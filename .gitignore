@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.pytest_cache/
+*.sock
+
+# Compiled test fixtures (rebuild via tests/fixtures/Makefile)
+tests/fixtures/test_*
+!tests/fixtures/test_*.c
+tests/fixtures/*.bin
+
+# GDB artifacts
+.gdb_history

@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+import errno
+import json
+import os
+import socket
+import socketserver
+import threading
+import uuid
+from pathlib import Path
+
+import pytest
+
+from pry.paths import bridge_registry_path
+from pry.transport import choose_instance, list_instances, send_request
+
+
+class _Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        raw = self.rfile.readline()
+        if not raw:
+            return
+        payload = json.loads(raw.decode("utf-8"))
+        response = {
+            "ok": True,
+            "result": {
+                "op": payload["op"],
+                "params": payload.get("params"),
+            },
+        }
+        self.wfile.write(json.dumps(response).encode("utf-8"))
+
+
+class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRY_CACHE_DIR", str(tmp_path))
+    pid = os.getpid()
+    socket_path = Path("/tmp") / f"pry-test-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    server = _Server(str(socket_path), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "socket_path": str(socket_path),
+                "plugin_name": "pry_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+        assert len(instances) == 1
+        instance = choose_instance()
+        assert instance.pid == pid
+
+        response = send_request("ping", params={"hello": "world"})
+        assert response["result"]["op"] == "ping"
+        assert response["result"]["params"] == {"hello": "world"}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRY_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    stale_socket_path = Path("/tmp") / f"pry-stale-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    stale_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_server.bind(str(stale_socket_path))
+    stale_server.listen(1)
+    stale_server.close()
+
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "socket_path": str(stale_socket_path),
+                "plugin_name": "pry_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert stale_socket_path.exists()
+
+    instances = list_instances()
+
+    assert instances == []
+    assert not registry_path.exists()
+    assert stale_socket_path.exists()
+
+
+def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
+    from pry.transport import BridgeError, BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "missing.sock",
+        registry_path=tmp_path / "missing.json",
+        plugin_name="pry_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+    monkeypatch.setattr("pry.transport.choose_instance", lambda pid=None: instance)
+
+    with pytest.raises(BridgeError, match="Failed to contact GDB bridge pid 999"):
+        send_request("doctor")
+
+
+def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
+    from pry.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="pry_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+    monkeypatch.setattr("pry.transport.choose_instance", lambda pid=None: instance)
+
+    class _FakeSocket:
+        attempts = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                return json.dumps({"ok": True, "result": {"pong": True}}).encode("utf-8")
+            return b""
+
+    monkeypatch.setattr("pry.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+
+    response = send_request("ping")
+
+    assert response["result"]["pong"] is True
+    assert _FakeSocket.attempts == 2
+
+
+def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch):
+    from pry.transport import BridgeError, BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="pry_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+    monkeypatch.setattr("pry.transport.choose_instance", lambda pid=None: instance)
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            self.path = path
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            raise socket.timeout("timed out")
+
+    monkeypatch.setattr("pry.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+
+    with pytest.raises(BridgeError, match="Timed out waiting for GDB bridge pid 999"):
+        send_request("ping", timeout=12.5)
+
+
+def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRY_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    socket_path = Path("/tmp") / f"pry-live-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": 111,
+                "socket_path": str(socket_path),
+                "plugin_name": "pry_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+
+        assert len(instances) == 1
+        assert instances[0].pid == 111
+        assert registry_path.exists()
+    finally:
+        server.shutdown()
+        server.server_close()

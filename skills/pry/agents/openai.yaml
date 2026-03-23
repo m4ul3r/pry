@@ -1,0 +1,4 @@
+interface:
+  display_name: "pry"
+  short_description: "Use pry for GDB debugging tasks"
+  default_prompt: "Use $pry to do GDB debugging work through the local pry CLI."
