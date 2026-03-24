@@ -526,3 +526,162 @@ def test_kill_ambiguous_instances(monkeypatch, capsys, tmp_path):
     assert "multiple" in stderr.lower()
     assert "111" in stderr
     assert "222" in stderr
+
+
+def test_connect_sends_correct_op(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return {
+            "ok": True,
+            "result": {
+                "connected": "localhost:1234",
+                "status": "stopped",
+                "frame": {"function": "start_kernel", "address": "0xffffffff81000000"},
+                "thread": 1,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["connect", "localhost:1234"])
+
+    assert rc == 0
+    assert captured["op"] == "connect"
+    assert captured["params"]["target"] == "localhost:1234"
+    assert captured["timeout"] == 20  # default 15s connect-timeout + 5s buffer
+
+
+def test_connect_custom_timeout_propagates(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return {
+            "ok": True,
+            "result": {
+                "connected": "localhost:1234",
+                "status": "stopped",
+                "frame": {"function": "start_kernel", "address": "0xffffffff81000000"},
+                "thread": 1,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["connect", "--connect-timeout", "3", "localhost:1234"])
+
+    assert rc == 0
+    assert captured["params"]["connect_timeout"] == 3
+    assert captured["timeout"] == 8  # 3s connect-timeout + 5s buffer
+
+
+def test_connect_text_rendering(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {
+                "connected": "localhost:1234",
+                "status": "stopped",
+                "frame": {"function": "start_kernel", "address": "0xffffffff81000000"},
+                "thread": 1,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["connect", "localhost:1234"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "connected: localhost:1234" in output
+    assert "status: stopped" in output
+    assert "start_kernel" in output
+
+
+def test_disconnect_sends_correct_op(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        return {"ok": True, "result": {"disconnected": True}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["disconnect"])
+
+    assert rc == 0
+    assert captured["op"] == "disconnect"
+
+
+def test_info_target_sends_correct_op(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        return {
+            "ok": True,
+            "result": {
+                "raw": "Remote serial target in gdb-specific protocol:\n",
+                "connections": "* 1    remote localhost:1234\n",
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["info", "target"])
+
+    assert rc == 0
+    assert captured["op"] == "target_info"
+    output = capsys.readouterr().out
+    assert "Remote serial target" in output
+    assert "localhost:1234" in output
+
+
+def test_gdb_exec_sends_correct_op(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"output": "rax  0x0  0\n"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "info registers"])
+
+    assert rc == 0
+    assert captured["op"] == "gdb_exec"
+    assert captured["params"]["command"] == "info registers"
+    output = capsys.readouterr().out
+    assert "rax" in output
+
+
+def test_gdb_exec_json_format(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"output": "KBASE: 0xffffffff81000000\n"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "--format", "json", "kbase"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["output"] == "KBASE: 0xffffffff81000000\n"
+
+
+def test_gdb_exec_empty_output(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"output": ""}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "set pagination off"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "(no output)" in output

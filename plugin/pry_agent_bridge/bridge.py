@@ -85,6 +85,7 @@ READ_LOCKED_OPS = {
     "source_list",
     "break_list",
     "list_inferiors",
+    "target_info",
 }
 
 EXEC_OPS = {
@@ -102,6 +103,8 @@ EXEC_OPS = {
 WRITE_LOCKED_OPS = {
     "load",
     "attach",
+    "connect",
+    "disconnect",
     "run",
     "continue",
     "step",
@@ -118,6 +121,7 @@ WRITE_LOCKED_OPS = {
     "watch_set",
     "memory_write",
     "py_exec",
+    "gdb_exec",
 }
 
 
@@ -535,6 +539,12 @@ class GdbBridge:
             return self._load(params)
         if op == "attach":
             return self._attach(params)
+        if op == "connect":
+            return self._connect(params)
+        if op == "disconnect":
+            return self._disconnect(params)
+        if op == "target_info":
+            return self._target_info(params)
 
         # Execution
         if op == "run":
@@ -606,6 +616,10 @@ class GdbBridge:
         if op == "py_exec":
             return self._py_exec(params)
 
+        # Raw GDB command passthrough
+        if op == "gdb_exec":
+            return self._gdb_exec(params)
+
         raise ValueError(f"Unknown op: {op!r}")
 
     # ------------------------------------------------------------------
@@ -660,6 +674,29 @@ class GdbBridge:
         info = self._stop_info()
         info["attached"] = pid
         return info
+
+    def _connect(self, params: dict[str, Any]) -> dict[str, Any]:
+        target = params["target"]
+        timeout = int(params.get("connect_timeout", 15))
+        self._last_stop_reason = None
+        gdb.execute(f"set tcp connect-timeout {timeout}", to_string=True)
+        gdb.execute(f"target remote {target}", to_string=True)
+        info = self._stop_info()
+        info["connected"] = target
+        return info
+
+    def _disconnect(self, params: dict[str, Any]) -> dict[str, Any]:
+        gdb.execute("disconnect", to_string=True)
+        return {"disconnected": True}
+
+    def _target_info(self, params: dict[str, Any]) -> dict[str, Any]:
+        raw = gdb.execute("info target", to_string=True)
+        connections = ""
+        try:
+            connections = gdb.execute("info connections", to_string=True)
+        except Exception:
+            pass
+        return {"raw": raw, "connections": connections}
 
     # ------------------------------------------------------------------
     # Execution control
@@ -1115,6 +1152,15 @@ class GdbBridge:
             gdb.execute(f"set listsize {count}", to_string=True)
         output = gdb.execute(cmd, to_string=True)
         return {"source": output}
+
+    # ------------------------------------------------------------------
+    # Raw GDB command passthrough
+    # ------------------------------------------------------------------
+
+    def _gdb_exec(self, params: dict[str, Any]) -> dict[str, Any]:
+        command = params["command"]
+        output = gdb.execute(command, to_string=True)
+        return {"output": output}
 
     # ------------------------------------------------------------------
     # Python escape hatch

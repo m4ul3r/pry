@@ -363,6 +363,56 @@ def _render_stop_text(value: Any) -> str:
     return "\n".join(parts)
 
 
+def _render_connect_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    target = value.get("connected", "<unknown>")
+    parts = [f"connected: {target}"]
+    status = value.get("status", "<unknown>")
+    parts.append(f"status: {status}")
+    reason = _format_stop_reason(value.get("reason"))
+    if reason:
+        parts.append(f"reason: {reason}")
+    frame = value.get("frame") or {}
+    func = frame.get("function")
+    if func:
+        loc = func
+        f = frame.get("file")
+        line = frame.get("line")
+        if f:
+            loc += f" at {f}"
+            if line is not None:
+                loc += f":{line}"
+        addr = frame.get("address")
+        if addr:
+            loc += f" ({addr})"
+        parts.append(f"frame: {loc}")
+    thread = value.get("thread")
+    if thread is not None:
+        parts.append(f"thread: {thread}")
+    return "\n".join(parts)
+
+
+def _render_disconnect_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return "disconnected"
+
+
+def _render_target_info_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    parts = []
+    raw = value.get("raw", "")
+    if raw:
+        parts.append(raw.rstrip())
+    connections = value.get("connections", "")
+    if connections:
+        parts.append("Connections:")
+        parts.append(connections.rstrip())
+    return "\n".join(parts) if parts else "no target info"
+
+
 def _render_breakpoint_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -616,6 +666,13 @@ def _render_py_exec_text(value: Any) -> str:
     return "\n".join(parts) if parts else "(no output)"
 
 
+def _render_gdb_exec_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    output = value.get("output", "")
+    return output.rstrip() if output else "(no output)"
+
+
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
@@ -781,8 +838,16 @@ def _render_launch_text(result: dict[str, Any]) -> str:
     lines = [f"GDB launched (pid={result['pid']})"]
     if result.get("binary"):
         lines.append(f"binary: {result['binary']}")
+    if result.get("symbols"):
+        lines.append(f"symbols: {result['symbols']}")
+    if result.get("connected"):
+        lines.append(f"connected: {result['connected']}")
+        if result.get("target_status"):
+            lines.append(f"target status: {result['target_status']}")
     lines.append(f"socket: {result['socket_path']}")
     lines.append(f"log: {result['log_path']}")
+    if result.get("post_launch_error"):
+        lines.append(f"error: {result['post_launch_error']}")
     return "\n".join(lines)
 
 
@@ -880,6 +945,36 @@ def _launch(args: argparse.Namespace) -> int:
     if args.binary:
         result["binary"] = str(Path(args.binary).expanduser().resolve())
 
+    # Post-launch: load symbols and/or connect to remote target
+    from .transport import BridgeInstance
+    _post_instance = BridgeInstance(
+        pid=pid,
+        socket_path=socket_path,
+        registry_path=bridge_registry_path(pid),
+        plugin_name="pry_agent_bridge",
+        plugin_version="",
+        started_at=None,
+        meta={},
+    )
+    try:
+        if getattr(args, "symbols", None):
+            symbols_path = str(Path(args.symbols).expanduser().resolve())
+            _send_request_to_instance(
+                _post_instance, "load", params={"path": symbols_path},
+            )
+            result["symbols"] = symbols_path
+        if getattr(args, "connect", None):
+            connect_resp = _send_request_to_instance(
+                _post_instance, "connect", params={"target": args.connect},
+                timeout=20,
+            )
+            result["connected"] = args.connect
+            connect_result = connect_resp.get("result")
+            if isinstance(connect_result, dict):
+                result["target_status"] = connect_result.get("status")
+    except BridgeError as exc:
+        result["post_launch_error"] = str(exc)
+
     if args.format == "text":
         _render_result(
             _render_launch_text(result), fmt="text", out_path=args.out, stem="launch"
@@ -966,6 +1061,42 @@ def _attach(args: argparse.Namespace) -> int:
         "attach",
         {"pid": args.pid},
         stem="attach",
+    )
+
+
+def _connect(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"target": args.target}
+    connect_timeout = getattr(args, "connect_timeout", None)
+    if connect_timeout is not None:
+        params["connect_timeout"] = connect_timeout
+    # Use connect_timeout + buffer as the transport-level socket timeout so
+    # the CLI fails at roughly the same time as GDB's tcp connect-timeout.
+    transport_timeout = (connect_timeout or 15) + 5
+    return _call(
+        args,
+        "connect",
+        params,
+        text_renderer=_render_connect_text,
+        stem="connect",
+        timeout=transport_timeout,
+    )
+
+
+def _disconnect(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "disconnect",
+        text_renderer=_render_disconnect_text,
+        stem="disconnect",
+    )
+
+
+def _target_info(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "target_info",
+        text_renderer=_render_target_info_text,
+        stem="target_info",
     )
 
 
@@ -1292,6 +1423,21 @@ def _source_list(args: argparse.Namespace) -> int:
     )
 
 
+# --- Raw GDB command passthrough ---
+
+def _gdb_exec(args: argparse.Namespace) -> int:
+    command = args.command
+    timeout = getattr(args, "timeout", None)
+    return _call(
+        args,
+        "gdb_exec",
+        {"command": command},
+        text_renderer=_render_gdb_exec_text,
+        stem="gdb_exec",
+        timeout=timeout,
+    )
+
+
 # --- Python escape hatch ---
 
 def _py_exec(args: argparse.Namespace) -> int:
@@ -1370,6 +1516,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=_LAUNCH_WAIT_TIMEOUT,
         help=f"Seconds to wait for bridge to start (default: {_LAUNCH_WAIT_TIMEOUT})",
     )
+    launch.add_argument(
+        "--connect", metavar="HOST:PORT", default=None,
+        help="Connect to a remote target after launch (e.g. localhost:1234)",
+    )
+    launch.add_argument(
+        "--symbols", metavar="PATH", default=None,
+        help="Load symbol file (e.g. vmlinux) before connecting",
+    )
     launch.set_defaults(handler=_launch)
 
     # --- kill ---
@@ -1388,6 +1542,21 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(attach, default_format="json")
     attach.add_argument("pid", type=int, help="Process ID to attach to")
     attach.set_defaults(handler=_attach)
+
+    # --- connect ---
+    connect = subparsers.add_parser("connect", help="Connect to a remote GDB target (QEMU, gdbserver)")
+    _common_io_options(connect)
+    connect.add_argument("target", help="Remote target (host:port, e.g. localhost:1234)")
+    connect.add_argument(
+        "--connect-timeout", type=int, default=15, dest="connect_timeout",
+        help="TCP connect timeout in seconds (default: 15)",
+    )
+    connect.set_defaults(handler=_connect)
+
+    # --- disconnect ---
+    disconnect = subparsers.add_parser("disconnect", help="Disconnect from remote target")
+    _common_io_options(disconnect, default_format="json")
+    disconnect.set_defaults(handler=_disconnect)
 
     # --- inferior ---
     inferior = subparsers.add_parser("inferior", help="Inspect GDB inferiors")
@@ -1600,6 +1769,9 @@ def build_parser() -> argparse.ArgumentParser:
     info_files_cmd = info_sub.add_parser("files", help="Show loaded files and sections")
     _common_io_options(info_files_cmd)
     info_files_cmd.set_defaults(handler=_info_files)
+    info_target_cmd = info_sub.add_parser("target", help="Show target connection info")
+    _common_io_options(info_target_cmd)
+    info_target_cmd.set_defaults(handler=_target_info)
 
     # --- source ---
     source = subparsers.add_parser("source", help="Source code inspection")
@@ -1620,6 +1792,13 @@ def build_parser() -> argparse.ArgumentParser:
     py_code_group.add_argument("--script", help="Path to Python script")
     py_code_group.add_argument("--stdin", action="store_true", help="Read code from stdin")
     py_exec.set_defaults(handler=_py_exec)
+
+    # --- gdb ---
+    gdb_cmd = subparsers.add_parser("gdb", help="Execute a raw GDB command (supports pwndbg, custom scripts, etc.)")
+    _common_io_options(gdb_cmd)
+    _add_timeout_arg(gdb_cmd)
+    gdb_cmd.add_argument("command", help="GDB command to execute (e.g. 'kbase', 'info proc mappings')")
+    gdb_cmd.set_defaults(handler=_gdb_exec)
 
     return parser
 

@@ -180,6 +180,14 @@ def _load_bridge(monkeypatch):
             return "Dump of assembler code for function main:\n   0x0000000000401000 <+0>:\tpush   %rbp\nEnd of assembler dump.\n"
         if cmd.startswith("ptype"):
             return "type = struct foo {\n    int x;\n    int y;\n}\n"
+        if cmd.startswith("target remote"):
+            return "Remote debugging using " + cmd.split("target remote ", 1)[1] + "\n"
+        if cmd == "disconnect":
+            return "Ending remote debugging.\n"
+        if cmd.startswith("info target"):
+            return "Remote serial target in gdb-specific protocol:\nDebugging a target over a serial line.\n"
+        if cmd.startswith("info connections"):
+            return "  Num  What                        Description\n* 1    remote localhost:1234       Remote serial target\n"
         # For execution commands, fire the pending stop event (simulates
         # GDB processing the stop after gdb.execute returns).
         base_cmd = cmd.split()[0] if cmd else ""
@@ -624,3 +632,66 @@ def test_dispatch_exec_no_stop_event(monkeypatch):
     assert response["ok"] is True
     result = response["result"]
     assert result["status"] == "stopped"
+
+
+def test_connect_executes_target_remote(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("connect", {"target": "localhost:1234"})
+    assert result["connected"] == "localhost:1234"
+    assert result["status"] == "stopped"
+    assert "set tcp connect-timeout 15" in fake_gdb._execute_log
+    assert "target remote localhost:1234" in fake_gdb._execute_log
+
+
+def test_connect_custom_timeout(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("connect", {"target": "localhost:1234", "connect_timeout": 5})
+    assert result["connected"] == "localhost:1234"
+    assert "set tcp connect-timeout 5" in fake_gdb._execute_log
+
+
+def test_connect_clears_stop_reason(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # Set a stale stop reason
+    fake_gdb.events.stop.fire(fake_gdb._FakeSignalEvent("SIGINT"))
+    assert bridge._last_stop_reason is not None
+
+    result = bridge._dispatch_op("connect", {"target": "localhost:1234"})
+    # _last_stop_reason should have been cleared before the connect
+    assert result["connected"] == "localhost:1234"
+
+
+def test_disconnect_executes_disconnect_command(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("disconnect", {})
+    assert result["disconnected"] is True
+    assert "disconnect" in fake_gdb._execute_log
+
+
+def test_target_info_returns_raw_output(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("target_info", {})
+    assert "raw" in result
+    assert "Remote serial target" in result["raw"]
+    assert "connections" in result
+    assert "localhost:1234" in result["connections"]
+
+
+def test_gdb_exec_passthrough(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("gdb_exec", {"command": "info registers"})
+    assert "output" in result
+    assert "rax" in result["output"]
+    assert "info registers" in fake_gdb._execute_log

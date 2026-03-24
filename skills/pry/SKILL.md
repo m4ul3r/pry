@@ -58,6 +58,49 @@ For headless/agent contexts without `pry launch`, keep GDB's stdin open:
 sleep 99999 | gdb -q ./binary -ex "python import sys; sys.path.insert(0, '/opt/pry/plugin'); import pry_agent_bridge"
 ```
 
+## Remote Debugging (QEMU / gdbserver)
+
+### Quick start
+
+```bash
+pry launch --symbols ./vmlinux --connect localhost:1234
+```
+
+This launches GDB, loads the symbol file, and connects to the remote target in one step.
+
+### Step-by-step
+
+```bash
+pry launch                          # Launch bare GDB session
+pry load ./vmlinux                  # Load symbol file
+pry connect localhost:1234          # Connect to QEMU/gdbserver
+pry break set commit_creds          # Set kernel breakpoint
+pry continue                        # Continue execution
+```
+
+### Connection management
+
+```bash
+pry connect localhost:1234          # Connect to remote target
+pry info target                     # Show target connection info
+pry disconnect                      # Disconnect from remote target
+```
+
+### Typical QEMU kernel debugging workflow
+
+```bash
+# Terminal 1: Start QEMU with GDB stub
+qemu-system-x86_64 -kernel bzImage -s -S ...
+
+# Terminal 2: Debug with pry
+pry launch --symbols ./vmlinux --connect localhost:1234
+pry break set start_kernel
+pry continue
+pry backtrace
+```
+
+The `-s` flag enables the GDB stub on port 1234. The `-S` flag freezes the CPU at startup.
+
 ## Workflow
 
 1. Start with bridge health check:
@@ -178,11 +221,38 @@ echo 'print(gdb.selected_frame().name())' | pry py exec --stdin
 
 The Python environment has `gdb` in scope. Set `result['value']` to return structured data.
 
+## Raw GDB Command Passthrough
+
+Execute any GDB command directly, including pwndbg commands and custom scripts:
+
+```bash
+pry gdb "info proc mappings"     # Any GDB command
+pry gdb kbase                    # pwndbg: kernel base address
+pry gdb kchecksec                # pwndbg: kernel hardening config
+pry gdb kdmesg                   # pwndbg: kernel ring buffer
+pry gdb "slab -v"                # pwndbg: SLUB allocator info
+pry gdb ktask                    # pwndbg: kernel task list
+pry gdb kmod                     # pwndbg: loaded kernel modules
+pry gdb kversion                 # pwndbg: kernel version
+pry gdb kcmdline                 # pwndbg: kernel command line
+pry gdb "klookup commit_creds"   # pwndbg: kernel symbol lookup
+pry gdb vmmap                    # pwndbg: virtual memory map
+pry gdb checksec                 # pwndbg: binary security checks
+pry gdb "search -s flag{"        # pwndbg: memory search
+pry gdb --format json kbase      # Get raw output as JSON
+pry gdb --timeout 60 kdmesg      # Custom timeout for slow commands
+```
+
+This is the escape hatch for any GDB/pwndbg command not covered by pry's built-in ops.
+
 ## Inferior Management
 
 ```bash
 pry inferior list                # List inferiors (processes)
 pry attach 1234                  # Attach to running process
+pry connect localhost:1234       # Connect to remote target (QEMU/gdbserver)
+pry disconnect                   # Disconnect from remote target
+pry info target                  # Show target connection info
 ```
 
 ## Known Quirks
@@ -192,3 +262,4 @@ pry attach 1234                  # Attach to running process
 - **No undo**: Unlike Binary Ninja's bn tool, GDB mutations (memory writes, register changes) are immediate and not reversible. There is no `--preview` mode.
 - **Source availability**: `pry source list` and file/line info in backtraces require debug symbols (`-g` flag when compiling).
 - **Symbol search scope**: `pry symbols` and `pry functions` search global/exported symbols. Local variables are only visible via `pry locals` within the current frame.
+- **Remote targets**: `pry connect` issues `target remote`, which expects the target to be paused. QEMU's `-S` flag or a gdbserver in stopped mode is required for reliable initial connection.
