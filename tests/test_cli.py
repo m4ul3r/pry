@@ -685,3 +685,261 @@ def test_gdb_exec_empty_output(monkeypatch, capsys):
     assert rc == 0
     output = capsys.readouterr().out
     assert "(no output)" in output
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: Timeout propagation to bridge
+# ---------------------------------------------------------------------------
+
+def test_continue_with_timeout_sends_timeout_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return {
+            "ok": True,
+            "result": {"status": "stopped", "frame": {"function": "main"}, "thread": 1},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["continue", "--timeout", "45"])
+
+    assert rc == 0
+    assert captured["params"]["_timeout"] == 45.0
+    assert captured["timeout"] == 55.0  # 45 + 10 buffer
+
+
+def test_stop_text_shows_timeout_interrupt(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {
+                "status": "stopped",
+                "timeout_interrupt": True,
+                "frame": {"function": "loop"},
+                "thread": 1,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["continue", "--timeout", "5"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "interrupted due to timeout" in output
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: py exec timeout
+# ---------------------------------------------------------------------------
+
+def test_py_exec_with_timeout(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return {"ok": True, "result": {"stdout": "", "result": None}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["py", "exec", "--code", "pass", "--timeout", "60"])
+
+    assert rc == 0
+    assert captured["params"]["_timeout"] == 60.0
+    assert captured["timeout"] == 60.0
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: Background continue, status, wait
+# ---------------------------------------------------------------------------
+
+def test_continue_background_sends_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"status": "running"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["continue", "--background"])
+
+    assert rc == 0
+    assert captured["params"]["_background"] is True
+    output = capsys.readouterr().out
+    assert "running" in output
+
+
+def test_status_command(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {"state": "stopped", "status": "stopped",
+                        "frame": {"function": "main"}, "thread": 1},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["status"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "stopped" in output
+
+
+def test_wait_command_with_timeout(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return {
+            "ok": True,
+            "result": {"state": "stopped", "status": "stopped",
+                        "frame": {"function": "main"}, "thread": 1},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["wait", "--timeout", "30"])
+
+    assert rc == 0
+    assert captured["op"] == "wait"
+    assert captured["params"]["_timeout"] == 30.0
+    assert captured["timeout"] == 40.0  # 30 + 10 buffer
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: PIE rebasing params
+# ---------------------------------------------------------------------------
+
+def test_break_set_rebase_sends_params(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "number": 1, "type": 0, "location": "*0x555555555234",
+                "enabled": True, "hits": 0,
+                "rebased": {
+                    "module": "target",
+                    "offset": "0x1234",
+                    "image_base": "0x0",
+                    "module_base": "0x555555554000",
+                    "resolved": "0x555555555234",
+                },
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["break", "set", "*0x1234", "--rebase", "target"])
+
+    assert rc == 0
+    assert captured["params"]["rebase_module"] == "target"
+    output = capsys.readouterr().out
+    assert "rebased from" in output
+    assert "target" in output
+
+
+def test_break_set_rebase_with_image_base_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {"number": 1, "type": 0, "location": "*0x55555555a56e",
+                        "enabled": True, "hits": 0},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["break", "set", "*0x40656e", "--rebase", "target", "--image-base", "0x400000"])
+
+    assert rc == 0
+    assert captured["params"]["rebase_module"] == "target"
+    assert captured["params"]["image_base"] == 0x400000
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Trace command
+# ---------------------------------------------------------------------------
+
+def test_trace_sends_correct_params(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return {
+            "ok": True,
+            "result": {
+                "hits": [{"pc": "0x404610", "asm": "mov eax, [rbx]"}],
+                "hit_count": 1,
+                "truncated": False,
+                "watch_addr": "0x7fffffffd5d4",
+                "watch_size": 4,
+                "range_start": "0x404610",
+                "range_end": "0x405e30",
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main([
+        "trace",
+        "--watch", "0x7fffffffd5d4",
+        "--range", "0x404610-0x405e30",
+        "--type", "access",
+        "--timeout", "60",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "trace"
+    assert captured["params"]["watch_addr"] == "0x7fffffffd5d4"
+    assert captured["params"]["range_start"] == "0x404610"
+    assert captured["params"]["range_end"] == "0x405e30"
+    assert captured["params"]["watch_type"] == "access"
+    assert captured["params"]["_timeout"] == 60.0
+    assert captured["timeout"] == 70.0  # 60 + 10 buffer
+    output = capsys.readouterr().out
+    assert "1 hits" in output
+    assert "0x404610" in output
+    assert "mov eax" in output
+
+
+def test_trace_text_truncated_warning(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {
+                "hits": [],
+                "hit_count": 10000,
+                "truncated": True,
+                "watch_addr": "0x1000",
+                "watch_size": 4,
+                "range_start": "0x2000",
+                "range_end": "0x3000",
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["trace", "--watch", "0x1000", "--range", "0x2000-0x3000"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "hit limit reached" in output

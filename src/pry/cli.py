@@ -342,6 +342,8 @@ def _render_stop_text(value: Any) -> str:
     reason = _format_stop_reason(value.get("reason"))
     frame = value.get("frame") or {}
     parts = [f"status: {status}"]
+    if value.get("timeout_interrupt"):
+        parts.append("note: interrupted due to timeout")
     if reason:
         parts.append(f"reason: {reason}")
     func = frame.get("function")
@@ -360,6 +362,41 @@ def _render_stop_text(value: Any) -> str:
     thread = value.get("thread")
     if thread is not None:
         parts.append(f"thread: {thread}")
+    return "\n".join(parts)
+
+
+def _render_background_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"status: {value.get('status', '<unknown>')}"
+
+
+def _render_status_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    state = value.get("state", "unknown")
+    parts = [f"state: {state}"]
+    if state == "stopped":
+        reason = _format_stop_reason(value.get("reason"))
+        if reason:
+            parts.append(f"reason: {reason}")
+        frame = value.get("frame") or {}
+        func = frame.get("function")
+        if func:
+            loc = func
+            f = frame.get("file")
+            line = frame.get("line")
+            if f:
+                loc += f" at {f}"
+                if line is not None:
+                    loc += f":{line}"
+            addr = frame.get("address")
+            if addr:
+                loc += f" ({addr})"
+            parts.append(f"frame: {loc}")
+        thread = value.get("thread")
+        if thread is not None:
+            parts.append(f"thread: {thread}")
     return "\n".join(parts)
 
 
@@ -448,6 +485,9 @@ def _render_breakpoint_set_text(value: Any) -> str:
     cond = value.get("condition")
     if cond:
         parts.append(f"if {cond}")
+    rebased = value.get("rebased")
+    if isinstance(rebased, dict):
+        parts.append(f"(rebased from {rebased.get('offset', '?')} in {rebased.get('module', '?')})")
     return " ".join(parts)
 
 
@@ -1111,29 +1151,54 @@ def _inferior_list(args: argparse.Namespace) -> int:
 
 # --- Execution control ---
 
+def _exec_timeout(args: argparse.Namespace) -> tuple[dict[str, Any], float | None]:
+    """Extract --timeout from args and return (params_patch, transport_timeout).
+
+    The bridge-side ``_timeout`` travels in params so ``_dispatch_exec`` can
+    auto-interrupt.  The transport timeout is slightly longer to give the
+    bridge time to interrupt and respond before the socket gives up.
+    """
+    timeout = getattr(args, "timeout", None)
+    if timeout is None:
+        return {}, None
+    return {"_timeout": timeout}, timeout + 10
+
+
+def _exec_params(args: argparse.Namespace) -> tuple[dict[str, Any], float | None]:
+    """Build common exec params (timeout + background) from args."""
+    params, tt = _exec_timeout(args)
+    if getattr(args, "background", False):
+        params["_background"] = True
+    return params, tt
+
+
 def _run(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.args:
         params["args"] = args.args
-    timeout = getattr(args, "timeout", None)
+    ep, tt = _exec_params(args)
+    params.update(ep)
+    renderer = _render_background_text if params.get("_background") else _render_stop_text
     return _call(
         args,
         "run",
         params,
-        text_renderer=_render_stop_text,
+        text_renderer=renderer,
         stem="run",
-        timeout=timeout,
+        timeout=tt,
     )
 
 
 def _continue(args: argparse.Namespace) -> int:
-    timeout = getattr(args, "timeout", None)
+    ep, tt = _exec_params(args)
+    renderer = _render_background_text if ep.get("_background") else _render_stop_text
     return _call(
         args,
         "continue",
-        text_renderer=_render_stop_text,
+        ep or None,
+        text_renderer=renderer,
         stem="continue",
-        timeout=timeout,
+        timeout=tt,
     )
 
 
@@ -1162,24 +1227,47 @@ def _nexti(args: argparse.Namespace) -> int:
 
 
 def _finish(args: argparse.Namespace) -> int:
-    timeout = getattr(args, "timeout", None)
-    return _call(args, "finish", text_renderer=_render_stop_text, stem="finish", timeout=timeout)
+    ep, tt = _exec_params(args)
+    renderer = _render_background_text if ep.get("_background") else _render_stop_text
+    return _call(args, "finish", ep or None, text_renderer=renderer, stem="finish", timeout=tt)
 
 
 def _until(args: argparse.Namespace) -> int:
-    timeout = getattr(args, "timeout", None)
+    ep, tt = _exec_params(args)
+    params: dict[str, Any] = {"location": args.location}
+    params.update(ep)
+    renderer = _render_background_text if params.get("_background") else _render_stop_text
     return _call(
         args,
         "until",
-        {"location": args.location},
-        text_renderer=_render_stop_text,
+        params,
+        text_renderer=renderer,
         stem="until",
-        timeout=timeout,
+        timeout=tt,
     )
 
 
 def _interrupt(args: argparse.Namespace) -> int:
     return _call(args, "interrupt", stem="interrupt")
+
+
+def _status(args: argparse.Namespace) -> int:
+    return _call(args, "status", text_renderer=_render_status_text, stem="status")
+
+
+def _wait(args: argparse.Namespace) -> int:
+    timeout = getattr(args, "timeout", None)
+    params: dict[str, Any] = {}
+    if timeout is not None:
+        params["_timeout"] = timeout
+    return _call(
+        args,
+        "wait",
+        params or None,
+        text_renderer=_render_stop_text,
+        stem="wait",
+        timeout=(timeout + 10) if timeout else None,
+    )
 
 
 # --- Breakpoints ---
@@ -1192,6 +1280,12 @@ def _break_set(args: argparse.Namespace) -> int:
         params["temporary"] = True
     if args.hardware:
         params["hardware"] = True
+    rebase = getattr(args, "rebase", None)
+    if rebase:
+        params["rebase_module"] = rebase
+    image_base = getattr(args, "image_base", 0)
+    if image_base:
+        params["image_base"] = image_base
     return _call(args, "break_set", params, text_renderer=_render_breakpoint_set_text, stem="break_set")
 
 
@@ -1428,10 +1522,13 @@ def _source_list(args: argparse.Namespace) -> int:
 def _gdb_exec(args: argparse.Namespace) -> int:
     command = args.command
     timeout = getattr(args, "timeout", None)
+    params: dict[str, Any] = {"command": command}
+    if timeout is not None:
+        params["_timeout"] = timeout
     return _call(
         args,
         "gdb_exec",
-        {"command": command},
+        params,
         text_renderer=_render_gdb_exec_text,
         stem="gdb_exec",
         timeout=timeout,
@@ -1454,12 +1551,71 @@ def _py_exec(args: argparse.Namespace) -> int:
     else:
         raise BridgeError("One of --code, --script, or --stdin is required")
 
+    timeout = getattr(args, "timeout", None)
+    params: dict[str, Any] = {"code": source}
+    if timeout is not None:
+        params["_timeout"] = timeout
     return _call(
         args,
         "py_exec",
-        {"code": source},
+        params,
         text_renderer=_render_py_exec_text,
         stem="py_exec",
+        timeout=timeout,
+    )
+
+
+# --- Tracing ---
+
+def _render_trace_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    watch = value.get("watch_addr", "?")
+    rng = f"{value.get('range_start', '?')}-{value.get('range_end', '?')}"
+    hit_count = value.get("hit_count", 0)
+    lines = [f"trace: {hit_count} hits on {watch} in range {rng}"]
+    if value.get("truncated"):
+        lines.append("warning: hit limit reached, trace may be incomplete")
+    for h in value.get("hits", []):
+        pc = h.get("pc", "?")
+        asm = h.get("asm", "?")
+        lines.append(f"  {pc}: {asm}")
+    stop = value.get("stop_info")
+    if isinstance(stop, dict):
+        status = stop.get("status", "unknown")
+        lines.append(f"final status: {status}")
+    return "\n".join(lines)
+
+
+def _trace(args: argparse.Namespace) -> int:
+    range_str: str = args.range
+    # Split on the first '-' that is NOT inside a '0x' prefix.
+    # E.g. "0x404610-0x405e30" → ("0x404610", "0x405e30")
+    idx = range_str.find("-", 2)  # skip potential 0x prefix
+    if idx == -1:
+        print("error: --range must be in format START-END (e.g., 0x404610-0x405e30)",
+              file=sys.stderr)
+        return 1
+    range_start = range_str[:idx].strip()
+    range_end = range_str[idx + 1:].strip()
+
+    timeout = getattr(args, "timeout", None) or 120.0
+    params: dict[str, Any] = {
+        "watch_addr": args.watch,
+        "watch_size": args.watch_size,
+        "range_start": range_start,
+        "range_end": range_end,
+        "watch_type": args.watch_type,
+        "max_hits": args.max_hits,
+        "_timeout": timeout,
+    }
+    return _call(
+        args,
+        "trace",
+        params,
+        text_renderer=_render_trace_text,
+        stem="trace",
+        timeout=timeout + 10,
     )
 
 
@@ -1569,6 +1725,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Run the loaded program")
     _common_io_options(run)
     _add_timeout_arg(run)
+    run.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     run.add_argument("args", nargs="*", help="Program arguments")
     run.set_defaults(handler=_run)
 
@@ -1576,6 +1733,7 @@ def build_parser() -> argparse.ArgumentParser:
     cont = subparsers.add_parser("continue", help="Continue execution")
     _common_io_options(cont)
     _add_timeout_arg(cont)
+    cont.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     cont.set_defaults(handler=_continue)
 
     # --- step ---
@@ -1604,12 +1762,14 @@ def build_parser() -> argparse.ArgumentParser:
     finish = subparsers.add_parser("finish", help="Run until current function returns")
     _common_io_options(finish)
     _add_timeout_arg(finish)
+    finish.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     finish.set_defaults(handler=_finish)
 
     # --- until ---
     until = subparsers.add_parser("until", help="Run until a location is reached")
     _common_io_options(until)
     _add_timeout_arg(until)
+    until.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     until.add_argument("location", help="Location to run until (function, file:line, or address)")
     until.set_defaults(handler=_until)
 
@@ -1617,6 +1777,17 @@ def build_parser() -> argparse.ArgumentParser:
     interrupt = subparsers.add_parser("interrupt", help="Interrupt the running inferior")
     _common_io_options(interrupt, default_format="json")
     interrupt.set_defaults(handler=_interrupt)
+
+    # --- status ---
+    status_cmd = subparsers.add_parser("status", help="Show inferior execution state")
+    _common_io_options(status_cmd)
+    status_cmd.set_defaults(handler=_status)
+
+    # --- wait ---
+    wait_cmd = subparsers.add_parser("wait", help="Wait for running inferior to stop")
+    _common_io_options(wait_cmd)
+    _add_timeout_arg(wait_cmd)
+    wait_cmd.set_defaults(handler=_wait)
 
     # --- break ---
     brk = subparsers.add_parser("break", help="Breakpoint management")
@@ -1628,6 +1799,9 @@ def build_parser() -> argparse.ArgumentParser:
     brk_set.add_argument("--condition", help="Conditional expression")
     brk_set.add_argument("--temporary", action="store_true", help="Temporary breakpoint (deleted on hit)")
     brk_set.add_argument("--hardware", action="store_true", help="Hardware breakpoint")
+    brk_set.add_argument("--rebase", metavar="MODULE", help="Treat location as offset from MODULE's load base (PIE/ASLR rebasing)")
+    brk_set.add_argument("--image-base", type=lambda x: int(x, 0), default=0, metavar="ADDR",
+                          help="Static image base to subtract (default: 0x0)")
     brk_set.set_defaults(handler=_break_set)
 
     brk_list = brk_sub.add_parser("list", help="List breakpoints")
@@ -1787,6 +1961,7 @@ def build_parser() -> argparse.ArgumentParser:
     py_sub = py.add_subparsers(dest="py_command")
     py_exec = py_sub.add_parser("exec", help="Execute Python code")
     _common_io_options(py_exec)
+    _add_timeout_arg(py_exec)
     py_code_group = py_exec.add_mutually_exclusive_group(required=True)
     py_code_group.add_argument("--code", help="Python code to execute")
     py_code_group.add_argument("--script", help="Path to Python script")
@@ -1799,6 +1974,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_timeout_arg(gdb_cmd)
     gdb_cmd.add_argument("command", help="GDB command to execute (e.g. 'kbase', 'info proc mappings')")
     gdb_cmd.set_defaults(handler=_gdb_exec)
+
+    # --- trace ---
+    trace_cmd = subparsers.add_parser("trace", help="Trace memory accesses within a code range")
+    _common_io_options(trace_cmd)
+    _add_timeout_arg(trace_cmd)
+    trace_cmd.add_argument("--watch", required=True, metavar="ADDR",
+                           help="Memory address to watch (hex)")
+    trace_cmd.add_argument("--watch-size", type=int, default=4, metavar="N",
+                           help="Number of bytes to watch (default: 4)")
+    trace_cmd.add_argument("--range", required=True, metavar="START-END",
+                           help="Code address range (e.g., 0x404610-0x405e30)")
+    trace_cmd.add_argument("--type", choices=("write", "read", "access"), default="access",
+                           dest="watch_type", help="Watch type (default: access)")
+    trace_cmd.add_argument("--max-hits", type=int, default=10000, metavar="N",
+                           help="Maximum number of hits to record (default: 10000)")
+    trace_cmd.set_defaults(handler=_trace)
 
     return parser
 

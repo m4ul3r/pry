@@ -87,30 +87,59 @@ Every command accepts `--format [text|json|ndjson]`, `--out <path>`, and `--inst
 
 ### Execution control
 
-All execution commands block until the inferior stops or exits, returning structured stop info (reason, frame, thread).
+All execution commands block until the inferior stops or exits, returning structured stop info (reason, frame, thread). Use `--timeout N` to auto-interrupt after N seconds. Use `--background` to return immediately while the inferior keeps running.
 
 | Command | Description |
 |---------|-------------|
-| `pry run [args...]` | Start program |
-| `pry continue` | Continue from stop |
+| `pry run [args...]` | Start program (`--timeout`, `--background`) |
+| `pry continue` | Continue from stop (`--timeout`, `--background`) |
 | `pry step [count]` | Source-level step into |
 | `pry next [count]` | Source-level step over |
 | `pry stepi` | Instruction-level step into |
 | `pry nexti` | Instruction-level step over |
-| `pry finish` | Run until function returns |
-| `pry until <location>` | Run until location |
-| `pry interrupt` | Interrupt running inferior |
+| `pry finish` | Run until function returns (`--timeout`, `--background`) |
+| `pry until <location>` | Run until location (`--timeout`, `--background`) |
+| `pry interrupt` | Interrupt running inferior (always works, even during background exec) |
+| `pry status` | Show inferior execution state (running/stopped) |
+| `pry wait` | Wait for running inferior to stop (`--timeout`) |
+
+When `--timeout` fires, the bridge auto-interrupts the inferior and returns the stop info with `timeout_interrupt: true`. The bridge remains responsive for subsequent commands.
 
 ### Breakpoints & watchpoints
 
 | Command | Description |
 |---------|-------------|
-| `pry break set <loc>` | Set breakpoint (supports `--condition`, `--temporary`, `--hardware`) |
+| `pry break set <loc>` | Set breakpoint (`--condition`, `--temporary`, `--hardware`, `--rebase`, `--image-base`) |
 | `pry break list` | List all breakpoints |
 | `pry break delete <num>` | Delete breakpoint |
 | `pry break enable/disable <num>` | Toggle breakpoint |
 | `pry watch set <expr>` | Set watchpoint (`--type write\|read\|access`) |
 | `pry watch list/delete/enable/disable` | Manage watchpoints |
+
+#### PIE/ASLR rebasing
+
+For PIE binaries, use `--rebase MODULE` to set breakpoints by static offset:
+
+```bash
+# Binary Ninja says function is at 0x1234 — pry resolves the runtime address automatically
+pry break set *0x1234 --rebase myprogram
+
+# If your tool uses a non-zero image base (e.g., Binary Ninja's default 0x400000)
+pry break set *0x40656e --rebase myprogram --image-base 0x400000
+```
+
+### Memory tracing
+
+| Command | Description |
+|---------|-------------|
+| `pry trace` | Trace memory accesses within a code range |
+
+```bash
+pry trace --watch 0x7fffffffd5d4 --range 0x404610-0x405e30
+pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type access --timeout 60
+```
+
+Uses hardware watchpoints gated by range boundary breakpoints for native-speed tracing. Reports every instruction within the range that touches the watched memory.
 
 ### Inspection
 
@@ -149,9 +178,10 @@ All execution commands block until the inferior stops or exits, returning struct
 
 ```bash
 pry py exec --code 'result["value"] = gdb.parse_and_eval("argc").string()'
+pry py exec --script trace.py --timeout 120
 ```
 
-Runs arbitrary Python inside GDB with the `gdb` module and a `result` dict in scope.
+Runs arbitrary Python inside GDB with the `gdb` module and a `result` dict in scope. Use `--timeout` to prevent long-running scripts from hanging the bridge.
 
 ## Multiple sessions
 

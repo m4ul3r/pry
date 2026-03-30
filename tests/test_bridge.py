@@ -695,3 +695,215 @@ def test_gdb_exec_passthrough(monkeypatch):
     assert "output" in result
     assert "rax" in result["output"]
     assert "info registers" in fake_gdb._execute_log
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: Lock-free interrupt
+# ---------------------------------------------------------------------------
+
+def test_interrupt_bypasses_exec_ops(monkeypatch):
+    """interrupt is handled before EXEC_OPS check, without locks."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    response = bridge.dispatch({"op": "interrupt", "params": {}})
+    assert response["ok"] is True
+    assert response["result"]["interrupted"] is True
+    assert "interrupt" in fake_gdb._execute_log
+
+
+def test_dispatch_exec_respects_timeout_param(monkeypatch):
+    """_dispatch_exec pops _timeout from params and uses it."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # With a stop event queued, the timeout shouldn't matter (it completes immediately)
+    fake_gdb._pending_stop_event = fake_gdb._FakeStopEvent()
+    response = bridge.dispatch({"op": "continue", "params": {"_timeout": 5.0}})
+    assert response["ok"] is True
+
+
+def test_dispatch_exec_auto_interrupt_on_timeout(monkeypatch):
+    """When _dispatch_exec times out, it auto-interrupts and returns with timeout_interrupt."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # Queue no stop event — the initial completion.wait will time out.
+    # But the auto-interrupt fires another "interrupt" command, which we need
+    # to produce a stop event.
+    original_execute = fake_gdb.execute
+
+    def _execute_with_interrupt_stop(cmd, to_string=False):
+        result = original_execute(cmd, to_string)
+        # When "interrupt" is called, fire a stop event
+        if cmd.strip() == "interrupt":
+            fake_gdb.events.stop.fire(fake_gdb._FakeStopEvent())
+        return result
+
+    fake_gdb.execute = _execute_with_interrupt_stop
+
+    response = bridge.dispatch({"op": "continue", "params": {"_timeout": 0.01}})
+    assert response["ok"] is True
+    assert response["result"].get("timeout_interrupt") is True
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: _run_on_gdb_thread timeout parameter
+# ---------------------------------------------------------------------------
+
+def test_run_on_gdb_thread_custom_timeout(monkeypatch):
+    """_run_on_gdb_thread accepts a timeout parameter."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    # Just verify the function runs with a custom timeout
+    result = bridge_mod._run_on_gdb_thread(lambda: 42, timeout=5.0)
+    assert result == 42
+
+
+def test_dispatch_passes_timeout_to_run_on_gdb_thread(monkeypatch):
+    """Non-exec ops extract _timeout from params."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # py_exec is a WRITE_LOCKED_OP that goes through _run_on_gdb_thread
+    response = bridge.dispatch({
+        "op": "py_exec",
+        "params": {"code": "pass", "_timeout": 5.0},
+    })
+    assert response["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: Background continue, status, wait
+# ---------------------------------------------------------------------------
+
+def test_background_continue_returns_running(monkeypatch):
+    """Background continue returns immediately with status=running."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # Don't queue a stop event — background should return immediately
+    response = bridge.dispatch({
+        "op": "continue",
+        "params": {"_background": True},
+    })
+    assert response["ok"] is True
+    assert response["result"]["status"] == "running"
+    assert bridge._running is True
+
+
+def test_status_returns_running_state(monkeypatch):
+    """status op returns the running/stopped state."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # Initially not running
+    response = bridge.dispatch({"op": "status", "params": {}})
+    assert response["ok"] is True
+    assert response["result"]["state"] == "stopped"
+
+
+def test_wait_when_not_running(monkeypatch):
+    """wait when inferior is stopped returns immediately."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    response = bridge.dispatch({"op": "wait", "params": {}})
+    assert response["ok"] is True
+    assert response["result"]["state"] == "stopped"
+
+
+def test_dispatch_exec_rejects_concurrent_background(monkeypatch):
+    """A second exec op while background is running raises an error."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # Start a background continue
+    bridge.dispatch({"op": "continue", "params": {"_background": True}})
+    assert bridge._running is True
+
+    # A second foreground continue should fail
+    response = bridge.dispatch({"op": "continue", "params": {}})
+    assert response["ok"] is False
+    assert "already running" in response["error"]
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: PIE address rebasing
+# ---------------------------------------------------------------------------
+
+def test_break_set_with_rebase(monkeypatch):
+    """break_set with rebase_module resolves address via info proc mappings."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    # Patch _fake_execute to handle info proc mappings
+    original_execute = fake_gdb.execute
+
+    def _execute_with_mappings(cmd, to_string=False):
+        if cmd.startswith("info proc mappings"):
+            return (
+                "          Start Addr           End Addr       Size     Offset  Perms  objfile\n"
+                "      0x555555554000     0x555555555000     0x1000        0x0  r-xp   /usr/bin/lugosiii\n"
+                "      0x555555555000     0x555555556000     0x1000     0x1000  rw-p   /usr/bin/lugosiii\n"
+            )
+        return original_execute(cmd, to_string)
+
+    fake_gdb.execute = _execute_with_mappings
+
+    result = bridge._dispatch_op("break_set", {
+        "location": "*0x1234",
+        "rebase_module": "lugosiii",
+    })
+    assert result["rebased"] is not None
+    assert result["rebased"]["module"] == "lugosiii"
+    assert result["rebased"]["module_base"] == hex(0x555555554000)
+    # runtime_addr = 0x1234 - 0 + 0x555555554000
+    assert result["rebased"]["resolved"] == hex(0x555555554000 + 0x1234)
+
+
+def test_break_set_rebase_with_image_base(monkeypatch):
+    """break_set with rebase_module and image_base subtracts static base."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    original_execute = fake_gdb.execute
+
+    def _execute_with_mappings(cmd, to_string=False):
+        if cmd.startswith("info proc mappings"):
+            return (
+                "      0x555555554000     0x555555600000     0xac000        0x0  r-xp   /usr/bin/target\n"
+            )
+        return original_execute(cmd, to_string)
+
+    fake_gdb.execute = _execute_with_mappings
+
+    result = bridge._dispatch_op("break_set", {
+        "location": "*0x40656e",
+        "rebase_module": "target",
+        "image_base": 0x400000,
+    })
+    # runtime_addr = 0x40656e - 0x400000 + 0x555555554000 = 0x55555555a56e
+    expected = 0x40656e - 0x400000 + 0x555555554000
+    assert result["rebased"]["resolved"] == hex(expected)
+
+
+def test_break_set_rebase_module_not_found(monkeypatch):
+    """break_set with unknown module raises ValueError."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    original_execute = fake_gdb.execute
+
+    def _execute_with_empty_mappings(cmd, to_string=False):
+        if cmd.startswith("info proc mappings"):
+            raise fake_gdb.error("No current process")
+        return original_execute(cmd, to_string)
+
+    fake_gdb.execute = _execute_with_empty_mappings
+    fake_gdb.objfiles = lambda: []
+
+    with pytest.raises(ValueError, match="not found"):
+        bridge._dispatch_op("break_set", {
+            "location": "*0x1234",
+            "rebase_module": "nonexistent",
+        })

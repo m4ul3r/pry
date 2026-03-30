@@ -97,7 +97,6 @@ EXEC_OPS = {
     "nexti",
     "finish",
     "until",
-    "interrupt",
 }
 
 WRITE_LOCKED_OPS = {
@@ -113,7 +112,6 @@ WRITE_LOCKED_OPS = {
     "nexti",
     "finish",
     "until",
-    "interrupt",
     "break_set",
     "break_delete",
     "break_enable",
@@ -129,7 +127,7 @@ WRITE_LOCKED_OPS = {
 # GDB thread safety: post work to GDB's event loop
 # ---------------------------------------------------------------------------
 
-def _run_on_gdb_thread(func):
+def _run_on_gdb_thread(func, *, timeout: float = 120.0):
     """Execute *func* on GDB's main thread via gdb.post_event and wait."""
     holder: dict[str, Any] = {}
     event = threading.Event()
@@ -143,10 +141,13 @@ def _run_on_gdb_thread(func):
         event.set()
 
     gdb.post_event(_callback)
-    event.wait(timeout=120.0)
+    event.wait(timeout=timeout)
 
     if not event.is_set():
-        raise RuntimeError("Timed out waiting for GDB main thread")
+        raise RuntimeError(
+            f"Timed out waiting for GDB main thread after {timeout:.0f}s "
+            "(the operation may still be running in GDB)"
+        )
     if "error" in holder:
         raise holder["error"]
     return holder.get("result")
@@ -294,6 +295,10 @@ class GdbBridge:
         self._thread: threading.Thread | None = None
         self._lock = _ReadWriteLock()
         self._last_stop_reason: dict[str, Any] | None = None
+        # Background execution state
+        self._running = False
+        self._background_completion: threading.Event | None = None
+        self._background_result: dict[str, Any] | None = None
         gdb.events.stop.connect(self._on_stop)
         if hasattr(gdb.events, "exited"):
             gdb.events.exited.connect(self._on_exited)
@@ -350,6 +355,7 @@ class GdbBridge:
 
     def _on_stop(self, event):
         """GDB stop-event callback — captures the stop reason."""
+        self._running = False
         reason: dict[str, Any] = {}
         if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
             bps = event.breakpoints
@@ -362,6 +368,7 @@ class GdbBridge:
 
     def _on_exited(self, event):
         """GDB exited-event callback — clears stale stop reason."""
+        self._running = False
         self._last_stop_reason = None
 
     def _exec_and_stop(self, cmd: str) -> None:
@@ -448,19 +455,124 @@ class GdbBridge:
         op = payload.get("op")
         params = payload.get("params") or {}
         try:
+            # Lock-free ops: these must work even when the write lock is held
+            # by a running background exec.
+            if op == "interrupt":
+                return self._dispatch_interrupt()
+            if op == "status":
+                return self._dispatch_status()
+            if op == "wait":
+                return self._dispatch_wait(params)
+
+            if op == "trace":
+                return self._dispatch_trace(params)
+
             if op in EXEC_OPS:
                 return self._dispatch_exec(op, params)
 
+            gdb_timeout = params.pop("_timeout", None) or 120.0
             lock = contextlib.nullcontext()
             if op in WRITE_LOCKED_OPS:
                 lock = self._lock.write()
             elif op in READ_LOCKED_OPS:
                 lock = self._lock.read()
             with lock:
-                result = _run_on_gdb_thread(lambda: self._dispatch_op(op, params))
+                result = _run_on_gdb_thread(
+                    lambda: self._dispatch_op(op, params),
+                    timeout=gdb_timeout,
+                )
             return _json_response(ok=True, result=result)
         except Exception as exc:
             return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+    def _dispatch_interrupt(self) -> dict[str, Any]:
+        """Interrupt the inferior without acquiring any lock.
+
+        This must work even when ``_dispatch_exec`` holds the write lock,
+        since the primary use case is interrupting a running continue.
+        """
+        event = threading.Event()
+        holder: dict[str, Any] = {}
+
+        def _do_interrupt():
+            try:
+                gdb.execute("interrupt", to_string=True)
+                holder["ok"] = True
+            except Exception as exc:
+                holder["error"] = str(exc)
+            event.set()
+
+        gdb.post_event(_do_interrupt)
+        if not event.wait(timeout=10.0):
+            return _json_response(
+                ok=False, error="Timed out posting interrupt to GDB"
+            )
+        if "error" in holder:
+            return _json_response(ok=False, error=holder["error"])
+        return _json_response(ok=True, result={"interrupted": True})
+
+    def _dispatch_status(self) -> dict[str, Any]:
+        """Return the inferior's current execution state (lock-free)."""
+        result: dict[str, Any] = {}
+        if self._running:
+            result["state"] = "running"
+        else:
+            result["state"] = "stopped"
+            result.update(_stop_info())
+            if self._last_stop_reason:
+                result["reason"] = self._last_stop_reason
+        if self._background_result is not None:
+            result["last_background_result"] = self._background_result
+        return _json_response(ok=True, result=result)
+
+    def _dispatch_wait(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Block until the inferior stops after a background exec (lock-free)."""
+        wait_timeout: float = params.pop("_timeout", 120.0)
+        completion = self._background_completion
+        if completion is None:
+            if self._running:
+                return _json_response(
+                    ok=False,
+                    error="Inferior is running but not from a background exec",
+                )
+            result = _stop_info()
+            result["state"] = "stopped"
+            if self._last_stop_reason:
+                result["reason"] = self._last_stop_reason
+            return _json_response(ok=True, result=result)
+
+        if not completion.wait(timeout=wait_timeout):
+            return _json_response(
+                ok=False,
+                error=f"Timed out after {wait_timeout:.0f}s waiting for inferior to stop",
+            )
+
+        result = self._background_result or _stop_info()
+        result["state"] = "stopped"
+        self._background_result = None
+        return _json_response(ok=True, result=result)
+
+    def _background_monitor(
+        self,
+        completion: threading.Event,
+        result_box: list[dict[str, Any]],
+        error_box: list[Exception],
+        on_stop,
+        on_exited,
+    ):
+        """Wait for a background exec to complete and clean up."""
+        completion.wait()  # wait indefinitely
+        with contextlib.suppress(Exception):
+            gdb.events.stop.disconnect(on_stop)
+        if hasattr(gdb.events, "exited"):
+            with contextlib.suppress(Exception):
+                gdb.events.exited.disconnect(on_exited)
+        if result_box:
+            self._background_result = result_box[0]
+        elif error_box:
+            self._background_result = {"error": str(error_box[0])}
+        self._background_completion = None
+        self._running = False
 
     def _dispatch_exec(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
         """Dispatch an execution command and wait for the stop/exited event.
@@ -469,6 +581,16 @@ class GdbBridge:
         to return, this waits for GDB's stop or exited event to fire — which
         happens AFTER the callback returns and GDB processes the stop.
         """
+        exec_timeout: float = params.pop("_timeout", 120.0)
+        background: bool = params.pop("_background", False)
+
+        if self._running:
+            raise RuntimeError(
+                "Inferior is already running (from a background exec). "
+                "Use 'pry wait' to wait for it to stop, "
+                "or 'pry interrupt' to interrupt it."
+            )
+
         completion = threading.Event()
         result_box: list[dict[str, Any]] = []
         error_box: list[Exception] = []
@@ -502,16 +624,46 @@ class GdbBridge:
                 error_box.append(exc)
                 completion.set()
 
+        if background:
+            # Background mode: set up event handlers, post the command,
+            # start a monitor thread, and return immediately.
+            self._running = True
+            self._background_completion = completion
+            self._background_result = None
+            gdb.events.stop.connect(_on_exec_stop)
+            if hasattr(gdb.events, "exited"):
+                gdb.events.exited.connect(_on_exec_exited)
+            gdb.post_event(_do_execute)
+            threading.Thread(
+                target=self._background_monitor,
+                args=(completion, result_box, error_box,
+                      _on_exec_stop, _on_exec_exited),
+                daemon=True,
+            ).start()
+            return _json_response(ok=True, result={"status": "running"})
+
         with self._lock.write():
+            self._running = True
             gdb.events.stop.connect(_on_exec_stop)
             if hasattr(gdb.events, "exited"):
                 gdb.events.exited.connect(_on_exec_exited)
             try:
                 gdb.post_event(_do_execute)
-                if not completion.wait(timeout=120.0):
-                    raise RuntimeError(
-                        "Timed out waiting for inferior to stop"
+                if not completion.wait(timeout=exec_timeout):
+                    # Auto-interrupt the inferior and give it a short grace
+                    # period to stop so we can return a usable response
+                    # instead of leaving the bridge deadlocked.
+                    gdb.post_event(
+                        lambda: gdb.execute("interrupt", to_string=True)
                     )
+                    if not completion.wait(timeout=5.0):
+                        self._running = False
+                        raise RuntimeError(
+                            "Timed out waiting for inferior to stop, "
+                            "and auto-interrupt did not succeed"
+                        )
+                    if result_box:
+                        result_box[0]["timeout_interrupt"] = True
             finally:
                 gdb.events.stop.disconnect(_on_exec_stop)
                 if hasattr(gdb.events, "exited"):
@@ -523,6 +675,171 @@ class GdbBridge:
             raise RuntimeError("Execution completed without stop or exit event")
 
         return _json_response(ok=True, result=result_box[0])
+
+    @staticmethod
+    def _parse_addr(addr) -> int:
+        """Parse an address from int, hex string, or GDB expression."""
+        if isinstance(addr, int):
+            return addr
+        if isinstance(addr, str):
+            addr = addr.strip().lstrip("*")
+            try:
+                return int(addr, 0)
+            except ValueError:
+                val = gdb.parse_and_eval(addr)
+                return int(val)
+        return int(addr)
+
+    def _dispatch_trace(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Trace memory accesses within a code range using hardware watchpoints.
+
+        Sets up a hardware watchpoint (initially disabled) and boundary
+        breakpoints.  The watchpoint is enabled when range_start is hit and
+        disabled when range_end is reached.  Each watchpoint hit records the
+        PC and instruction.  All automation runs inside GDB via
+        ``Breakpoint.stop()`` callbacks at native speed.
+        """
+        watch_addr = self._parse_addr(params["watch_addr"])
+        watch_size = int(params.get("watch_size", 4))
+        range_start = self._parse_addr(params["range_start"])
+        range_end = self._parse_addr(params["range_end"])
+        watch_type = params.get("watch_type", "access")
+        max_hits = int(params.get("max_hits", 10000))
+        trace_timeout: float = params.pop("_timeout", 120.0)
+
+        hits: list[dict[str, Any]] = []
+        completion = threading.Event()
+        result_box: list[dict[str, Any]] = []
+        error_box: list[Exception] = []
+        cleanup_bps: list[Any] = []
+
+        # We build the custom Breakpoint subclasses inside a GDB-thread
+        # callback so that gdb.Breakpoint() calls happen on the main thread.
+        # A mutable holder lets the start-BP reference the watchpoint that
+        # is created after it.
+        wp_holder: list[Any] = []
+
+        def _setup_and_continue():
+            try:
+                wp_class_map = {
+                    "write": getattr(gdb, "WP_WRITE", 0),
+                    "read": getattr(gdb, "WP_READ", 1),
+                    "access": getattr(gdb, "WP_ACCESS", 2),
+                }
+                wp_class = wp_class_map.get(watch_type, wp_class_map["access"])
+                watch_expr = f"*(char(*)[{watch_size}]){hex(watch_addr)}"
+
+                class _RangeStartBP(gdb.Breakpoint):
+                    def stop(self_bp):  # noqa: N805
+                        if wp_holder:
+                            wp_holder[0].enabled = True
+                        return False  # auto-continue
+
+                class _RangeEndBP(gdb.Breakpoint):
+                    def stop(self_bp):  # noqa: N805
+                        if wp_holder:
+                            wp_holder[0].enabled = False
+                        return True  # stop execution
+
+                class _TraceWatchBP(gdb.Breakpoint):
+                    def stop(self_bp):  # noqa: N805
+                        if len(hits) >= max_hits:
+                            return True  # stop, limit reached
+                        try:
+                            frame = gdb.selected_frame()
+                            pc = hex(frame.pc())
+                            arch = frame.architecture()
+                            insns = arch.disassemble(frame.pc(), count=1)
+                            asm = insns[0]["asm"] if insns else "<unknown>"
+                        except Exception:
+                            pc = "<unknown>"
+                            asm = "<unknown>"
+                        hits.append({"pc": pc, "asm": asm})
+                        return False  # auto-continue
+
+                start_bp = _RangeStartBP(f"*{hex(range_start)}")
+                start_bp.silent = True
+                cleanup_bps.append(start_bp)
+
+                end_bp = _RangeEndBP(f"*{hex(range_end)}")
+                end_bp.silent = True
+                cleanup_bps.append(end_bp)
+
+                trace_wp = _TraceWatchBP(
+                    watch_expr,
+                    type=gdb.BP_WATCHPOINT,
+                    wp_class=wp_class,
+                )
+                trace_wp.silent = True
+                trace_wp.enabled = False
+                cleanup_bps.append(trace_wp)
+                wp_holder.append(trace_wp)
+
+                gdb.execute("continue", to_string=True)
+            except Exception as exc:
+                error_box.append(exc)
+                completion.set()
+
+        def _on_trace_stop(event):
+            result = _stop_info()
+            reason: dict[str, Any] = {}
+            if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
+                bps = event.breakpoints
+                if bps:
+                    reason = self._bp_reason(bps[0])
+            elif hasattr(gdb, "SignalEvent") and isinstance(event, gdb.SignalEvent):
+                reason = {"kind": "signal", "signal": event.stop_signal}
+            if reason:
+                result["reason"] = reason
+            result_box.append(result)
+            completion.set()
+
+        def _on_trace_exited(event):
+            result: dict[str, Any] = {"status": "exited", "frame": None, "thread": None}
+            code = getattr(event, "exit_code", None)
+            if code is not None:
+                result["reason"] = {"kind": "exited", "code": code}
+            result_box.append(result)
+            completion.set()
+
+        with self._lock.write():
+            gdb.events.stop.connect(_on_trace_stop)
+            if hasattr(gdb.events, "exited"):
+                gdb.events.exited.connect(_on_trace_exited)
+            try:
+                gdb.post_event(_setup_and_continue)
+                if not completion.wait(timeout=trace_timeout):
+                    gdb.post_event(
+                        lambda: gdb.execute("interrupt", to_string=True)
+                    )
+                    completion.wait(timeout=5.0)
+            finally:
+                gdb.events.stop.disconnect(_on_trace_stop)
+                if hasattr(gdb.events, "exited"):
+                    gdb.events.exited.disconnect(_on_trace_exited)
+                # Clean up internal breakpoints.
+                def _cleanup():
+                    for bp in cleanup_bps:
+                        with contextlib.suppress(Exception):
+                            bp.delete()
+                gdb.post_event(_cleanup)
+
+        if error_box:
+            raise error_box[0]
+
+        trace_result: dict[str, Any] = {
+            "hits": hits,
+            "hit_count": len(hits),
+            "truncated": len(hits) >= max_hits,
+            "watch_addr": hex(watch_addr),
+            "watch_size": watch_size,
+            "range_start": hex(range_start),
+            "range_end": hex(range_end),
+        }
+        if result_box:
+            trace_result["stop_info"] = result_box[0]
+
+        return _json_response(ok=True, result=trace_result)
 
     # ------------------------------------------------------------------
     # Op dispatch
@@ -743,10 +1060,63 @@ class GdbBridge:
     # Breakpoints
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_module_base(module_name: str) -> int:
+        """Find the runtime load base of a module via process mappings."""
+        import re as _re
+
+        # Try info proc mappings first (most reliable for local targets).
+        try:
+            output = gdb.execute("info proc mappings", to_string=True)
+            for line in output.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and module_name in parts[-1]:
+                    return int(parts[0], 16)
+        except gdb.error:
+            pass
+
+        # Fallback: search loaded objfiles.
+        for objfile in gdb.objfiles():
+            fname = objfile.filename or ""
+            if module_name in fname:
+                # Use the lowest section address as the load base.
+                try:
+                    out = gdb.execute(
+                        f"info files", to_string=True
+                    )
+                    for fline in out.splitlines():
+                        m = _re.match(
+                            r"\s*(0x[0-9a-fA-F]+)\s*-\s*0x[0-9a-fA-F]+\s+is\s+\.text\s+in\s+",
+                            fline,
+                        )
+                        if m and module_name in fline:
+                            return int(m.group(1), 16)
+                except gdb.error:
+                    pass
+
+        raise ValueError(f"Module {module_name!r} not found in process mappings")
+
     def _break_set(self, params: dict[str, Any]) -> dict[str, Any]:
         location = params["location"]
         temporary = params.get("temporary", False)
         hardware = params.get("hardware", False)
+        rebase_module = params.get("rebase_module")
+        image_base = int(params.get("image_base", 0))
+
+        rebased_meta: dict[str, Any] | None = None
+        if rebase_module:
+            offset_str = location.lstrip("*").strip()
+            offset = int(offset_str, 0)
+            module_base = self._resolve_module_base(rebase_module)
+            runtime_addr = offset - image_base + module_base
+            location = f"*{hex(runtime_addr)}"
+            rebased_meta = {
+                "module": rebase_module,
+                "offset": hex(offset),
+                "image_base": hex(image_base),
+                "module_base": hex(module_base),
+                "resolved": hex(runtime_addr),
+            }
 
         bp_type = gdb.BP_BREAKPOINT
         if hardware:
@@ -758,7 +1128,10 @@ class GdbBridge:
         if condition:
             bp.condition = condition
 
-        return _breakpoint_to_dict(bp)
+        result = _breakpoint_to_dict(bp)
+        if rebased_meta:
+            result["rebased"] = rebased_meta
+        return result
 
     def _break_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         bps = gdb.breakpoints() or []

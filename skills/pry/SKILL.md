@@ -136,9 +136,32 @@ pry nexti                    # Step over (instruction-level)
 pry finish                   # Run until current function returns
 pry until main.c:42          # Run until a specific location
 pry interrupt                # Interrupt a running inferior
+pry status                   # Check if inferior is running or stopped
+pry wait                     # Wait for a background exec to stop
 ```
 
-Execution commands block until the inferior stops or exits. Use `--timeout` to override the default 30s transport timeout for long-running programs. Set breakpoints before running to ensure the program stops where you want.
+Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
+
+### Background execution
+
+Use `--background` on `run`, `continue`, `finish`, or `until` to return immediately while the inferior keeps running:
+
+```bash
+pry continue --background    # Returns immediately with status: running
+pry status                   # Check state: running or stopped
+pry wait --timeout 60        # Block until stopped (with optional timeout)
+pry interrupt                # Manually interrupt if needed
+```
+
+`pry interrupt` always works — even during a background exec or when the write lock is held.
+
+### Timeout recovery
+
+```bash
+pry continue --timeout 60    # Auto-interrupts after 60s, bridge stays usable
+```
+
+When `--timeout` fires, the bridge auto-interrupts the inferior and returns the stop info. No more `pry kill` + relaunch cycles.
 
 Execution commands report the **stop reason** when available:
 - `reason: breakpoint #1 hit` — stopped at a breakpoint
@@ -166,7 +189,37 @@ pry watch disable 2                         # Disable watchpoint #2
 pry watch list                              # List all (same as break list)
 ```
 
+### PIE/ASLR rebasing
+
+For PIE binaries, use `--rebase MODULE` to set breakpoints by static analysis offset — pry resolves the runtime address automatically:
+
+```bash
+pry break set *0x1234 --rebase myprogram                      # Offset from module load base
+pry break set *0x40656e --rebase myprogram --image-base 0x400000  # Subtract BN's image base
+```
+
+The response includes rebasing metadata showing the module base and resolved runtime address.
+
 Breakpoints and watchpoints share the same number space in GDB. `pry watch delete 2` and `pry break delete 2` are equivalent.
+
+## Memory Tracing
+
+Trace every instruction within a code range that touches a specific memory address:
+
+```bash
+pry trace --watch 0x7fffffffd5d4 --range 0x404610-0x405e30
+pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type access --timeout 60 --max-hits 1000
+```
+
+Uses hardware watchpoints gated by range boundary breakpoints. All automation runs inside GDB at native speed via `Breakpoint.stop()` callbacks — no socket round-trips for intermediate hits.
+
+Options:
+- `--watch ADDR` — memory address to watch (required)
+- `--watch-size N` — bytes to watch (default: 4)
+- `--range START-END` — code address range (required)
+- `--type write|read|access` — watch type (default: access)
+- `--max-hits N` — safety limit (default: 10000)
+- `--timeout N` — max seconds (default: 120)
 
 ## Inspection Commands
 
@@ -216,10 +269,11 @@ Execute arbitrary Python inside GDB when the built-in commands are insufficient:
 ```bash
 pry py exec --code "result['value'] = [str(f) for f in gdb.selected_frame().block()]"
 pry py exec --script /path/to/script.py
+pry py exec --script trace.py --timeout 120   # Timeout for long-running scripts
 echo 'print(gdb.selected_frame().name())' | pry py exec --stdin
 ```
 
-The Python environment has `gdb` in scope. Set `result['value']` to return structured data.
+The Python environment has `gdb` in scope. Set `result['value']` to return structured data. Use `--timeout` to prevent long-running scripts from hanging the bridge.
 
 ## Raw GDB Command Passthrough
 
@@ -379,7 +433,7 @@ pry info target                  # Show target connection info
 
 ## Known Quirks
 
-- **Execution commands block**: `pry run`, `pry continue`, `pry finish` block until the inferior stops. Always set breakpoints before running, or use `--timeout` for long-running programs.
+- **Execution commands block**: `pry run`, `pry continue`, `pry finish` block until the inferior stops. Use `--timeout` for auto-interrupt recovery, or `--background` to return immediately and poll with `pry status`/`pry wait`.
 - **Thread safety**: The bridge posts all GDB commands onto GDB's main thread. This means GDB stays responsive, but only one op executes at a time.
 - **No undo**: Unlike Binary Ninja's bn tool, GDB mutations (memory writes, register changes) are immediate and not reversible. There is no `--preview` mode.
 - **Source availability**: `pry source list` and file/line info in backtraces require debug symbols (`-g` flag when compiling).
