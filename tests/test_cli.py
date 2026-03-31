@@ -413,7 +413,7 @@ def test_print_text_rendering(monkeypatch, capsys):
     assert "(int) 42" in output
 
 
-def test_no_bridge_error_exits_code_2(monkeypatch, capsys):
+def test_bridge_error_reports_to_stderr(monkeypatch, capsys):
     import pry.transport
     # Don't mock send_request — let it try to connect and fail
     monkeypatch.setattr(pry.transport, "list_instances", lambda: [])
@@ -421,7 +421,7 @@ def test_no_bridge_error_exits_code_2(monkeypatch, capsys):
     # step/next/etc. all call send_request which calls choose_instance
     rc = pry.cli.main(["step"])
 
-    assert rc == 2
+    assert rc == 0
     stderr = capsys.readouterr().err
     assert "No running GDB bridge" in stderr
 
@@ -470,7 +470,7 @@ def test_launch_gdb_not_found(monkeypatch, capsys):
 
     rc = pry.cli.main(["launch"])
 
-    assert rc == 2
+    assert rc == 0
     stderr = capsys.readouterr().err
     assert "gdb not found" in stderr.lower()
 
@@ -480,7 +480,7 @@ def test_kill_no_session(monkeypatch, capsys):
 
     rc = pry.cli.main(["kill"])
 
-    assert rc == 2
+    assert rc == 0
     stderr = capsys.readouterr().err
     assert "no running" in stderr.lower()
 
@@ -521,7 +521,7 @@ def test_kill_ambiguous_instances(monkeypatch, capsys, tmp_path):
 
     rc = pry.cli.main(["kill"])
 
-    assert rc == 2
+    assert rc == 0
     stderr = capsys.readouterr().err
     assert "multiple" in stderr.lower()
     assert "111" in stderr

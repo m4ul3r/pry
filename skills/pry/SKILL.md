@@ -124,6 +124,8 @@ pry run
 
 Outputs above 10,000 `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata.
 
+4. **Parallel calls are safe.** All pry commands exit 0 — errors are reported in stderr, never via exit code. Read-only inspection commands (`backtrace`, `registers`, `locals`, `memory read`, `disasm`, `print`, etc.) can be batched in parallel freely. Avoid parallelising execution/mutation commands (`run`, `continue`, `step`, `break set`, `memory write`) as they acquire an exclusive lock and will serialise anyway.
+
 ## Execution Control
 
 ```bash

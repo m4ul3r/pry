@@ -1593,9 +1593,7 @@ def _trace(args: argparse.Namespace) -> int:
     # E.g. "0x404610-0x405e30" → ("0x404610", "0x405e30")
     idx = range_str.find("-", 2)  # skip potential 0x prefix
     if idx == -1:
-        print("error: --range must be in format START-END (e.g., 0x404610-0x405e30)",
-              file=sys.stderr)
-        return 1
+        raise BridgeError("--range must be in format START-END (e.g., 0x404610-0x405e30)")
     range_start = range_str[:idx].strip()
     range_end = range_str[idx + 1:].strip()
 
@@ -2001,10 +1999,10 @@ def main(argv: list[str] | None = None) -> int:
     if handler is None:
         selected_parser = getattr(args, "_parser", parser)
         selected_parser.print_help()
-        return 1
+        return 0
 
     try:
-        return handler(args)
+        handler(args)
     except BridgeError as exc:
         print(str(exc), file=sys.stderr)
-        return 2
+    return 0
