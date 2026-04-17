@@ -79,6 +79,43 @@ def _load_instance(path: Path) -> BridgeInstance | None:
 PLUGIN_NAME = "pry_agent_bridge"
 
 
+def _pid_is_alive(pid: int) -> bool:
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _reap_stale_artifacts(inst_dir: Path, live_pids: set[int]) -> None:
+    """Unlink orphaned .sock/.log files whose owning GDB process is gone.
+
+    A normal `pry kill` or clean bridge shutdown unlinks everything; this
+    reaper only kicks in when GDB was killed externally (SIGKILL, OOM, etc.)
+    and left its socket/log behind.
+    """
+    if not inst_dir.is_dir():
+        return
+    for path in inst_dir.iterdir():
+        stem = path.stem
+        try:
+            pid = int(stem)
+        except ValueError:
+            continue
+        if pid in live_pids:
+            continue
+        if _pid_is_alive(pid):
+            continue
+        if path.suffix in (".sock", ".log"):
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
 def list_instances() -> list[BridgeInstance]:
     instances: list[BridgeInstance] = []
 
@@ -98,6 +135,7 @@ def list_instances() -> list[BridgeInstance]:
             if instance is not None:
                 instances.append(instance)
 
+    _reap_stale_artifacts(inst_dir, {inst.pid for inst in instances})
     return instances
 
 

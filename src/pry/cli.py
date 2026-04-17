@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -376,7 +377,7 @@ def _render_status_text(value: Any) -> str:
         return _render_fallback_text(value)
     state = value.get("state", "unknown")
     parts = [f"state: {state}"]
-    if state == "stopped":
+    if state in ("stopped", "exited"):
         reason = _format_stop_reason(value.get("reason"))
         if reason:
             parts.append(f"reason: {reason}")
@@ -450,6 +451,38 @@ def _render_target_info_text(value: Any) -> str:
     return "\n".join(parts) if parts else "no target info"
 
 
+def _bp_kind_label(bp: dict) -> str:
+    """Return the human-friendly kind label for a breakpoint dict."""
+    kind = bp.get("kind")
+    if isinstance(kind, str):
+        return kind
+    # Legacy fallback: plugins without the kind field report only the
+    # integer type code, or sometimes a pre-rendered string. Accept both.
+    btype = bp.get("type")
+    if isinstance(btype, str):
+        return btype
+    return "breakpoint" if btype in (None, 1) else f"type-{btype}"
+
+
+def _bp_target_label(bp: dict) -> str:
+    """Location string for watchpoints vs breakpoints."""
+    expr = bp.get("expression")
+    location = bp.get("location")
+    if expr and (bp.get("kind") or "").endswith("watchpoint"):
+        return expr
+    if location:
+        return location
+    if expr:
+        return expr
+    return "<unknown>"
+
+
+def _bp_target_preposition(bp: dict) -> str:
+    """'at' for breakpoints, 'on' for watchpoints."""
+    kind = bp.get("kind") or ""
+    return "on" if "watchpoint" in kind else "at"
+
+
 def _render_breakpoint_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -461,11 +494,16 @@ def _render_breakpoint_list_text(value: Any) -> str:
             lines.append(str(bp))
             continue
         num = bp.get("number", "?")
-        btype = bp.get("type", "breakpoint")
-        location = bp.get("location", "<unknown>")
+        kind = _bp_kind_label(bp)
+        target = _bp_target_label(bp)
+        prep = _bp_target_preposition(bp)
         enabled = "enabled" if bp.get("enabled") else "disabled"
         hits = bp.get("hits", 0)
-        line = f"#{num} {btype} at {location} [{enabled}] hits={hits}"
+        line = f"#{num} {kind} {prep} {target} [{enabled}] hits={hits}"
+        if bp.get("pending"):
+            line += " (pending)"
+        if bp.get("temporary"):
+            line += " (temporary)"
         cond = bp.get("condition")
         if cond:
             line += f" if {cond}"
@@ -477,9 +515,14 @@ def _render_breakpoint_set_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     num = value.get("number", "?")
-    location = value.get("location") or value.get("expression") or "<unknown>"
+    target = _bp_target_label(value)
+    prep = _bp_target_preposition(value)
+    kind = _bp_kind_label(value)
+    noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
     enabled = "enabled" if value.get("enabled") else "disabled"
-    parts = [f"breakpoint #{num} set at {location} [{enabled}]"]
+    parts = [f"{noun} #{num} set {prep} {target} [{enabled}]"]
+    if value.get("pending"):
+        parts.append("(pending — location not yet resolved)")
     if value.get("temporary"):
         parts.append("temporary")
     cond = value.get("condition")
@@ -502,9 +545,11 @@ def _render_breakpoint_state_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     num = value.get("number", "?")
-    location = value.get("location") or value.get("expression") or "<unknown>"
+    target = _bp_target_label(value)
+    prep = _bp_target_preposition(value)
+    noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
     enabled = "enabled" if value.get("enabled") else "disabled"
-    return f"breakpoint #{num} at {location} [{enabled}]"
+    return f"{noun} #{num} {prep} {target} [{enabled}]"
 
 
 def _render_watch_set_text(value: Any) -> str:
@@ -603,11 +648,39 @@ def _render_memory_text(value: Any) -> str:
     fmt = value.get("format", "hex")
     if fmt == "string":
         return value.get("data", "")
+    if fmt == "pretty":
+        return _render_memory_pretty(value)
     data = value.get("data", "")
     addr = value.get("address", "")
     if addr:
         return f"{addr}: {data}"
     return data
+
+
+def _render_memory_pretty(value: dict) -> str:
+    """Build an xxd-style dump from a hex payload."""
+    hex_data = value.get("data", "")
+    addr_str = value.get("address", "0x0")
+    try:
+        base = int(addr_str, 16) if isinstance(addr_str, str) else int(addr_str)
+    except ValueError:
+        base = 0
+    try:
+        raw = bytes.fromhex(hex_data)
+    except ValueError:
+        return hex_data
+    lines = []
+    for offset in range(0, len(raw), 16):
+        chunk = raw[offset:offset + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        # Pad hex part to 16 bytes wide for alignment.
+        hex_part = f"{hex_part:<47}"
+        # Split into two 8-byte groups with a middle gap.
+        left = hex_part[:23]
+        right = hex_part[24:]
+        ascii_part = "".join(chr(b) if 0x20 <= b < 0x7f else "." for b in chunk)
+        lines.append(f"0x{base + offset:x}:  {left} {right}  |{ascii_part}|")
+    return "\n".join(lines)
 
 
 def _render_disasm_text(value: Any) -> str:
@@ -631,17 +704,40 @@ def _render_name_list_text(value: Any) -> str:
         return _render_fallback_text(value)
     if not value:
         return "none"
-    lines = []
+    # Align the name column when addresses are present so the eye can scan
+    # down. Trailing columns (file:line, signature/decl) fall where they may.
+    rows: list[tuple[str, str, str]] = []
+    name_width = 0
     for item in value:
-        if isinstance(item, dict):
-            name = item.get("name", "<unknown>")
-            addr = item.get("address", "")
-            if addr:
-                lines.append(f"{addr}  {name}")
-            else:
-                lines.append(name)
+        if not isinstance(item, dict):
+            rows.append(("", str(item), ""))
+            continue
+        addr = item.get("address") or ""
+        name = item.get("name") or "<unknown>"
+        trailer_parts: list[str] = []
+        file = item.get("file")
+        line = item.get("line")
+        if file and line is not None:
+            trailer_parts.append(f"{file}:{line}")
+        elif file:
+            trailer_parts.append(str(file))
+        detail = item.get("signature") or item.get("decl")
+        if detail:
+            trailer_parts.append(str(detail))
+        rows.append((addr, name, "  ".join(trailer_parts)))
+        name_width = max(name_width, len(name))
+    lines: list[str] = []
+    for addr, name, trailer in rows:
+        parts = []
+        if addr:
+            parts.append(addr)
+        if trailer:
+            parts.append(f"{name:<{name_width}}")
         else:
-            lines.append(str(item))
+            parts.append(name)
+        if trailer:
+            parts.append(trailer)
+        lines.append("  ".join(parts))
     return "\n".join(lines)
 
 
@@ -706,11 +802,21 @@ def _render_py_exec_text(value: Any) -> str:
     return "\n".join(parts) if parts else "(no output)"
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def _render_gdb_exec_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     output = value.get("output", "")
-    return output.rstrip() if output else "(no output)"
+    if not output:
+        return "(no output)"
+    # pwndbg and friends emit ANSI colors even when stdout is a pipe. Strip
+    # them when we're not printing to a real terminal so agents don't have
+    # to filter escape codes out of tool results.
+    if not sys.stdout.isatty():
+        output = _ANSI_ESCAPE_RE.sub("", output)
+    return output.rstrip()
 
 
 # ---------------------------------------------------------------------------
@@ -1400,13 +1506,24 @@ def _memory_read(args: argparse.Namespace) -> int:
         "address": args.address,
         "length": args.length,
     }
-    if mem_fmt != "hex":
-        params["format"] = mem_fmt
+    # "pretty" is a CLI-side presentation on top of the hex payload so the
+    # wire format stays unchanged. Request hex from the bridge and let the
+    # text renderer format the dump.
+    wire_fmt = "hex" if mem_fmt == "pretty" else mem_fmt
+    if wire_fmt != "hex":
+        params["format"] = wire_fmt
+
+    def _render(value: Any) -> str:
+        if mem_fmt == "pretty" and isinstance(value, dict):
+            value = dict(value)
+            value["format"] = "pretty"
+        return _render_memory_text(value)
+
     return _call(
         args,
         "memory_read",
         params,
-        text_renderer=_render_memory_text,
+        text_renderer=_render,
         stem="memory_read",
     )
 
@@ -1633,6 +1750,13 @@ def _add_timeout_arg(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = PryArgumentParser(prog="pry", description="Agent-friendly GDB CLI")
     parser.set_defaults(handler=None)
+    # Global --instance: accepted before the subcommand so `pry --instance PID
+    # <cmd>` matches the form shown throughout the README/SKILL docs. The
+    # subcommand-level --instance is still accepted and wins when both are set.
+    parser.add_argument(
+        "--instance", type=int, default=None, metavar="PID", dest="instance_global",
+        help="Target a specific bridge instance by GDB PID (global form)",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1896,8 +2020,9 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(mem_read)
     mem_read.add_argument("address", help="Start address (hex or expression)")
     mem_read.add_argument("length", type=int, help="Number of bytes to read")
-    mem_read.add_argument("--display", dest="mem_format", choices=("hex", "bytes", "string"), default="hex",
-                          help="Memory display format")
+    mem_read.add_argument("--display", dest="mem_format",
+                          choices=("hex", "bytes", "string", "pretty"), default="hex",
+                          help="Memory display format (pretty = xxd-style hex+ASCII)")
     mem_read.set_defaults(handler=_memory_read)
 
     mem_write = mem_sub.add_parser("write", help="Write memory")
@@ -1992,9 +2117,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _emit_error(args: argparse.Namespace, message: str) -> None:
+    fmt = getattr(args, "format", "text")
+    if fmt in ("json", "ndjson"):
+        payload = json.dumps({"ok": False, "error": message}, sort_keys=True)
+        print(payload, file=sys.stderr)
+        return
+    # Avoid double-prefixing when the underlying bridge or GDB already emitted
+    # its own "error:"/"ErrorType:" lead-in.
+    text = message if ":" in message.split(None, 1)[0] else f"error: {message}"
+    print(text, file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Reconcile the two --instance positions: subcommand-level value wins when
+    # set; otherwise fall back to the global one.
+    if getattr(args, "instance", None) is None:
+        global_instance = getattr(args, "instance_global", None)
+        if global_instance is not None:
+            args.instance = global_instance
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)
     if handler is None:
         selected_parser = getattr(args, "_parser", parser)
@@ -2004,5 +2147,5 @@ def main(argv: list[str] | None = None) -> int:
     try:
         handler(args)
     except BridgeError as exc:
-        print(str(exc), file=sys.stderr)
+        _emit_error(args, str(exc))
     return 0

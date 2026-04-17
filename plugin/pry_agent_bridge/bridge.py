@@ -6,6 +6,7 @@ import contextlib
 import errno
 import json
 import os
+import re
 import socketserver
 import sys
 import threading
@@ -121,6 +122,155 @@ WRITE_LOCKED_OPS = {
     "py_exec",
     "gdb_exec",
 }
+
+
+# ---------------------------------------------------------------------------
+# info functions / info variables parsing
+# ---------------------------------------------------------------------------
+
+_DEBUG_LINE_RE = re.compile(r"^\s*(\d+):\s*(.+?)\s*;?\s*$")
+_NON_DEBUG_LINE_RE = re.compile(r"^\s*(0x[0-9a-fA-F]+)\s+(.+?)\s*$")
+_FILE_HEADER_RE = re.compile(r"^\s*File\s+(.+?):\s*$")
+# Last identifier before '(' (functions) or before ';' / '[' (variables).
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _extract_function_name(signature: str) -> str | None:
+    """Pull the function name out of a `info functions` signature."""
+    paren = signature.find("(")
+    head = signature[:paren] if paren != -1 else signature
+    idents = _IDENT_RE.findall(head)
+    return idents[-1] if idents else None
+
+
+def _extract_variable_name(decl: str) -> str | None:
+    """Pull the variable name out of a `info variables` declaration."""
+    # Strip trailing initializer, array dims, bit-field widths.
+    head = re.split(r"[\[=:]", decl, maxsplit=1)[0]
+    idents = _IDENT_RE.findall(head)
+    return idents[-1] if idents else None
+
+
+def _lookup_function_address(name: str) -> str | None:
+    """Resolve a function's runtime address via GDB. Best-effort."""
+    try:
+        val = gdb.parse_and_eval(f"&{name}")
+        return f"0x{int(val):x}"
+    except Exception:
+        return None
+
+
+def _resolve_to_address(expr: str) -> int | None:
+    """Resolve *expr* to an integer address. Handles functions, registers,
+    symbols, and raw addresses. Returns None if GDB can't produce one.
+
+    gdb.parse_and_eval("main") returns a function-typed Value; int() of it
+    raises "Cannot convert value to long". Retry as &expr in that case so a
+    function name works the same as a pointer/address.
+    """
+    try:
+        val = gdb.parse_and_eval(expr)
+    except Exception:
+        return None
+    try:
+        return int(val)
+    except Exception:
+        pass
+    try:
+        return int(val.address)
+    except Exception:
+        pass
+    try:
+        return int(gdb.parse_and_eval(f"&({expr})"))
+    except Exception:
+        return None
+
+
+def _parse_info_functions(output: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    current_file: str | None = None
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("All functions", "All defined functions")):
+            continue
+        if stripped.startswith("Non-debugging symbols"):
+            current_file = None
+            continue
+        m = _FILE_HEADER_RE.match(line)
+        if m:
+            current_file = m.group(1)
+            continue
+        # Address-prefixed form ("0xADDR NAME") appears in both
+        # Non-debugging-symbols sections and (in some GDB outputs) directly
+        # under a File: header. Handle either.
+        m = _NON_DEBUG_LINE_RE.match(line)
+        if m:
+            entry: dict[str, Any] = {"name": m.group(2), "address": m.group(1)}
+            if current_file:
+                entry["file"] = current_file
+            result.append(entry)
+            continue
+        m = _DEBUG_LINE_RE.match(line)
+        if not m:
+            continue
+        line_num = int(m.group(1))
+        signature = m.group(2).strip()
+        name = _extract_function_name(signature)
+        if not name:
+            continue
+        entry = {"name": name, "signature": signature, "line": line_num}
+        if current_file:
+            entry["file"] = current_file
+        address = _lookup_function_address(name)
+        if address:
+            entry["address"] = address
+        result.append(entry)
+    return result
+
+
+def _parse_info_variables(output: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    current_file: str | None = None
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("All variables", "All defined variables")):
+            continue
+        if stripped.startswith("Non-debugging symbols"):
+            current_file = None
+            continue
+        m = _FILE_HEADER_RE.match(line)
+        if m:
+            current_file = m.group(1)
+            continue
+        m = _NON_DEBUG_LINE_RE.match(line)
+        if m:
+            entry: dict[str, Any] = {"name": m.group(2), "address": m.group(1)}
+            if current_file:
+                entry["file"] = current_file
+            result.append(entry)
+            continue
+        m = _DEBUG_LINE_RE.match(line)
+        if not m:
+            continue
+        line_num = int(m.group(1))
+        decl = m.group(2).strip()
+        name = _extract_variable_name(decl)
+        if not name:
+            continue
+        entry = {"name": name, "decl": decl, "line": line_num}
+        if current_file:
+            entry["file"] = current_file
+        address = _lookup_function_address(name)
+        if address:
+            entry["address"] = address
+        result.append(entry)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -267,17 +417,44 @@ def _stop_info() -> dict[str, Any]:
     return result
 
 
+_BP_KIND_BY_TYPE: dict[int, str] = {}
+
+
+def _bp_kind(bp_type: int) -> str:
+    """Map a gdb.BP_* integer to a stable string name."""
+    if not _BP_KIND_BY_TYPE:
+        for attr, name in (
+            ("BP_BREAKPOINT", "breakpoint"),
+            ("BP_HARDWARE_BREAKPOINT", "hw-breakpoint"),
+            ("BP_WATCHPOINT", "watchpoint"),
+            ("BP_HARDWARE_WATCHPOINT", "hw-watchpoint"),
+            ("BP_READ_WATCHPOINT", "read-watchpoint"),
+            ("BP_ACCESS_WATCHPOINT", "access-watchpoint"),
+            ("BP_CATCHPOINT", "catchpoint"),
+        ):
+            val = getattr(gdb, attr, None)
+            if val is not None:
+                _BP_KIND_BY_TYPE[int(val)] = name
+    return _BP_KIND_BY_TYPE.get(int(bp_type), f"type-{bp_type}")
+
+
 def _breakpoint_to_dict(bp) -> dict[str, Any]:
     """Convert a gdb.Breakpoint to a JSON-friendly dict."""
     result: dict[str, Any] = {
         "number": bp.number,
         "type": bp.type,
+        "kind": _bp_kind(bp.type),
         "enabled": bp.enabled,
         "location": getattr(bp, "location", None),
         "expression": getattr(bp, "expression", None),
         "condition": bp.condition,
         "hits": bp.hit_count,
         "temporary": bp.temporary,
+        # gdb.Breakpoint.pending is True when the location has not been
+        # resolved yet (e.g. set on a symbol in an unloaded shared library,
+        # or a typo'd function name). Agents otherwise can't tell a zombie
+        # BP from a live one.
+        "pending": bool(getattr(bp, "pending", False)),
     }
     return result
 
@@ -491,6 +668,14 @@ class GdbBridge:
         This must work even when ``_dispatch_exec`` holds the write lock,
         since the primary use case is interrupting a running continue.
         """
+        if not self._running:
+            # Don't lie about interrupting a stopped/exited inferior. Report
+            # the observed state so callers can react instead of assuming a
+            # running program was stopped.
+            return _json_response(
+                ok=True, result={"interrupted": False, "state": "stopped"}
+            )
+
         event = threading.Event()
         holder: dict[str, Any] = {}
 
@@ -517,8 +702,19 @@ class GdbBridge:
         if self._running:
             result["state"] = "running"
         else:
-            result["state"] = "stopped"
-            result.update(_stop_info())
+            info = _stop_info()
+            # Use the thread-level status ("exited" / "stopped" / ...) as the
+            # authoritative state when available so callers don't see
+            # `state: stopped` for an inferior that has already exited.
+            thread_status = info.get("status")
+            if thread_status == "exited":
+                result["state"] = "exited"
+            elif not gdb.selected_inferior().pid:
+                # No thread has ever run (or the inferior has been unloaded).
+                result["state"] = "not-started"
+            else:
+                result["state"] = "stopped"
+            result.update(info)
             if self._last_stop_reason:
                 result["reason"] = self._last_stop_reason
         if self._background_result is not None:
@@ -657,7 +853,6 @@ class GdbBridge:
                         lambda: gdb.execute("interrupt", to_string=True)
                     )
                     if not completion.wait(timeout=5.0):
-                        self._running = False
                         raise RuntimeError(
                             "Timed out waiting for inferior to stop, "
                             "and auto-interrupt did not succeed"
@@ -668,6 +863,12 @@ class GdbBridge:
                 gdb.events.stop.disconnect(_on_exec_stop)
                 if hasattr(gdb.events, "exited"):
                     gdb.events.exited.disconnect(_on_exec_exited)
+                # Reset _running regardless of outcome: the global _on_stop /
+                # _on_exited handlers only clear it when a stop/exit event
+                # fires, so a command that fails before the inferior runs
+                # (e.g. "continue" past exit) would otherwise leak True and
+                # wedge the next exec with a spurious "already running".
+                self._running = False
 
         if error_box:
             raise error_box[0]
@@ -1094,6 +1295,20 @@ class GdbBridge:
                 except gdb.error:
                     pass
 
+        # No mappings means the inferior isn't running yet: PIE images don't
+        # have a runtime base until after exec(). Tell the caller how to get
+        # one instead of just blaming the module name.
+        try:
+            has_mappings = bool(gdb.execute("info proc mappings", to_string=True).strip())
+        except gdb.error:
+            has_mappings = False
+        if not has_mappings:
+            raise ValueError(
+                f"Module {module_name!r} not found: the inferior has no memory "
+                "mappings yet (PIE addresses aren't known until the program "
+                "has exec'd). Set a breakpoint at main and run the program "
+                "first, then retry --rebase."
+            )
         raise ValueError(f"Module {module_name!r} not found in process mappings")
 
     def _break_set(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1386,11 +1601,15 @@ class GdbBridge:
         location = params.get("location")
         count = params.get("count")
 
-        if location:
-            # Try to use Architecture.disassemble for structured output
+        # Default to $pc so --count is honored even when the caller didn't
+        # pass a location. Previously omitting location routed to GDB's
+        # `disassemble` command (whole function), which silently ignored
+        # --count.
+        effective_location = location or "$pc"
+        addr_int = _resolve_to_address(effective_location)
+
+        if addr_int is not None:
             try:
-                addr_val = gdb.parse_and_eval(location)
-                addr_int = int(addr_val)
                 arch = gdb.selected_frame().architecture()
                 insns = arch.disassemble(addr_int, count=count or 20)
                 return [
@@ -1399,36 +1618,19 @@ class GdbBridge:
                 ]
             except Exception:
                 pass
-            # Fallback to gdb.execute
-            cmd = f"disassemble {location}"
-        else:
-            cmd = "disassemble"
 
-        output = gdb.execute(cmd, to_string=True)
-        return output
+        # Fallback: GDB's disassemble command. This path ignores --count
+        # because `disassemble FUNC` emits the whole function.
+        cmd = f"disassemble {location}" if location else "disassemble"
+        return gdb.execute(cmd, to_string=True)
 
     def _functions(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         query = params.get("query")
         offset = int(params.get("offset", 0))
         limit = params.get("limit")
-
-        if query:
-            output = gdb.execute(f"info functions {query}", to_string=True)
-        else:
-            output = gdb.execute("info functions", to_string=True)
-
-        result = []
-        for line in output.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("All") or line.startswith("File") or line.startswith("Non-debugging"):
-                continue
-            # Lines look like: "0x00401000  function_name" or type signatures
-            parts = line.split()
-            if parts and parts[0].startswith("0x"):
-                result.append({"address": parts[0], "name": " ".join(parts[1:])})
-            elif line and not line.endswith(":"):
-                result.append({"name": line})
-
+        cmd = f"info functions {query}" if query else "info functions"
+        output = gdb.execute(cmd, to_string=True)
+        result = _parse_info_functions(output)
         if offset:
             result = result[offset:]
         if limit is not None:
@@ -1439,23 +1641,9 @@ class GdbBridge:
         query = params.get("query")
         offset = int(params.get("offset", 0))
         limit = params.get("limit")
-
-        if query:
-            output = gdb.execute(f"info variables {query}", to_string=True)
-        else:
-            output = gdb.execute("info variables", to_string=True)
-
-        result = []
-        for line in output.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("All") or line.startswith("File") or line.startswith("Non-debugging"):
-                continue
-            parts = line.split()
-            if parts and parts[0].startswith("0x"):
-                result.append({"address": parts[0], "name": " ".join(parts[1:])})
-            elif line and not line.endswith(":"):
-                result.append({"name": line})
-
+        cmd = f"info variables {query}" if query else "info variables"
+        output = gdb.execute(cmd, to_string=True)
+        result = _parse_info_variables(output)
         if offset:
             result = result[offset:]
         if limit is not None:
@@ -1559,10 +1747,19 @@ class GdbBridge:
         finally:
             sys.stdout = old_stdout
 
-        return {
-            "stdout": captured.getvalue(),
-            "result": result_holder.get("value"),
-        }
+        # Return the whole `result` dict so scripts can set arbitrary keys.
+        # Historically only `result["value"]` was surfaced, which silently
+        # dropped anything else the user set. For back-compat, if the script
+        # only set `value`, surface that under the top-level `result` key
+        # (and also expose the full dict under `result_dict`).
+        payload: dict[str, Any] = {"stdout": captured.getvalue()}
+        if set(result_holder.keys()) == {"value"}:
+            payload["result"] = result_holder["value"]
+        elif result_holder:
+            payload["result"] = dict(result_holder)
+        else:
+            payload["result"] = None
+        return payload
 
 
 # ---------------------------------------------------------------------------

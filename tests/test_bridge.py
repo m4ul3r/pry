@@ -705,11 +705,25 @@ def test_interrupt_bypasses_exec_ops(monkeypatch):
     """interrupt is handled before EXEC_OPS check, without locks."""
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
+    bridge._running = True  # simulate a running foreground exec
 
     response = bridge.dispatch({"op": "interrupt", "params": {}})
     assert response["ok"] is True
     assert response["result"]["interrupted"] is True
     assert "interrupt" in fake_gdb._execute_log
+
+
+def test_interrupt_when_idle_is_noop(monkeypatch):
+    """interrupt on a stopped/exited inferior reports rather than lying."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    # Fresh bridge: _running is False.
+
+    response = bridge.dispatch({"op": "interrupt", "params": {}})
+    assert response["ok"] is True
+    assert response["result"]["interrupted"] is False
+    assert response["result"]["state"] == "stopped"
+    assert "interrupt" not in fake_gdb._execute_log
 
 
 def test_dispatch_exec_respects_timeout_param(monkeypatch):

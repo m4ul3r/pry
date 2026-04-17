@@ -18,3 +18,6 @@ tests/fixtures/*.bin
 
 # GDB artifacts
 .gdb_history
+
+# Local scratch binaries / audit fixtures
+tmp/
