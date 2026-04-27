@@ -176,6 +176,7 @@ Execution commands report the **stop reason** when available:
 pry break set main                          # Break at function
 pry break set main.c:42                     # Break at file:line
 pry break set *0x401000                     # Break at address
+pry break set *0x1234 --rebase myprog       # PIE: offset from module load base (see PIE/ASLR rebasing)
 pry break set main --condition "argc > 1"   # Conditional breakpoint
 pry break set main --temporary              # One-shot breakpoint
 pry break list                              # List all breakpoints
@@ -202,6 +203,10 @@ pry break set *0x40656e --rebase myprogram --image-base 0x400000  # Subtract BN'
 
 The response includes rebasing metadata showing the module base and resolved runtime address.
 
+`--rebase` is the equivalent of pwndbg's `brva`, but works for any loaded module (libc, plugins, kernel modules), not just the main executable. If you specifically want raw `brva`, use `pry gdb "brva 0x1234"`.
+
+Combine `--rebase` with `pry trace` (below) for static-analysis-driven memory tracing — give it ranges relative to a module and pry resolves them at runtime.
+
 Breakpoints and watchpoints share the same number space in GDB. `pry watch delete 2` and `pry break delete 2` are equivalent.
 
 ## Memory Tracing
@@ -214,6 +219,8 @@ pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type
 ```
 
 Uses hardware watchpoints gated by range boundary breakpoints. All automation runs inside GDB at native speed via `Breakpoint.stop()` callbacks — no socket round-trips for intermediate hits.
+
+If `--timeout` fires before `--max-hits`, the bridge auto-interrupts and returns the partial hits collected so far — the bridge stays usable, no relaunch needed.
 
 Options:
 - `--watch ADDR` — memory address to watch (required)
