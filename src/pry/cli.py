@@ -18,12 +18,14 @@ from .paths import (
     bridge_registry_path,
     bridge_socket_path,
     cache_home,
+    claude_skills_dir,
+    codex_home,
+    codex_skills_dir,
     gdb_log_path,
     gdb_pid_path,
     plugin_install_dir,
     plugin_source_dir,
-    skill_install_dir,
-    skill_source_dir,
+    repo_root,
 )
 from .transport import BridgeError, _send_request_to_instance, _socket_is_live, list_instances, send_request
 from .version import VERSION, build_id_for_file
@@ -789,6 +791,34 @@ def _render_inferior_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_thread_list_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "no threads"
+    lines = []
+    for thread in value:
+        if not isinstance(thread, dict):
+            lines.append(str(thread))
+            continue
+        num = thread.get("num", "?")
+        selected = " *" if thread.get("selected") else ""
+        status = thread.get("status") or "unknown"
+        inf = thread.get("inferior_num")
+        frame = thread.get("frame") if isinstance(thread.get("frame"), dict) else {}
+        addr = frame.get("address") or "?"
+        func = frame.get("function") or "?"
+        name = thread.get("name")
+        prefix = f"  {num}{selected}"
+        if inf is not None:
+            prefix += f"  inferior={inf}"
+        line = f"{prefix}  {status:<7}  {addr}  {func}"
+        if name:
+            line += f"  ({name})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _render_py_exec_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -817,6 +847,27 @@ def _render_gdb_exec_text(value: Any) -> str:
     if not sys.stdout.isatty():
         output = _ANSI_ESCAPE_RE.sub("", output)
     return output.rstrip()
+
+
+def _render_skill_install_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+
+    installed = value.get("installed_destinations")
+    skipped = value.get("skipped_destinations")
+    lines = []
+
+    if isinstance(installed, list) and installed:
+        lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
+        lines.extend(f"- {dest}" for dest in installed)
+    else:
+        lines.append("Skills already installed.")
+
+    if isinstance(skipped, list) and skipped:
+        lines.append("Skipped existing destinations:")
+        lines.extend(f"- {dest}" for dest in skipped)
+
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +952,13 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         os.symlink(source, dest, target_is_directory=True)
 
 
+def _check_install_destination(dest: Path, *, force: bool) -> None:
+    if force:
+        return
+    if dest.exists() or dest.is_symlink():
+        raise BridgeError(f"Destination already exists: {dest}")
+
+
 def _plugin_install(args: argparse.Namespace) -> int:
     source = plugin_source_dir()
     dest = args.dest or plugin_install_dir()
@@ -931,23 +989,59 @@ def _plugin_install(args: argparse.Namespace) -> int:
 
 
 def _skill_install(args: argparse.Namespace) -> int:
-    source = skill_source_dir()
-    dest = args.dest or skill_install_dir()
-    _install_tree(source, dest, mode=args.mode, force=args.force)
+    skills_root = repo_root() / "skills"
+    explicit_dest = args.dest is not None
+    target_roots = [args.dest] if explicit_dest else _default_skill_install_roots()
+    install_plan = []
+    results = []
 
-    _render_result(
-        {
-            "installed": True,
-            "mode": args.mode,
-            "skill": source.name,
-            "source": str(source),
-            "destination": str(dest),
-        },
-        fmt=args.format,
-        out_path=args.out,
-        stem="skill-install",
-    )
+    for source in sorted(skills_root.iterdir()):
+        if not source.is_dir() or not (source / "SKILL.md").exists():
+            continue
+        destinations = []
+        for target_root in target_roots:
+            dest = target_root / source.name
+            install_plan.append((source, dest))
+            destinations.append(str(dest))
+        results.append(
+            {
+                "skill": source.name,
+                "source": str(source),
+                "destination": destinations[0],
+                "destinations": destinations,
+            }
+        )
+
+    pending_installs = []
+    skipped_destinations = []
+    for source, dest in install_plan:
+        if not explicit_dest and not args.force and (dest.exists() or dest.is_symlink()):
+            skipped_destinations.append(str(dest))
+            continue
+        _check_install_destination(dest, force=args.force)
+        pending_installs.append((source, dest))
+
+    for source, dest in pending_installs:
+        _install_tree(source, dest, mode=args.mode, force=args.force)
+
+    result: Any = {
+        "installed": True,
+        "mode": args.mode,
+        "installed_destinations": [str(dest) for _, dest in pending_installs],
+        "skipped_destinations": skipped_destinations,
+        "skills": results,
+    }
+    if args.format == "text":
+        result = _render_skill_install_text(result)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="skill-install")
     return 0
+
+
+def _default_skill_install_roots() -> list[Path]:
+    roots = [claude_skills_dir()]
+    if codex_home().is_dir():
+        roots.append(codex_skills_dir())
+    return roots
 
 
 # --- Launch / Kill ---
@@ -1255,6 +1349,21 @@ def _inferior_list(args: argparse.Namespace) -> int:
     )
 
 
+def _threads(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.pc:
+        params["pc"] = args.pc
+    if args.function:
+        params["function"] = args.function
+    return _call(
+        args,
+        "list_threads",
+        params,
+        text_renderer=_render_thread_list_text,
+        stem="threads",
+    )
+
+
 # --- Execution control ---
 
 def _exec_timeout(args: argparse.Namespace) -> tuple[dict[str, Any], float | None]:
@@ -1502,6 +1611,7 @@ def _registers(args: argparse.Namespace) -> int:
 
 def _memory_read(args: argparse.Namespace) -> int:
     mem_fmt = getattr(args, "mem_format", "hex")
+    plain = bool(getattr(args, "plain", False))
     params: dict[str, Any] = {
         "address": args.address,
         "length": args.length,
@@ -1514,6 +1624,8 @@ def _memory_read(args: argparse.Namespace) -> int:
         params["format"] = wire_fmt
 
     def _render(value: Any) -> str:
+        if plain and isinstance(value, dict):
+            return str(value.get("data", ""))
         if mem_fmt == "pretty" and isinstance(value, dict):
             value = dict(value)
             value["format"] = "pretty"
@@ -1776,13 +1888,13 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_install.set_defaults(handler=_plugin_install)
 
     # --- skill install ---
-    skill = subparsers.add_parser("skill", help="Install the bundled Claude Code skill")
+    skill = subparsers.add_parser("skill", help="Install the bundled agent skills")
     skill_sub = skill.add_subparsers(dest="skill_command")
-    skill_install_cmd = skill_sub.add_parser("install", help="Install the bundled Claude Code skill")
+    skill_install_cmd = skill_sub.add_parser("install", help="Install the bundled agent skills")
     skill_install_cmd.add_argument("--dest", type=Path, help="Custom install destination")
     skill_install_cmd.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
     skill_install_cmd.add_argument("--force", action="store_true")
-    _common_io_options(skill_install_cmd, default_format="json")
+    _common_io_options(skill_install_cmd)
     skill_install_cmd.set_defaults(handler=_skill_install)
 
     # --- launch ---
@@ -1842,6 +1954,13 @@ def build_parser() -> argparse.ArgumentParser:
     inferior_list = inferior_sub.add_parser("list", help="List inferiors")
     _common_io_options(inferior_list)
     inferior_list.set_defaults(handler=_inferior_list)
+
+    # --- threads ---
+    threads = subparsers.add_parser("threads", help="List threads")
+    _common_io_options(threads)
+    threads.add_argument("--pc", help="Only show threads stopped at this exact PC")
+    threads.add_argument("--function", help="Only show threads whose frame function contains this text")
+    threads.set_defaults(handler=_threads)
 
     # --- run ---
     run = subparsers.add_parser("run", help="Run the loaded program")
@@ -2023,6 +2142,8 @@ def build_parser() -> argparse.ArgumentParser:
     mem_read.add_argument("--display", dest="mem_format",
                           choices=("hex", "bytes", "string", "pretty"), default="hex",
                           help="Memory display format (pretty = xxd-style hex+ASCII)")
+    mem_read.add_argument("--plain", action="store_true",
+                          help="In text mode, print only the memory data payload")
     mem_read.set_defaults(handler=_memory_read)
 
     mem_write = mem_sub.add_parser("write", help="Write memory")

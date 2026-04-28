@@ -86,6 +86,7 @@ READ_LOCKED_OPS = {
     "source_list",
     "break_list",
     "list_inferiors",
+    "list_threads",
     "target_info",
 }
 
@@ -368,7 +369,8 @@ def _frame_to_dict(frame) -> dict[str, Any]:
     except Exception:
         result["address"] = None
     try:
-        result["function"] = str(frame.name())
+        name = frame.name()
+        result["function"] = str(name) if name is not None else None
     except Exception:
         result["function"] = None
     try:
@@ -1051,6 +1053,8 @@ class GdbBridge:
             return self._doctor()
         if op == "list_inferiors":
             return self._list_inferiors()
+        if op == "list_threads":
+            return self._list_threads(params)
 
         # Session
         if op == "load":
@@ -1175,6 +1179,70 @@ class GdbBridge:
 
     def _list_inferiors(self) -> list[dict[str, Any]]:
         return [self._inferior_dict(inf) for inf in gdb.inferiors()]
+
+    def _thread_dict(self, thread, *, selected_thread) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "num": getattr(thread, "num", None),
+            "global_num": getattr(thread, "global_num", None),
+            "name": getattr(thread, "name", None),
+            "ptid": list(getattr(thread, "ptid", ())) if getattr(thread, "ptid", None) else None,
+            "selected": thread == selected_thread,
+        }
+        try:
+            result["inferior_num"] = thread.inferior.num
+        except Exception:
+            result["inferior_num"] = None
+        try:
+            result["status"] = (
+                "exited" if thread.is_exited()
+                else "running" if thread.is_running()
+                else "stopped" if thread.is_stopped()
+                else "unknown"
+            )
+        except Exception:
+            result["status"] = "unknown"
+
+        frame = None
+        try:
+            thread.switch()
+            frame = gdb.selected_frame()
+        except Exception:
+            frame = None
+        result["frame"] = _frame_to_dict(frame) if frame is not None else None
+        return result
+
+    def _list_threads(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        pc_filter = params.get("pc")
+        function_filter = params.get("function")
+        selected_thread = None
+        try:
+            selected_thread = gdb.selected_thread()
+        except Exception:
+            pass
+
+        threads: list[dict[str, Any]] = []
+        for inf in gdb.inferiors():
+            try:
+                inf_threads = inf.threads()
+            except Exception:
+                continue
+            for thread in inf_threads:
+                entry = self._thread_dict(thread, selected_thread=selected_thread)
+                frame = entry.get("frame") if isinstance(entry.get("frame"), dict) else {}
+                if pc_filter is not None and frame.get("address") != pc_filter:
+                    continue
+                if function_filter:
+                    func = str(frame.get("function") or "")
+                    if function_filter not in func:
+                        continue
+                threads.append(entry)
+
+        if selected_thread is not None:
+            try:
+                selected_thread.switch()
+            except Exception:
+                pass
+        return threads
 
     # ------------------------------------------------------------------
     # Session management

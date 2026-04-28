@@ -37,11 +37,13 @@ pry plugin install
 
 This symlinks the bridge into `~/.gdb/pry_agent_bridge/` and prints a `source` line to add to your `~/.gdbinit`.
 
-Optionally install the Claude Code skill:
+Install the bundled Claude Code/Codex skills:
 
 ```bash
 pry skill install
 ```
+
+That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
 
 ## Quick start
 
@@ -83,7 +85,7 @@ Every command accepts `--format [text|json|ndjson]`, `--out <path>`, and `--inst
 | `pry kill` | Terminate GDB session |
 | `pry doctor` | Bridge health check and version info |
 | `pry plugin install` | Install GDB bridge plugin |
-| `pry skill install` | Install Claude Code skill |
+| `pry skill install` | Install bundled agent skills |
 
 ### Execution control
 
@@ -102,6 +104,7 @@ All execution commands block until the inferior stops or exits, returning struct
 | `pry interrupt` | Interrupt running inferior (always works, even during background exec) |
 | `pry status` | Show inferior execution state (running/stopped) |
 | `pry wait` | Wait for running inferior to stop (`--timeout`) |
+| `pry threads` | List threads with selected frame info (`--pc`, `--function`) |
 
 When `--timeout` fires, the bridge auto-interrupts the inferior and returns the stop info with `timeout_interrupt: true`. The bridge remains responsive for subsequent commands.
 
@@ -152,7 +155,7 @@ Uses hardware watchpoints gated by range boundary breakpoints for native-speed t
 | `pry args` | Function arguments |
 | `pry print <expr>` | Evaluate expression |
 | `pry registers` | CPU registers (`--all`) |
-| `pry memory read <addr> <len>` | Read memory (`--display hex\|string\|bytes`) |
+| `pry memory read <addr> <len>` | Read memory (`--display hex\|string\|bytes\|pretty`, `--plain`) |
 | `pry memory write <addr> <hex>` | Write memory |
 
 ### Code & symbols
@@ -173,6 +176,7 @@ Uses hardware watchpoints gated by range boundary breakpoints for native-speed t
 | `pry load <path>` | Load binary |
 | `pry attach <pid>` | Attach to process |
 | `pry inferior list` | List inferiors |
+| `pry threads` | List threads with frame PCs/functions |
 
 ### Escape hatch
 

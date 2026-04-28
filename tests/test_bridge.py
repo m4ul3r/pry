@@ -128,8 +128,17 @@ def _load_bridge(monkeypatch):
 
     # Fake thread
     class _FakeThread:
-        def __init__(self):
-            self.num = 1
+        def __init__(self, num=1, frame=None, name=None):
+            self.num = num
+            self.global_num = num
+            self.name = name
+            self.ptid = (12345, num, 0)
+            self._frame = frame or _FakeFrame("main", 0x401000)
+            self.inferior = None
+
+        def switch(self):
+            nonlocal _current_frame
+            _current_frame = self._frame
 
         def is_exited(self):
             return False
@@ -140,7 +149,11 @@ def _load_bridge(monkeypatch):
         def is_stopped(self):
             return True
 
-    fake_gdb.selected_thread = lambda: _FakeThread()
+    _threads = [
+        _FakeThread(1, _FakeFrame("main", 0x401000), "main-thread"),
+        _FakeThread(2, _FakeFrame("worker", 0x401100), "worker"),
+    ]
+    fake_gdb.selected_thread = lambda: _threads[0]
 
     # Fake inferior
     class _FakeInferior:
@@ -148,12 +161,17 @@ def _load_bridge(monkeypatch):
             self.num = 1
             self.pid = 12345
             self.progspace = types.SimpleNamespace(filename="/bin/test")
+            for thread in _threads:
+                thread.inferior = self
 
         def read_memory(self, addr, length):
             return bytes(range(length % 256)) * (length // 256 + 1)[:length]
 
         def write_memory(self, addr, data):
             pass
+
+        def threads(self):
+            return list(_threads)
 
     _inferior = _FakeInferior()
     fake_gdb.inferiors = lambda: [_inferior]
@@ -325,6 +343,36 @@ def test_list_inferiors(monkeypatch):
     assert len(result) == 1
     assert result[0]["num"] == 1
     assert result[0]["pid"] == 12345
+
+
+def test_list_threads(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    result = bridge._dispatch_op("list_threads", {})
+    assert len(result) == 2
+    assert result[0]["num"] == 1
+    assert result[0]["selected"] is True
+    assert result[0]["frame"]["function"] == "main"
+    assert result[1]["num"] == 2
+    assert result[1]["frame"]["address"] == "0x401100"
+
+
+def test_list_threads_filters_by_pc(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    result = bridge._dispatch_op("list_threads", {"pc": "0x401100"})
+    assert len(result) == 1
+    assert result[0]["num"] == 2
+
+
+def test_list_threads_preserves_missing_function_as_null(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.inferiors()[0].threads()[1]._frame._name = None
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("list_threads", {"pc": "0x401100"})
+
+    assert result[0]["frame"]["function"] is None
 
 
 def test_break_set_and_list(monkeypatch):

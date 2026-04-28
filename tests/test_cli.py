@@ -465,6 +465,203 @@ def test_inferior_list_text_rendering(monkeypatch, capsys):
     assert "/bin/ls" in output
 
 
+def test_threads_text_rendering(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        assert op == "list_threads"
+        assert params == {}
+        return {
+            "ok": True,
+            "result": [
+                {
+                    "num": 1,
+                    "inferior_num": 1,
+                    "selected": True,
+                    "status": "stopped",
+                    "name": "main-thread",
+                    "frame": {"address": "0x401000", "function": "main"},
+                },
+                {
+                    "num": 2,
+                    "inferior_num": 1,
+                    "selected": False,
+                    "status": "stopped",
+                    "frame": {"address": "0x401100", "function": "worker"},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["threads"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "1 *  inferior=1  stopped  0x401000  main  (main-thread)" in output
+    assert "2  inferior=1  stopped  0x401100  worker" in output
+
+
+def test_threads_passes_filters(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        assert op == "list_threads"
+        assert params == {"pc": "0x401100", "function": "worker"}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["threads", "--pc", "0x401100", "--function", "worker"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "no threads\n"
+
+
+def test_memory_read_text_includes_address_by_default(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        assert op == "memory_read"
+        assert params == {"address": "0x401000", "length": 4}
+        return {
+            "ok": True,
+            "result": {"address": "0x401000", "length": 4, "format": "hex", "data": "41424344"},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["memory", "read", "0x401000", "4"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "0x401000: 41424344\n"
+
+
+def test_memory_read_plain_text_prints_data_only(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        assert op == "memory_read"
+        assert params == {"address": "0x401000", "length": 4}
+        return {
+            "ok": True,
+            "result": {"address": "0x401000", "length": 4, "format": "hex", "data": "41424344"},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["memory", "read", "0x401000", "4", "--display", "hex", "--plain"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "41424344\n"
+
+
+def test_memory_read_plain_does_not_change_json_payload(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        assert op == "memory_read"
+        return {
+            "ok": True,
+            "result": {"address": "0x401000", "length": 4, "format": "hex", "data": "41424344"},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["memory", "read", "0x401000", "4", "--plain", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["address"] == "0x401000"
+    assert payload["data"] == "41424344"
+
+
+def test_skill_install_copy_mode(tmp_path):
+    destination = tmp_path / "skill-copy"
+
+    rc = pry.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)])
+
+    assert rc == 0
+    assert (destination / "pry" / "SKILL.md").exists()
+    assert (destination / "pry" / "agents" / "openai.yaml").exists()
+
+
+def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_root = codex_home / "skills"
+    monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(pry.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(pry.cli, "codex_skills_dir", lambda: codex_root)
+
+    rc = pry.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (claude_root / "pry" / "SKILL.md").exists()
+    assert not codex_root.exists()
+
+
+def test_skill_install_defaults_to_claude_and_codex_when_codex_home_exists(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_root = codex_home / "skills"
+    codex_home.mkdir()
+    monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(pry.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(pry.cli, "codex_skills_dir", lambda: codex_root)
+
+    rc = pry.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (claude_root / "pry" / "SKILL.md").exists()
+    assert (codex_root / "pry" / "SKILL.md").exists()
+
+
+def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_root = codex_home / "skills"
+    codex_home.mkdir()
+    (claude_root / "pry").mkdir(parents=True)
+    monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(pry.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(pry.cli, "codex_skills_dir", lambda: codex_root)
+
+    rc = pry.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (codex_root / "pry" / "SKILL.md").exists()
+
+
+def test_skill_install_default_output_is_text(tmp_path, monkeypatch, capsys):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(pry.cli, "codex_home", lambda: codex_home)
+
+    rc = pry.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert output.startswith("Installed skills (copy):\n")
+    assert "- " + str(claude_root / "pry") in output
+    assert '"installed"' not in output
+
+
+def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, capsys):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(pry.cli, "codex_home", lambda: codex_home)
+
+    rc = pry.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["installed"] is True
+    assert "installed_destinations" in payload
+
+
+def test_skill_install_custom_dest_reports_error_when_destination_exists(tmp_path, capsys):
+    destination = tmp_path / "skill-copy"
+    (destination / "pry").mkdir(parents=True)
+
+    rc = pry.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)])
+
+    assert rc == 0
+    assert "Destination already exists" in capsys.readouterr().err
+
+
 def test_launch_gdb_not_found(monkeypatch, capsys):
     monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: None)
 

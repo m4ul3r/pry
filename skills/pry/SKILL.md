@@ -140,6 +140,9 @@ pry until main.c:42          # Run until a specific location
 pry interrupt                # Interrupt a running inferior
 pry status                   # Check if inferior is running or stopped
 pry wait                     # Wait for a background exec to stop
+pry threads                  # List threads with selected frame info
+pry threads --pc 0x401400    # Filter threads stopped at an exact PC
+pry threads --function worker  # Filter by current frame function substring
 ```
 
 Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
@@ -250,6 +253,7 @@ pry registers --all              # All registers (including FP/SIMD)
 
 ```bash
 pry memory read 0x7fffffffe000 64              # Read 64 bytes as hex
+pry memory read 0x7fffffffe000 64 --plain      # Print only hex bytes for scripts
 pry memory read 0x7fffffffe000 64 --display string   # Read as string
 pry memory read 0x7fffffffe000 64 --display bytes    # Read as base64
 pry memory write 0x7fffffffe000 deadbeef       # Write hex bytes
@@ -424,7 +428,8 @@ pry gdb "telescope $rsp 20"           # Alias for dereference
 
 ```bash
 pry gdb procinfo                      # Process info (pid, uid, groups, etc.)
-pry gdb "info threads"                # List all threads
+pry threads                           # Structured thread list
+pry gdb "info threads"                # Raw GDB thread list
 pry gdb "thread apply all bt"         # Backtrace all threads
 pry gdb canary                        # Leak the stack canary value
 pry gdb "tls"                         # Thread-local storage info
