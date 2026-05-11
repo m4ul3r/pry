@@ -1110,7 +1110,14 @@ def _launch(args: argparse.Namespace) -> int:
     bridge_ex = (
         f"python import sys; sys.path.insert(0, {str(plugin_parent)!r}); import pry_agent_bridge"
     )
-    gdb_cmd.extend(["-ex", keepalive_ex, "-ex", bridge_ex])
+    # Disable GDB's default behaviour of spawning the inferior via /bin/sh.
+    # Programmatic debuggers want byte-precise argv: shell-routing mangles
+    # quotes, backslashes, NULs, etc., and the inferior may never reach
+    # the entry point (e.g. /bin/sh -c with unmatched quote → exit 1).
+    # Anyone needing shell expansion can `set startup-with-shell on` from
+    # their own session.
+    shell_off_ex = "set startup-with-shell off"
+    gdb_cmd.extend(["-ex", shell_off_ex, "-ex", keepalive_ex, "-ex", bridge_ex])
 
     gdb_extra = args.gdb_args or []
     if gdb_extra and gdb_extra[0] == "--":
