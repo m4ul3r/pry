@@ -136,6 +136,20 @@ _FILE_HEADER_RE = re.compile(r"^\s*File\s+(.+?):\s*$")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _looks_like_bare_hex_address(s: str) -> bool:
+    """True when s matches /^0x[0-9a-f]+$/i — no '*' prefix, no spaces,
+    no module qualifier. Such inputs almost always mean "raw address"
+    (not a source line number, which is gdb's default interpretation).
+    """
+    if not s or s.startswith("*"):
+        return False
+    s = s.strip()
+    if not s.startswith(("0x", "0X")):
+        return False
+    rest = s[2:]
+    return bool(rest) and all(c in "0123456789abcdefABCDEF" for c in rest)
+
+
 def _extract_function_name(signature: str) -> str | None:
     """Pull the function name out of a `info functions` signature."""
     paren = signature.find("(")
@@ -1400,6 +1414,15 @@ class GdbBridge:
                 "module_base": hex(module_base),
                 "resolved": hex(runtime_addr),
             }
+        else:
+            # A bare hex string ("0x401f0e") is what most users mean when
+            # they ask to break "at this address". GDB's command-line
+            # syntax for a raw-address breakpoint is "*0x401f0e" — without
+            # the asterisk, the bare hex is interpreted as a source line
+            # number and the breakpoint silently goes pending. Auto-prefix
+            # so the obvious form works.
+            if _looks_like_bare_hex_address(location):
+                location = f"*{location}"
 
         bp_type = gdb.BP_BREAKPOINT
         if hardware:
