@@ -1516,3 +1516,26 @@ def test_types_show_text_includes_offsets(monkeypatch, capsys):
     assert "offsets (sizeof=24):" in out
     assert "+0" in out and "+4" in out and "+16" in out
     assert "flags" in out
+
+
+# ---------------------------------------------------------------------------
+# Edge-case hardening (adversarial hunt fixes)
+# ---------------------------------------------------------------------------
+
+def test_out_to_bad_path_exits_zero_with_error(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    rc = pry.cli.main(["doctor", "--out", str(tmp_path)])  # tmp_path is a directory
+    assert rc == 0  # always-exit-0 contract holds
+    err = capsys.readouterr().err
+    assert "cannot write output" in err
+
+
+def test_mappings_filter_no_match_message(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["mappings", "--name", "libxyz"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no mappings match --name libxyz" in out

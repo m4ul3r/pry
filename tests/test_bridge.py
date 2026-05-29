@@ -1120,6 +1120,8 @@ def test_backtrace_no_inferior_is_actionable(monkeypatch, gdb_msg):
         raise fake_gdb.error(gdb_msg)
 
     fake_gdb.newest_frame = _boom
+    # No inferior -> pid 0, so the hint resolves to "not running".
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
     bridge = bridge_mod.GdbBridge()
 
     resp = bridge.dispatch({"op": "backtrace", "params": {}})
@@ -1147,6 +1149,8 @@ def test_register_write_requires_live_inferior(monkeypatch):
         raise fake_gdb.error("No frame selected.")
 
     fake_gdb.selected_frame = _no_frame
+    # No inferior -> pid 0, so the error says "not running" (vs "running").
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
     bridge = bridge_mod.GdbBridge()
 
     resp = bridge.dispatch(
@@ -1313,3 +1317,91 @@ def test_disasm_fallback_returns_list(monkeypatch):
     assert isinstance(result, list)
     assert result[0]["address"].startswith("0x")
     assert "asm" in result[0]
+
+
+# ---------------------------------------------------------------------------
+# Edge-case hardening (adversarial hunt fixes)
+# ---------------------------------------------------------------------------
+
+def test_status_not_started_vs_exited(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    fake_gdb.selected_thread = lambda: None
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch({"op": "status", "params": {}})
+    assert resp["result"]["state"] == "not-started"
+
+    bridge._has_run = True  # simulate a run that has since exited
+    resp2 = bridge.dispatch({"op": "status", "params": {}})
+    assert resp2["result"]["state"] == "exited"
+
+
+def test_register_write_while_running_says_interrupt(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _no_frame():
+        raise fake_gdb.error("No frame selected.")
+
+    fake_gdb.selected_frame = _no_frame  # frame unavailable while running
+    bridge = bridge_mod.GdbBridge()       # default fake pid is live (running)
+
+    resp = bridge.dispatch({"op": "register_write", "params": {"name": "rax", "value": "0x1"}})
+    assert resp["ok"] is False
+    assert "running" in resp["error"] and "interrupt" in resp["error"].lower()
+
+
+def test_augment_error_does_not_overmatch_substrings(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _boom(expr):
+        raise fake_gdb.error("No registers available in my custom module")
+
+    fake_gdb.parse_and_eval = _boom
+    bridge = bridge_mod.GdbBridge()
+    resp = bridge.dispatch({"op": "print", "params": {"expression": "x"}})
+    assert resp["ok"] is False
+    assert "not running" not in resp["error"]
+    assert "interrupt" not in resp["error"].lower()
+
+
+def test_load_rejects_base_and_slide_together(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    resp = bridge.dispatch({"op": "load", "params": {"path": "/x", "base": "0x1000", "slide": "0x10"}})
+    assert resp["ok"] is False
+    assert "both" in resp["error"]
+
+
+def test_disasm_count_zero_or_negative_returns_empty_list(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    assert bridge._dispatch_op("disasm", {"count": 0}) == []
+    assert bridge._dispatch_op("disasm", {"count": -5}) == []
+
+
+def test_parse_addr_masks_high_bit_to_unsigned(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    class _Neg:
+        def __int__(self):
+            return -10485760  # 0xffffffffff600000 interpreted signed
+
+    fake_gdb.parse_and_eval = lambda e: _Neg()
+    assert bridge_mod.GdbBridge._parse_addr("$rax") == 0xFFFFFFFFFF600000
+
+
+def test_watchpoint_unreadable_new_value_keeps_old(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    bp = bridge._dispatch_op("watch_set", {"expression": "p"})  # seeds "42"
+    bp_obj = fake_gdb.breakpoints()[0]
+    bp_obj.type = fake_gdb.BP_HARDWARE_WATCHPOINT
+
+    def _boom(expr):
+        raise fake_gdb.error("Cannot access memory")
+
+    fake_gdb.parse_and_eval = _boom
+    reason = bridge._bp_reason(bp_obj)
+    assert reason["old_value"] == "42"
+    assert reason["new_value"] == "<unreadable>"

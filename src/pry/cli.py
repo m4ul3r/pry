@@ -175,7 +175,12 @@ def _render_result(
     spill_label: str | None = None,
     spill_context: Any = None,
 ) -> None:
-    result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
+    try:
+        result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
+    except OSError as exc:
+        # A bad --out (or unwritable spill dir) must surface as the standard
+        # exit-0 error envelope, not a raw traceback with exit 1.
+        raise BridgeError(f"cannot write output to {out_path or '<spill dir>'}: {exc}")
     if result.spilled and result.artifact:
         label = spill_label or stem.replace("_", " ")
         artifact = result.artifact
@@ -1811,15 +1816,27 @@ def _register_write(args: argparse.Namespace) -> int:
 
 def _mappings(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
-    if getattr(args, "contains", None):
-        params["contains"] = args.contains
-    if getattr(args, "name", None):
-        params["name"] = args.name
+    contains = getattr(args, "contains", None)
+    name = getattr(args, "name", None)
+    if contains:
+        params["contains"] = contains
+    if name:
+        params["name"] = name
+    has_filter = bool(contains or name)
+
+    def render(value: Any) -> str:
+        # Distinguish "filter matched nothing" from "no mappings at all" so the
+        # empty case doesn't always (falsely) claim the inferior isn't running.
+        if isinstance(value, list) and not value and has_filter:
+            filt = f"--contains {contains}" if contains else f"--name {name}"
+            return f"no mappings match {filt}"
+        return _render_mappings_text(value)
+
     return _call(
         args,
         "mappings",
         params or None,
-        text_renderer=_render_mappings_text,
+        text_renderer=render,
         stem="mappings",
     )
 
