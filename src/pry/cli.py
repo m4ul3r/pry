@@ -156,8 +156,14 @@ def _common_io_options(
 
 
 def _add_paged_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument(
+        "--offset", type=int, default=0,
+        help="Skip this many results (for paging; default: 0)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=100,
+        help="Max results to return; on truncation a stderr note shows the next --offset (default: 100)",
+    )
 
 
 def _render_result(
@@ -173,35 +179,27 @@ def _render_result(
     if result.spilled and result.artifact:
         label = spill_label or stem.replace("_", " ")
         artifact = result.artifact
-        lines = [
-            f"warning: {label} output spilled",
-            f"path: {artifact['artifact_path']}",
-            f"format: {artifact['format']}",
-            f"bytes: {artifact['bytes']}",
-            f"tokens: {artifact['tokens']}",
-            f"tokenizer: {artifact['tokenizer']}",
-        ]
-        if isinstance(artifact.get("sha256"), str):
-            lines.append(f"sha256: {artifact['sha256']}")
+        # The artifact envelope (path/tokens/summary/...) is the real result
+        # once output spills, so it must go to STDOUT — agents that read
+        # stdout as the result would otherwise see nothing and conclude the
+        # command produced no data. A concise note also goes to stderr for
+        # humans.
         summary = artifact.get("summary")
+        summary_note = ""
         if isinstance(summary, dict):
-            summary_parts = []
             kind = summary.get("kind")
+            count = summary.get("count")
             if kind is not None:
-                summary_parts.append(f"kind={kind}")
-            for key in sorted(summary):
-                if key == "kind":
-                    continue
-                summary_parts.append(
-                    f"{key}={json.dumps(summary[key], sort_keys=True, default=str)}"
-                )
-            if summary_parts:
-                lines.append(f"summary: {', '.join(summary_parts)}")
-        if isinstance(spill_context, list):
-            lines.append(f"items: {len(spill_context)}")
-        if isinstance(value, str):
-            lines.append(f"lines: {len(value.splitlines())}")
-        print("\n".join(lines), file=sys.stderr)
+                summary_note = f", {kind}"
+                if count is not None:
+                    summary_note += f" of {count}"
+        print(
+            f"warning: {label} output spilled to {artifact['artifact_path']} "
+            f"({artifact['tokens']} tokens{summary_note}); "
+            f"full envelope on stdout",
+            file=sys.stderr,
+        )
+        sys.stdout.write(result.rendered)
         return
     sys.stdout.write(result.rendered)
 
@@ -218,6 +216,7 @@ def _call(
     params: dict[str, Any] | None = None,
     *,
     text_renderer: Callable[[Any], str] | None = None,
+    map_result: Callable[[Any], Any] | None = None,
     page_limit: int | None = None,
     page_offset: int = 0,
     page_label: str | None = None,
@@ -243,6 +242,11 @@ def _call(
         **kw,
     )
     result = response["result"]
+    # Normalise the raw result for ALL output formats (e.g. strip ANSI from
+    # gdb passthrough) before exit-code/pagination/render decisions, so JSON
+    # consumers get the same clean payload that text mode does.
+    if map_result is not None:
+        result = map_result(result)
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
     if effective_page_limit is not None and isinstance(result, list) and len(result) > effective_page_limit:
         result = result[:effective_page_limit]
@@ -329,9 +333,14 @@ def _format_stop_reason(reason: Any) -> str | None:
     if kind == "watchpoint-hit":
         num = reason.get("number", "?")
         expr = reason.get("expression")
-        if expr:
-            return f"watchpoint #{num} ({expr}) hit"
-        return f"watchpoint #{num} hit"
+        base = f"watchpoint #{num} ({expr}) hit" if expr else f"watchpoint #{num} hit"
+        old = reason.get("old_value")
+        new = reason.get("new_value")
+        if new is not None and old is not None:
+            base += f": {old} -> {new}"
+        elif new is not None:
+            base += f": value = {new}"
+        return base
     if kind == "signal":
         sig = reason.get("signal", "unknown")
         return f"signal {sig}"
@@ -540,7 +549,9 @@ def _render_breakpoint_delete_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     num = value.get("deleted", "?")
-    return f"breakpoint #{num} deleted"
+    # break/watch share a number space; name the deleted object correctly.
+    noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
+    return f"{noun} #{num} deleted"
 
 
 def _render_breakpoint_state_text(value: Any) -> str:
@@ -574,7 +585,9 @@ def _render_backtrace_text(value: Any) -> str:
             lines.append(str(frame))
             continue
         level = frame.get("level", "?")
-        func = frame.get("function", "<unknown>")
+        # An unresolved frame carries function=None (e.g. a smashed return
+        # address); render GDB's "??" rather than the literal "None".
+        func = frame.get("function") or "??"
         addr = frame.get("address", "")
         entry = f"#{level} {addr} in {func}"
         f = frame.get("file")
@@ -596,7 +609,7 @@ def _render_frame_info_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     level = value.get("level", "?")
-    func = value.get("function", "<unknown>")
+    func = value.get("function") or "??"
     addr = value.get("address", "")
     entry = f"#{level} {addr} in {func}"
     f = value.get("file")
@@ -625,6 +638,43 @@ def _render_locals_text(value: Any) -> str:
             lines.append(f"{typ} {name} = {val}")
         else:
             lines.append(f"{name} = {val}")
+    return "\n".join(lines)
+
+
+def _render_args_text(value: Any) -> str:
+    # Same formatting as locals, but the empty case is "no args" (a frame with
+    # no parameters), not "no locals".
+    if isinstance(value, list) and not value:
+        return "no args"
+    return _render_locals_text(value)
+
+
+def _render_register_write_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    name = value.get("register", "?")
+    readback = value.get("readback")
+    if readback is not None:
+        return f"${name} = {readback}"
+    return f"${name} set to {value.get('value', '?')}"
+
+
+def _render_mappings_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "no mappings (inferior not running, or target has no proc maps)"
+    lines = []
+    for m in value:
+        if not isinstance(m, dict):
+            lines.append(str(m))
+            continue
+        start = m.get("start", "?")
+        end = m.get("end", "?")
+        perms = m.get("perms", "----")
+        offset = m.get("offset", "")
+        objfile = m.get("objfile", "")
+        lines.append(f"{start}-{end}  {perms:<5} {offset:>12}  {objfile}".rstrip())
     return "\n".join(lines)
 
 
@@ -697,7 +747,11 @@ def _render_disasm_text(value: Any) -> str:
             continue
         addr = insn.get("address", "")
         asm_text = insn.get("asm", "")
-        lines.append(f"{addr}:  {asm_text}")
+        symbol = insn.get("symbol")
+        if symbol:
+            lines.append(f"{addr} <{symbol}>:  {asm_text}")
+        else:
+            lines.append(f"{addr}:  {asm_text}")
     return "\n".join(lines)
 
 
@@ -705,7 +759,7 @@ def _render_name_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return "no matches"
     # Align the name column when addresses are present so the eye can scan
     # down. Trailing columns (file:line, signature/decl) fall where they may.
     rows: list[tuple[str, str, str]] = []
@@ -768,9 +822,11 @@ def _render_print_text(value: Any) -> str:
         return _render_fallback_text(value)
     val = value.get("value", "<unknown>")
     typ = value.get("type")
-    if typ:
-        return f"({typ}) {val}"
-    return str(val)
+    base = f"({typ}) {val}" if typ else str(val)
+    note = value.get("note")
+    if note:
+        base += f"\nnote: {note}"
+    return base
 
 
 def _render_inferior_list_text(value: Any) -> str:
@@ -1581,7 +1637,7 @@ def _args(args: argparse.Namespace) -> int:
     return _call(
         args,
         "args",
-        text_renderer=_render_locals_text,
+        text_renderer=_render_args_text,
         stem="args",
     )
 
@@ -1606,6 +1662,31 @@ def _registers(args: argparse.Namespace) -> int:
         params,
         text_renderer=_render_registers_text,
         stem="registers",
+    )
+
+
+def _register_write(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "register_write",
+        {"name": args.name, "value": args.value},
+        text_renderer=_render_register_write_text,
+        stem="register_write",
+    )
+
+
+def _mappings(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if getattr(args, "contains", None):
+        params["contains"] = args.contains
+    if getattr(args, "name", None):
+        params["name"] = args.name
+    return _call(
+        args,
+        "mappings",
+        params or None,
+        text_renderer=_render_mappings_text,
+        stem="mappings",
     )
 
 
@@ -1748,6 +1829,23 @@ def _source_list(args: argparse.Namespace) -> int:
 
 # --- Raw GDB command passthrough ---
 
+def _strip_gdb_exec_ansi(result: Any) -> Any:
+    """Strip ANSI escapes from gdb passthrough output for non-TTY consumers.
+
+    pwndbg emits color even over a pipe. The text renderer already strips for
+    non-TTY stdout, but the JSON/ndjson paths bypass it — so do it on the raw
+    result here, leaving color intact only for an interactive terminal.
+    """
+    if (
+        isinstance(result, dict)
+        and isinstance(result.get("output"), str)
+        and not sys.stdout.isatty()
+    ):
+        result = dict(result)
+        result["output"] = _ANSI_ESCAPE_RE.sub("", result["output"])
+    return result
+
+
 def _gdb_exec(args: argparse.Namespace) -> int:
     command = args.command
     timeout = getattr(args, "timeout", None)
@@ -1759,6 +1857,7 @@ def _gdb_exec(args: argparse.Namespace) -> int:
         "gdb_exec",
         params,
         text_renderer=_render_gdb_exec_text,
+        map_result=_strip_gdb_exec_ansi,
         stem="gdb_exec",
         timeout=timeout,
     )
@@ -2127,10 +2226,16 @@ def build_parser() -> argparse.ArgumentParser:
     print_cmd.set_defaults(handler=_print_expr)
 
     # --- registers ---
-    regs = subparsers.add_parser("registers", help="Show register values")
+    regs = subparsers.add_parser("registers", help="Show or write register values")
     _common_io_options(regs)
     regs.add_argument("--all", action="store_true", help="Show all registers including floating-point")
     regs.set_defaults(handler=_registers)
+    regs_sub = regs.add_subparsers(dest="registers_command")
+    regs_write = regs_sub.add_parser("write", help="Write a register value (e.g. registers write rip 0x401234)")
+    _common_io_options(regs_write, default_format="json")
+    regs_write.add_argument("name", help="Register name (rip, rax, pc, ...; leading $ optional)")
+    regs_write.add_argument("value", help="Value to set (hex, decimal, or a GDB expression)")
+    regs_write.set_defaults(handler=_register_write)
 
     # --- memory ---
     mem = subparsers.add_parser("memory", help="Memory read/write")
@@ -2152,6 +2257,13 @@ def build_parser() -> argparse.ArgumentParser:
     mem_write.add_argument("value", help="Value to write (hex string)")
     mem_write.set_defaults(handler=_memory_write)
 
+    # --- mappings ---
+    mappings = subparsers.add_parser("mappings", help="List process memory mappings (structured vmmap)")
+    _common_io_options(mappings)
+    mappings.add_argument("--contains", metavar="ADDR", help="Only the mapping containing this address (hex or expression)")
+    mappings.add_argument("--name", help="Filter mappings whose objfile contains this substring")
+    mappings.set_defaults(handler=_mappings)
+
     # --- disasm ---
     disasm = subparsers.add_parser("disasm", help="Disassemble instructions")
     _common_io_options(disasm)
@@ -2163,14 +2275,14 @@ def build_parser() -> argparse.ArgumentParser:
     funcs = subparsers.add_parser("functions", help="List or search functions")
     _common_io_options(funcs)
     _add_paged_args(funcs)
-    funcs.add_argument("--query", help="Search pattern")
+    funcs.add_argument("--query", help="Search pattern (matches function names/signatures)")
     funcs.set_defaults(handler=_functions)
 
     # --- symbols ---
     syms = subparsers.add_parser("symbols", help="List or search symbols")
     _common_io_options(syms)
     _add_paged_args(syms)
-    syms.add_argument("--query", help="Search pattern")
+    syms.add_argument("--query", help="Search pattern (data/variable symbols only — use `functions --query` for functions)")
     syms.set_defaults(handler=_symbols)
 
     # --- types ---

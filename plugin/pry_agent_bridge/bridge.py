@@ -88,6 +88,7 @@ READ_LOCKED_OPS = {
     "list_inferiors",
     "list_threads",
     "target_info",
+    "mappings",
 }
 
 EXEC_OPS = {
@@ -120,6 +121,7 @@ WRITE_LOCKED_OPS = {
     "break_disable",
     "watch_set",
     "memory_write",
+    "register_write",
     "py_exec",
     "gdb_exec",
 }
@@ -474,6 +476,10 @@ class GdbBridge:
         self._thread: threading.Thread | None = None
         self._lock = _ReadWriteLock()
         self._last_stop_reason: dict[str, Any] | None = None
+        # Last-seen value per watchpoint number, so a watchpoint-hit stop can
+        # report old -> new even though the GDB Python event API doesn't carry
+        # the values GDB prints to the console.
+        self._watchpoint_values: dict[int, str] = {}
         # Background execution state
         self._running = False
         self._background_completion: threading.Event | None = None
@@ -517,13 +523,55 @@ class GdbBridge:
         return False
 
     @staticmethod
-    def _bp_reason(bp) -> dict[str, Any]:
+    def _safe_eval_str(expression: str) -> str | None:
+        """Evaluate *expression* and stringify it, or None if that fails."""
+        try:
+            return str(gdb.parse_and_eval(expression))
+        except Exception:
+            return None
+
+    def _snapshot_watchpoints(self) -> None:
+        """Record each active watchpoint's current value (GDB thread only).
+
+        Called just before the inferior resumes so the next watchpoint-hit can
+        report old -> new. Snapshotting once per resume (rather than mutating
+        in _bp_reason) keeps the transition correct when multiple stop handlers
+        process the same stop.
+        """
+        for bp in (gdb.breakpoints() or []):
+            if not self._is_watchpoint_type(bp.type):
+                continue
+            expression = getattr(bp, "expression", None)
+            if not expression:
+                continue
+            value = self._safe_eval_str(expression)
+            if value is not None:
+                self._watchpoint_values[bp.number] = value
+
+    def _bp_reason(self, bp) -> dict[str, Any]:
         """Build a stop-reason dict for a breakpoint/watchpoint."""
         reason: dict[str, Any] = {}
-        if GdbBridge._is_watchpoint_type(bp.type):
+        if self._is_watchpoint_type(bp.type):
             reason["kind"] = "watchpoint-hit"
             reason["number"] = bp.number
-            reason["expression"] = getattr(bp, "expression", None)
+            expression = getattr(bp, "expression", None)
+            reason["expression"] = expression
+            # GDB prints "Old value = .. / New value = .." to the console but
+            # the Python event API doesn't expose it. Re-evaluate the watched
+            # expression (the inferior has already performed the write by the
+            # time the stop fires) and diff against the value snapshotted just
+            # before the inferior resumed, so the agent gets the single datum a
+            # watchpoint exists to provide. This is READ-ONLY on purpose: a
+            # single stop fires every connected stop handler, each of which
+            # builds a reason, so mutating the cache here would let the first
+            # handler advance it and make the rest see old == new.
+            if expression:
+                new_value = self._safe_eval_str(expression)
+                if new_value is not None:
+                    old_value = self._watchpoint_values.get(bp.number)
+                    reason["new_value"] = new_value
+                    if old_value is not None and old_value != new_value:
+                        reason["old_value"] = old_value
         else:
             reason["kind"] = "breakpoint-hit"
             reason["number"] = bp.number
@@ -662,7 +710,39 @@ class GdbBridge:
                 )
             return _json_response(ok=True, result=result)
         except Exception as exc:
-            return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
+            return _json_response(ok=False, error=self._augment_error(exc))
+
+    @staticmethod
+    def _augment_error(exc: Exception) -> str:
+        """Turn a raw GDB/Python error into an agent-actionable message.
+
+        The bare ``type: message`` form (e.g. ``error: No symbol "foo" in
+        current context.``) tells an agent what failed but not what to do.
+        Append a concrete next step for the most common recoverable cases.
+        """
+        base = f"{type(exc).__name__}: {exc}"
+        low = str(exc).lower()
+        hint = None
+        if "no frame is currently selected" in low or "no frame selected" in low:
+            hint = (
+                "no inferior is stopped at a frame — start the program "
+                "(`pry run`) and stop at a breakpoint first"
+            )
+        elif "no symbol" in low and "context" in low:
+            hint = (
+                "symbol not in scope — check spelling; it may be a function "
+                "(`pry functions --query NAME`), a global (`pry symbols "
+                "--query NAME`), or live in another frame (`pry frame select N`)"
+            )
+        elif "no stack" in low:
+            hint = "the inferior is not running — use `pry run` or `pry continue`"
+        elif "cannot access memory" in low:
+            hint = "address not mapped — check `pry mappings` for valid ranges"
+        elif "the program is not being run" in low or "not being run" in low:
+            hint = "the inferior is not running — `pry run` to start it"
+        if hint:
+            return f"{base} ({hint})"
+        return base
 
     def _dispatch_interrupt(self) -> dict[str, Any]:
         """Interrupt the inferior without acquiring any lock.
@@ -817,6 +897,9 @@ class GdbBridge:
 
         def _do_execute():
             try:
+                # Snapshot watchpoint values before resuming so a watchpoint
+                # hit during this run can report old -> new.
+                self._snapshot_watchpoints()
                 self._dispatch_op(op, params)
             except Exception as exc:
                 error_box.append(exc)
@@ -1117,6 +1200,10 @@ class GdbBridge:
             return self._print(params)
         if op == "registers":
             return self._registers(params)
+        if op == "register_write":
+            return self._register_write(params)
+        if op == "mappings":
+            return self._mappings(params)
         if op == "memory_read":
             return self._memory_read(params)
         if op == "memory_write":
@@ -1334,15 +1421,12 @@ class GdbBridge:
         """Find the runtime load base of a module via process mappings."""
         import re as _re
 
-        # Try info proc mappings first (most reliable for local targets).
-        try:
-            output = gdb.execute("info proc mappings", to_string=True)
-            for line in output.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and module_name in parts[-1]:
-                    return int(parts[0], 16)
-        except gdb.error:
-            pass
+        # Try info proc mappings first (most reliable for local targets). The
+        # lowest-addressed mapping for the module is its load base; the parser
+        # preserves /proc ordering so the first match is the lowest.
+        for mapping in GdbBridge._parse_proc_mappings():
+            if module_name in (mapping.get("objfile") or ""):
+                return int(mapping["start"], 16)
 
         # Fallback: search loaded objfiles.
         for objfile in gdb.objfiles():
@@ -1424,8 +1508,12 @@ class GdbBridge:
         number = int(params["number"])
         for bp in (gdb.breakpoints() or []):
             if bp.number == number:
+                # Capture the kind before deleting so the response can name a
+                # watchpoint a "watchpoint" (break/watch share a number space).
+                kind = _bp_kind(bp.type)
                 bp.delete()
-                return {"deleted": number}
+                self._watchpoint_values.pop(number, None)
+                return {"deleted": number, "kind": kind}
         raise ValueError(f"No breakpoint #{number}")
 
     def _break_enable(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1454,6 +1542,10 @@ class GdbBridge:
         else:
             wp_type = gdb.WP_WRITE
         bp = gdb.Breakpoint(expression, type=gdb.BP_WATCHPOINT, wp_class=wp_type)
+        # Seed the value cache so the first hit can report old -> new.
+        initial = self._safe_eval_str(expression)
+        if initial is not None:
+            self._watchpoint_values[bp.number] = initial
         return _breakpoint_to_dict(bp)
 
     # ------------------------------------------------------------------
@@ -1464,10 +1556,10 @@ class GdbBridge:
         full = params.get("full", False)
         limit = params.get("limit")
         frames = []
-        try:
-            frame = gdb.newest_frame()
-        except gdb.error:
-            return []
+        # gdb.newest_frame() raises gdb.error "No stack." when nothing is
+        # running. Let it propagate so dispatch() attaches an actionable hint,
+        # rather than returning [] (which an agent reads as "empty stack").
+        frame = gdb.newest_frame()
         level = 0
         while frame is not None:
             if limit is not None and level >= limit:
@@ -1601,6 +1693,19 @@ class GdbBridge:
             pass
         return result
 
+    @staticmethod
+    def _inferior_is_live() -> bool:
+        """True when an inferior process is actually running/stopped.
+
+        ``pid`` is 0 both before the first run and after the inferior exits;
+        in either case GDB resolves variable reads from the static binary
+        image rather than live memory.
+        """
+        try:
+            return bool(gdb.selected_inferior().pid)
+        except Exception:
+            return False
+
     def _print(self, params: dict[str, Any]) -> dict[str, Any]:
         expression = params["expression"]
         val = gdb.parse_and_eval(expression)
@@ -1609,6 +1714,15 @@ class GdbBridge:
             result["type"] = str(val.type)
         except Exception:
             pass
+        # Without a live inferior, a variable read comes from the static image
+        # (e.g. a global's initializer), which can silently contradict the
+        # value seen at the last stop. Flag it so the agent isn't misled.
+        if not self._inferior_is_live():
+            result["live"] = False
+            result["note"] = (
+                "no live inferior — value read from the static binary image, "
+                "not live memory"
+            )
         return result
 
     def _registers(self, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1621,6 +1735,70 @@ class GdbBridge:
             if len(parts) >= 2:
                 result.append({"name": parts[0], "value": " ".join(parts[1:])})
         return result
+
+    def _register_write(self, params: dict[str, Any]) -> dict[str, Any]:
+        name = str(params["name"]).lstrip("$")
+        value = params["value"]
+        gdb.execute(f"set ${name} = {value}", to_string=True)
+        readback = self._safe_eval_str(f"${name}")
+        result: dict[str, Any] = {"register": name, "value": str(value)}
+        if readback is not None:
+            result["readback"] = readback
+        return result
+
+    @staticmethod
+    def _parse_proc_mappings() -> list[dict[str, Any]]:
+        """Parse ``info proc mappings`` into structured entries.
+
+        Returns [] when no process is mapped or the command is unavailable
+        (e.g. some remote targets) — the caller decides how to surface that.
+        """
+        try:
+            output = gdb.execute("info proc mappings", to_string=True)
+        except gdb.error:
+            return []
+        maps: list[dict[str, Any]] = []
+        for line in output.splitlines():
+            parts = line.split()
+            # Rows start with a hex Start Addr; the header and blank lines don't.
+            if len(parts) < 4 or not parts[0].startswith("0x"):
+                continue
+            try:
+                start = int(parts[0], 16)
+                end = int(parts[1], 16)
+                size = int(parts[2], 16)
+                offset = int(parts[3], 16)
+            except ValueError:
+                continue
+            entry: dict[str, Any] = {
+                "start": hex(start),
+                "end": hex(end),
+                "size": size,
+                "offset": hex(offset),
+            }
+            rest = parts[4:]
+            # Newer GDB includes a perms column (e.g. "r-xp"); older omits it.
+            if rest and re.fullmatch(r"[rwxsp-]+", rest[0]):
+                entry["perms"] = rest[0]
+                rest = rest[1:]
+            if rest:
+                entry["objfile"] = " ".join(rest)
+            maps.append(entry)
+        return maps
+
+    def _mappings(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        maps = self._parse_proc_mappings()
+        contains = params.get("contains")
+        name = params.get("name")
+        if contains is not None:
+            addr = self._parse_addr(contains)
+            maps = [
+                m for m in maps
+                if int(m["start"], 16) <= addr < int(m["end"], 16)
+            ]
+        if name:
+            maps = [m for m in maps if name in (m.get("objfile") or "")]
+        return maps
 
     def _memory_read(self, params: dict[str, Any]) -> dict[str, Any]:
         address = params["address"]
@@ -1665,6 +1843,22 @@ class GdbBridge:
         inf.write_memory(addr_int, data)
         return {"written": len(data), "address": hex(addr_int)}
 
+    @staticmethod
+    def _symbolize(addr_int: int) -> str | None:
+        """Resolve an address to a compact ``func+off`` label, or None.
+
+        Uses ``info symbol`` (works without a selected frame) and normalises
+        GDB's "func + 4 in section .text" form to "func+4".
+        """
+        try:
+            out = gdb.execute(f"info symbol {hex(addr_int)}", to_string=True).strip()
+        except Exception:
+            return None
+        if not out or out.startswith("No symbol"):
+            return None
+        label = out.split(" in section", 1)[0].strip()
+        return re.sub(r"\s*\+\s*", "+", label) or None
+
     def _disasm(self, params: dict[str, Any]) -> Any:
         location = params.get("location")
         count = params.get("count")
@@ -1680,10 +1874,21 @@ class GdbBridge:
             try:
                 arch = gdb.selected_frame().architecture()
                 insns = arch.disassemble(addr_int, count=count or 20)
-                return [
-                    {"address": hex(insn["addr"]), "asm": insn["asm"], "length": insn["length"]}
-                    for insn in insns
-                ]
+                result = []
+                for insn in insns:
+                    entry = {
+                        "address": hex(insn["addr"]),
+                        "asm": insn["asm"],
+                        "length": insn["length"],
+                    }
+                    # Annotate with the containing symbol+offset so an agent
+                    # can locate each instruction (matches pwndbg/GDB context)
+                    # without a separate `info symbol` round-trip.
+                    symbol = self._symbolize(insn["addr"])
+                    if symbol:
+                        entry["symbol"] = symbol
+                    result.append(entry)
+                return result
             except Exception:
                 pass
 
