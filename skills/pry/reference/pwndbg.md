@@ -9,6 +9,7 @@ When connected to a QEMU kernel with KASLR enabled, vmlinux symbols are at link-
 **Recommended KASLR workflow** (verified: both function *and* data symbols resolve):
 ```bash
 pry launch --connect localhost:1234   # connect WITHOUT --symbols (no link-time copy)
+                                      # (with qmu: `qmu gdb --vm <id>` and DON'T pass --symbols)
 pry gdb kbase                         # -> "Found virtual text base address: 0x...."
 pry load ./vmlinux --base 0x<kbase>   # one clean copy; pry offsets ALL sections by the slide
 pry break set commit_creds            # symbol breakpoints, print, disasm now resolve correctly
