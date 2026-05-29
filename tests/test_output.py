@@ -101,3 +101,18 @@ def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monke
     assert envelope["artifact_path"] == str(out_path)
     assert envelope["tokenizer"] == TOKENIZER
     assert envelope["tokens"] == _token_count(artifact_text)
+
+
+def test_summary_flags_truncated_keys():
+    from pry.output import _summary
+
+    big = {f"k{i:02d}": i for i in range(25)}
+    summary = _summary(big)
+    assert summary["kind"] == "object"
+    assert summary["count"] == 25
+    assert len(summary["keys"]) == 10
+    assert summary["keys_truncated"] is True
+
+    small = _summary({"a": 1, "b": 2})
+    assert small["count"] == 2
+    assert "keys_truncated" not in small

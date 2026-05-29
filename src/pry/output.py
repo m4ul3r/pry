@@ -49,7 +49,13 @@ def render_value(value: Any, fmt: str) -> str:
 
 def _summary(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
-        return {"kind": "object", "keys": sorted(value.keys())[:10], "count": len(value)}
+        keys = sorted(value.keys())
+        summary: dict[str, Any] = {"kind": "object", "keys": keys[:10], "count": len(value)}
+        # "keys" is a sample when the dict is larger than the cap — flag it so
+        # an agent doesn't read the list as exhaustive.
+        if len(keys) > 10:
+            summary["keys_truncated"] = True
+        return summary
     if isinstance(value, list):
         return {"kind": "array", "count": len(value)}
     if isinstance(value, str):
