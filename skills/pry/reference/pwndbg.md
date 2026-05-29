@@ -73,7 +73,8 @@ pry gdb "slab -v"                     # Verbose SLUB allocator info
 pry gdb vmmap                         # Virtual memory map (all mappings with permissions)
 pry gdb "vmmap libc"                  # Filter mappings by name
 pry gdb "vmmap 0x7ffff7d00000"        # Show mapping containing address
-pry gdb 'search -t string "flag{"'   # Search memory for a string
+pry gdb 'search "flag{"'             # Search memory for a substring (plain form; matches a prefix of a longer string)
+pry gdb 'search -t string "flag{"'   # EXACT string match — `-t string` appends a NUL, so this only hits a whole NUL-terminated "flag{"; use the plain form above for prefixes/substrings
 pry gdb "search -x deadbeef"         # Search memory for hex bytes
 pry gdb "search -p 0x7ffff7d00000"   # Search memory for pointer value
 pry gdb "hexdump 0x7ffff7d00000 64"  # Hex dump

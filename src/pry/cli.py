@@ -1281,6 +1281,21 @@ def _launch(args: argparse.Namespace) -> int:
 
 
 def _kill(args: argparse.Namespace) -> int:
+    if getattr(args, "all", False):
+        killed = []
+        for inst in list_instances():
+            _kill_instance(inst.pid)
+            killed.append(inst.pid)
+        if args.format == "text":
+            msg = (
+                f"Killed {len(killed)} GDB session(s): {', '.join(map(str, killed))}"
+                if killed else "No running GDB sessions to kill."
+            )
+            _render_result(msg, fmt="text", out_path=args.out, stem="kill")
+        else:
+            _render_result({"killed": True, "pids": killed}, fmt=args.format, out_path=args.out, stem="kill")
+        return 0
+
     target_pid: int | None = getattr(args, "instance", None)
 
     if target_pid is None:
@@ -1302,6 +1317,47 @@ def _kill(args: argparse.Namespace) -> int:
         _render_result(f"Killed GDB (pid={target_pid})", fmt="text", out_path=args.out, stem="kill")
     else:
         _render_result(result, fmt=args.format, out_path=args.out, stem="kill")
+    return 0
+
+
+def _logs(args: argparse.Namespace) -> int:
+    """Show a session's captured inferior stdout/stderr (and GDB's own output).
+
+    The inferior's output is written to ~/.cache/pry/instances/<pid>.log; this
+    is the only place an agent can see what the debugged program printed.
+    """
+    target_pid: int | None = getattr(args, "instance", None)
+    if target_pid is None:
+        instances = list_instances()
+        if not instances:
+            raise BridgeError("No running GDB session found. Launch one with 'pry launch <binary>'.")
+        if len(instances) > 1:
+            pids = ", ".join(str(i.pid) for i in instances)
+            raise BridgeError(
+                f"Multiple bridge instances running (pids: {pids}). Use --instance <pid>."
+            )
+        target_pid = instances[0].pid
+
+    log_path = gdb_log_path(target_pid)
+    if not log_path.exists():
+        raise BridgeError(f"No log found for instance {target_pid} (expected {log_path}).")
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise BridgeError(f"Could not read log {log_path}: {exc}")
+
+    lines = getattr(args, "lines", None)
+    if lines is not None and lines > 0:
+        tail = text.splitlines()[-lines:]
+        text = ("\n".join(tail) + "\n") if tail else ""
+
+    if args.format == "text":
+        _render_result(text, fmt="text", out_path=args.out, stem="logs")
+    else:
+        _render_result(
+            {"pid": target_pid, "log_path": str(log_path), "content": text},
+            fmt=args.format, out_path=args.out, stem="logs",
+        )
     return 0
 
 
@@ -2039,7 +2095,14 @@ def build_parser() -> argparse.ArgumentParser:
     # --- kill ---
     kill = subparsers.add_parser("kill", help="Kill a running GDB bridge session")
     _common_io_options(kill)
+    kill.add_argument("--all", action="store_true", help="Kill all running GDB bridge sessions")
     kill.set_defaults(handler=_kill)
+
+    # --- logs ---
+    logs = subparsers.add_parser("logs", help="Show a session's captured inferior stdout/stderr (and GDB output)")
+    _common_io_options(logs)
+    logs.add_argument("-n", "--lines", type=int, default=None, metavar="N", help="Show only the last N lines")
+    logs.set_defaults(handler=_logs)
 
     # --- load ---
     load = subparsers.add_parser("load", help="Load a binary into GDB")

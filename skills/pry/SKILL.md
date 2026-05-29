@@ -36,26 +36,27 @@ pry --instance 12346 break set process_input
 pry --instance 12345 run
 pry --instance 12346 run
 pry kill --instance 12345    # Kill specific session
+pry kill --all               # Kill every running session
 ```
 
 ### Manual setup
 
 If you need interactive GDB access or a custom setup:
 
-1. **Manual source:**
+1. **Installed plugin (recommended, persistent):**
    ```bash
-   gdb -q ./binary -ex "python import sys; sys.path.insert(0, '/opt/pry/plugin'); import pry_agent_bridge"
+   pry plugin install        # symlinks the bridge into GDB's data dir (~/.gdb/pry_agent_bridge)
+   # It prints the exact `python ... import pry_agent_bridge` snippet to add to ~/.gdbinit.
    ```
 
-2. **Installed plugin (persistent):**
+2. **Manual source** — use the path `pry plugin install` printed (its parent of `pry_agent_bridge`, e.g. `~/.gdb`), not a hardcoded one:
    ```bash
-   pry plugin install
-   # Then add the printed snippet to ~/.gdbinit
+   gdb -q ./binary -ex "python import sys; sys.path.insert(0, '$HOME/.gdb'); import pry_agent_bridge"
    ```
 
 For headless/agent contexts without `pry launch`, keep GDB's stdin open:
 ```bash
-sleep 99999 | gdb -q ./binary -ex "python import sys; sys.path.insert(0, '/opt/pry/plugin'); import pry_agent_bridge"
+sleep 99999 | gdb -q ./binary -ex "python import sys; sys.path.insert(0, '$HOME/.gdb'); import pry_agent_bridge"
 ```
 
 ## Remote Debugging (QEMU / gdbserver)
@@ -130,7 +131,7 @@ pry run
 - Use `--format json` for structured/programmatic output, `--format ndjson` for streaming.
 - Use `--out <path>` to write output to a file.
 
-Outputs above 10,000 `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata.
+Outputs above 10,000 `o200k_base` tokens auto-spill to disk. When that happens, **stdout carries the artifact envelope** (a JSON object with `artifact_path`, `bytes`, `tokens`, `sha256`, `summary`) and stderr gets a one-line `warning: ... spilled to <path>` note. Read `artifact_path` from the stdout envelope to retrieve the full data.
 
 4. **Parallel calls are safe.** All pry commands exit 0 — errors are reported in stderr, never via exit code. Read-only inspection commands (`backtrace`, `registers`, `locals`, `memory read`, `disasm`, `print`, etc.) can be batched in parallel freely. Avoid parallelising execution/mutation commands (`run`, `continue`, `step`, `break set`, `memory write`) as they acquire an exclusive lock and will serialise anyway.
 
@@ -154,6 +155,20 @@ pry threads --function worker  # Filter by current frame function substring
 ```
 
 Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
+
+`pry status` reports one of: `running`, `stopped`, `exited`, or `not-started`.
+
+### Seeing the program's output
+
+The inferior's **stdout/stderr does not come back in command results** — it (plus GDB's own output) is captured to a per-session log. Use `pry logs` to read it; this is how you confirm what the program printed (e.g. to check a function actually ran):
+
+```bash
+pry logs                     # Full captured output for the (auto-selected) session
+pry logs -n 20               # Just the last 20 lines
+pry logs --instance 12345    # A specific session
+```
+
+Note: libc line-buffers stdout when not a TTY, so output may be withheld until a flush, a newline, or normal exit — a program that crashes mid-line may show nothing.
 
 ### Background execution
 
@@ -263,7 +278,7 @@ pry mappings --contains 0x7ffff7d00000   # Mapping that holds an address
 pry mappings --name libc         # Mappings whose objfile matches a substring
 ```
 
-`pry print "expr"` evaluates C expressions, and when `expr` is a call it runs **inside the inferior** (e.g. `pry print 'malloc(0x100)'` to shape the heap). A watchpoint stop reports the value change as `old -> new`. After the inferior exits, `pry print` reads the static binary image (not live memory) and flags the result with a `note`. `pry disasm` annotates each instruction with its `symbol+offset`.
+`pry print "expr"` evaluates C expressions, and when `expr` is a call it runs **inside the inferior** (e.g. `pry print 'malloc(0x100)'` to shape the heap). A watchpoint stop reports the value change as `old -> new` (rendered in the session's output radix — hex by default under pwndbg, e.g. `0x6 -> 0xa`). After the inferior exits, `pry print` reads the static binary image (not live memory) and flags the result with a `note`. `pry disasm` annotates each instruction with its `symbol+offset`.
 
 ## Memory Access
 
@@ -275,6 +290,8 @@ pry memory read 0x7fffffffe000 64 --display string   # Read as string
 pry memory read 0x7fffffffe000 64 --display bytes    # Read as base64
 pry memory write 0x7fffffffe000 deadbeef       # Write hex bytes
 ```
+
+**Searching memory:** there's no `pry memory search` — use the pwndbg passthrough: `pry gdb 'search "needle"'` (plain form matches a substring/prefix), `pry gdb "search -x deadbeef"` (hex), `pry gdb "search -p 0xADDR"` (pointer). Note `search -t string "x"` requires the *complete* NUL-terminated string. See [reference/pwndbg.md](reference/pwndbg.md).
 
 ## Code and Symbol Inspection
 
@@ -291,6 +308,8 @@ pry source list main.c:42       # Show source around line
 ```
 
 **Note:** `pry symbols` and `pry functions` search global symbols from all loaded shared libraries (via `info variables` / `info functions`). They do not find local variables — use `pry locals` for that. Results are paginated with `--limit` (default 100) and `--offset`.
+
+**No reverse xref/call-graph:** pry can't list a function's *callers* directly. For static caller discovery, prefer the `bn`/`bn-re` skills (Binary Ninja exposes `caller_static`); within pry you'd disassemble candidate functions and scan their call targets. `pry disasm` resolves call targets to symbol names, so the forward direction (what a function calls) is easy.
 
 ## Python Escape Hatch
 

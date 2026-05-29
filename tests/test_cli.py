@@ -1355,3 +1355,79 @@ def test_load_slide_sends_param(monkeypatch, capsys):
     assert captured["params"]["slide"] == "0x7000000"
     out = capsys.readouterr().out
     assert "loaded /x/vmlinux (slide 0x7000000)" in out
+
+
+# ---------------------------------------------------------------------------
+# Agent-ease review fixes: kill --all, logs
+# ---------------------------------------------------------------------------
+
+def _mk_instance(tmp_path, pid):
+    from pry.transport import BridgeInstance
+    return BridgeInstance(
+        pid=pid, socket_path=tmp_path / f"{pid}.sock", registry_path=tmp_path / f"{pid}.json",
+        plugin_name="pry_agent_bridge", plugin_version="0.1.0", started_at=None, meta={},
+    )
+
+
+def test_kill_all(monkeypatch, capsys, tmp_path):
+    instances = [_mk_instance(tmp_path, 111), _mk_instance(tmp_path, 222)]
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: instances)
+    monkeypatch.setattr(pry.cli.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+
+    rc = pry.cli.main(["kill", "--all"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "111" in out and "222" in out
+
+
+def test_kill_all_none_running(monkeypatch, capsys):
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    rc = pry.cli.main(["kill", "--all"])
+    assert rc == 0
+    assert "No running GDB sessions" in capsys.readouterr().out
+
+
+def test_logs_reads_instance_log(monkeypatch, capsys, tmp_path):
+    inst = _mk_instance(tmp_path, 4242)
+    logf = tmp_path / "4242.log"
+    logf.write_text("starting\nWIN reached\ndone\n")
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(pry.cli, "gdb_log_path", lambda pid=None: logf)
+
+    rc = pry.cli.main(["logs"])
+    assert rc == 0
+    assert "WIN reached" in capsys.readouterr().out
+
+
+def test_logs_tail_lines(monkeypatch, capsys, tmp_path):
+    inst = _mk_instance(tmp_path, 4242)
+    logf = tmp_path / "4242.log"
+    logf.write_text("a\nb\nc\nd\n")
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(pry.cli, "gdb_log_path", lambda pid=None: logf)
+
+    rc = pry.cli.main(["logs", "-n", "2"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "c\nd" in out and "a\n" not in out
+
+
+def test_logs_json_envelope(monkeypatch, capsys, tmp_path):
+    inst = _mk_instance(tmp_path, 4242)
+    logf = tmp_path / "4242.log"
+    logf.write_text("hello\n")
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(pry.cli, "gdb_log_path", lambda pid=None: logf)
+
+    rc = pry.cli.main(["logs", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pid"] == 4242
+    assert payload["content"] == "hello\n"
+
+
+def test_logs_no_session(monkeypatch, capsys):
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    rc = pry.cli.main(["logs"])
+    assert rc == 0
+    assert "No running GDB session" in capsys.readouterr().err
