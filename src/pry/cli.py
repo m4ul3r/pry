@@ -1342,11 +1342,32 @@ def _kill_instance(pid: int) -> None:
 
 # --- Session management ---
 
+def _render_load_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    path = value.get("loaded", "<unknown>")
+    base = value.get("base")
+    slide = value.get("slide")
+    if base:
+        return f"loaded {path} @ {base} (slide {slide})"
+    if slide:
+        return f"loaded {path} (slide {slide})"
+    return f"loaded {path}"
+
+
 def _load(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"path": str(Path(args.path).expanduser().resolve())}
+    base = getattr(args, "base", None)
+    slide = getattr(args, "slide", None)
+    if base:
+        params["base"] = base
+    if slide:
+        params["slide"] = slide
     return _call(
         args,
         "load",
-        {"path": str(Path(args.path).expanduser().resolve())},
+        params,
+        text_renderer=_render_load_text,
         stem="load",
     )
 
@@ -2024,6 +2045,18 @@ def build_parser() -> argparse.ArgumentParser:
     load = subparsers.add_parser("load", help="Load a binary into GDB")
     _common_io_options(load, default_format="json")
     load.add_argument("path", help="Path to binary")
+    load.add_argument(
+        "--base", metavar="ADDR",
+        help="Load symbols so .text lands at this runtime base, as the sole copy, "
+             "offsetting ALL sections uniformly (text+data). For relocated/PIE/KASLR "
+             "modules; avoids the duplicate-symbol and data-not-relocated traps of "
+             '`kbase -r`. Get a kernel base from `pry gdb "kbase"`.',
+    )
+    load.add_argument(
+        "--slide", metavar="OFFSET",
+        help="Offset added to every section (alternative to --base when the file's "
+             ".text address can't be read).",
+    )
     load.set_defaults(handler=_load)
 
     # --- attach ---

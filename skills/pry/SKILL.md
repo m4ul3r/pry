@@ -78,6 +78,14 @@ pry break set commit_creds          # Set kernel breakpoint
 pry continue                        # Continue execution
 ```
 
+> **KASLR kernels:** loading vmlinux at its link-time base (via `--symbols`/`pry load`) leaves symbols at the wrong addresses, so `pry break set <fn>` / `pry print <global>` won't resolve. Connect **without** symbols, read the base, then rebase in one clean step:
+> ```bash
+> pry launch --connect localhost:1234
+> pry gdb kbase                       # -> Found virtual text base address: 0x....
+> pry load ./vmlinux --base 0x<kbase> # offsets ALL sections; text + data resolve
+> ```
+> Do **not** use `kbase -r` for this — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
+
 ### Connection management
 
 ```bash
@@ -315,10 +323,12 @@ pwndbg is loaded alongside the bridge, so **any** pwndbg command runs verbatim t
 
 ```bash
 pry gdb "pwndbg --all"                # Full list of available pwndbg commands
-pry gdb "kbase -r"                    # Detect kernel base and reload symbols (KASLR)
+pry gdb kbase                         # Kernel virtual base (KASLR) — then `pry load vmlinux --base <kbase>`
 pry gdb checksec                      # Binary security (NX, PIE, RELRO, canary)
 pry gdb vmmap                         # Virtual memory map
 ```
+
+For KASLR, rebase vmlinux with `pry load vmlinux --base <kbase>` — **not** `kbase -r`, which leaves a stale duplicate and doesn't relocate data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
 
 Prefer the first-class structured commands where they exist — `pry mappings` (over `vmmap`), `pry registers` / `pry registers write`, `pry disasm` (symbol-annotated), `pry backtrace` — and drop to `pry gdb` for everything else.
 

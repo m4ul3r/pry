@@ -1322,3 +1322,36 @@ def test_print_renders_stale_note(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "(int) 0x0" in output
     assert "note: no live inferior" in output
+
+
+def test_load_base_sends_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"loaded": params["path"], "base": "0xffffffff84400000", "slide": "0x3400000"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["load", "/x/vmlinux", "--base", "0xffffffff84400000", "--format", "text"])
+    assert rc == 0
+    assert captured["op"] == "load"
+    assert captured["params"]["base"] == "0xffffffff84400000"
+    out = capsys.readouterr().out
+    assert "loaded /x/vmlinux @ 0xffffffff84400000 (slide 0x3400000)" in out
+
+
+def test_load_slide_sends_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"loaded": params["path"], "slide": params.get("slide")}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["load", "/x/vmlinux", "--slide", "0x7000000", "--format", "text"])
+    assert rc == 0
+    assert captured["params"]["slide"] == "0x7000000"
+    out = capsys.readouterr().out
+    assert "loaded /x/vmlinux (slide 0x7000000)" in out

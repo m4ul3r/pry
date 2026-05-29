@@ -4,32 +4,28 @@ pwndbg is a GDB plugin loaded alongside the pry bridge. All pwndbg commands are 
 
 ### KASLR / Kernel Symbols
 
-When connected to a QEMU kernel with KASLR enabled, symbols loaded from vmlinux will be at the wrong addresses. Use `kbase -r` to fix this:
+When connected to a QEMU kernel with KASLR enabled, vmlinux symbols are at link-time addresses and won't match the running kernel. **Use `pry load --base` to rebase them — do NOT pre-load symbols and then `kbase -r`** (see the pitfall below).
 
+**Recommended KASLR workflow** (verified: both function *and* data symbols resolve):
 ```bash
-# Detect kernel base and reload symbols at the correct KASLR'd offset (one command)
-pry gdb "kbase -r"
-
-# Or inspect first, then rebase manually:
-pry gdb kbase                         # Print kernel virtual base address
-pry gdb "add-symbol-file vmlinux 0xffffffff81e00000"  # Manual rebase
+pry launch --connect localhost:1234   # connect WITHOUT --symbols (no link-time copy)
+pry gdb kbase                         # -> "Found virtual text base address: 0x...."
+pry load ./vmlinux --base 0x<kbase>   # one clean copy; pry offsets ALL sections by the slide
+pry break set commit_creds            # symbol breakpoints, print, disasm now resolve correctly
+pry print "init_task.comm"            # data symbols work too
+pry continue
 ```
+
+`pry load --base` reads vmlinux's link-time `.text` address, computes `slide = base - .text`, and runs `add-symbol-file vmlinux -o <slide>` after dropping any prior copy — so there is exactly one symbol table and every section (text + data) lands at its runtime address.
 
 **How `kbase` works:** On x86-64 it reads the IDT via the IDTR register (available from the GDB stub without symbols), parses IDT entry 0 to get a `.text` address, then walks page tables to find the containing mapping's base. On AArch64 it reads VBAR_EL1. No symbols or /proc access needed.
 
-**Typical KASLR workflow:**
-```bash
-pry launch --symbols ./vmlinux --connect localhost:1234
-pry gdb "kbase -r"                    # Rebase symbols to actual KASLR'd base
-pry break set commit_creds            # Now symbol breakpoints work correctly
-pry continue
-```
+> **Pitfall — `kbase -r` is not enough.** `pry gdb "kbase -r"` does `add-symbol-file vmlinux <base>`, which (a) *adds* a second copy without removing the link-time one (so `print &sym`/`break sym` resolve to the stale, unmapped link-time address → `MemoryError`), and (b) only relocates `.text`, leaving data symbols (`jiffies`, `init_task`) at link addresses. If you loaded vmlinux as the primary file (e.g. `pry launch --symbols vmlinux` or `qmu gdb --symbols vmlinux`), `kbase -r` will *not* make symbol lookups work. Prefer `pry load --base`. If you don't have vmlinux at all, `klookup` reads the in-memory kallsyms and gives correct runtime addresses.
 
 ### Kernel Inspection
 
 ```bash
-pry gdb kbase                         # Kernel virtual base address
-pry gdb "kbase -r"                    # Detect kbase and reload symbols at correct offset
+pry gdb kbase                         # Kernel virtual base address (then: pry load vmlinux --base <kbase>)
 pry gdb "klookup commit_creds"        # Symbol lookup via in-memory kallsyms (no debug syms needed)
 pry gdb "klookup 0xffffffff81234567"  # Reverse lookup: address → symbol name
 pry gdb kcmdline                      # /proc/cmdline from kernel memory

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socketserver
+import struct
 import sys
 import threading
 import traceback
@@ -187,6 +188,48 @@ def _resolve_to_address(expr: str) -> int | None:
         return int(gdb.parse_and_eval(f"&({expr})"))
     except Exception:
         return None
+
+
+def _elf_text_vaddr(path: str) -> int | None:
+    """Link-time virtual address of the ``.text`` section of an ELF64 file.
+
+    Used to compute the uniform relocation slide for ``pry load --base``:
+    ``slide = runtime_base - link_text_vaddr``. Returns None if the file isn't
+    a readable ELF64 or has no ``.text`` section.
+    """
+    try:
+        with open(path, "rb") as f:
+            ehdr = f.read(64)
+            if len(ehdr) < 64 or ehdr[:4] != b"\x7fELF" or ehdr[4] != 2:
+                return None  # not ELF64
+            endian = "<" if ehdr[5] == 1 else ">"
+            e_shoff = struct.unpack_from(endian + "Q", ehdr, 0x28)[0]
+            e_shentsize = struct.unpack_from(endian + "H", ehdr, 0x3A)[0]
+            e_shnum = struct.unpack_from(endian + "H", ehdr, 0x3C)[0]
+            e_shstrndx = struct.unpack_from(endian + "H", ehdr, 0x3E)[0]
+            if not e_shoff or not e_shnum or e_shstrndx >= e_shnum:
+                return None
+            f.seek(e_shoff)
+            shdrs = f.read(e_shentsize * e_shnum)
+
+            def _sh(i: int) -> bytes:
+                return shdrs[i * e_shentsize:(i + 1) * e_shentsize]
+
+            strhdr = _sh(e_shstrndx)
+            str_off = struct.unpack_from(endian + "Q", strhdr, 0x18)[0]
+            str_size = struct.unpack_from(endian + "Q", strhdr, 0x20)[0]
+            f.seek(str_off)
+            strtab = f.read(str_size)
+            for i in range(e_shnum):
+                h = _sh(i)
+                name_off = struct.unpack_from(endian + "I", h, 0)[0]
+                end = strtab.find(b"\x00", name_off)
+                name = strtab[name_off:end if end != -1 else None]
+                if name == b".text":
+                    return struct.unpack_from(endian + "Q", h, 0x10)[0]
+    except (OSError, struct.error):
+        return None
+    return None
 
 
 def _parse_info_functions(output: str) -> list[dict[str, Any]]:
@@ -1343,8 +1386,37 @@ class GdbBridge:
 
     def _load(self, params: dict[str, Any]) -> dict[str, Any]:
         path = params["path"]
-        gdb.execute(f"file {path}", to_string=True)
-        return {"loaded": path}
+        base = params.get("base")
+        slide = params.get("slide")
+        if base is None and slide is None:
+            gdb.execute(f"file {path}", to_string=True)
+            return {"loaded": path}
+        # Load symbols at a runtime base (relocated/PIE/KASLR module). Two
+        # traps this avoids: (1) GDB doesn't auto-relocate symbols for a remote
+        # kernel stub, and pwndbg's `kbase -r` *adds* a copy without removing
+        # the link-time one, so name->address resolves to the stale (unmapped)
+        # copy; (2) `add-symbol-file FILE ADDR` only relocates .text, leaving
+        # data symbols (jiffies, init_task, ...) at link addresses. So: drop any
+        # prior copy, then add the file with ALL sections offset by a uniform
+        # slide, giving exactly one table where both text AND data resolve.
+        if slide is not None:
+            slide_int = self._parse_addr(slide)
+        else:
+            text_vaddr = _elf_text_vaddr(path)
+            if text_vaddr is None:
+                raise ValueError(
+                    f"could not read the .text address from {path} to compute "
+                    "the relocation slide; pass --slide <offset> explicitly"
+                )
+            slide_int = self._parse_addr(base) - text_vaddr
+        with contextlib.suppress(gdb.error):
+            gdb.execute(f"remove-symbol-file {path}", to_string=True)
+        offset = f"-0x{-slide_int:x}" if slide_int < 0 else hex(slide_int)
+        gdb.execute(f"add-symbol-file {path} -o {offset}", to_string=True)
+        result: dict[str, Any] = {"loaded": path, "slide": hex(slide_int)}
+        if base is not None:
+            result["base"] = hex(self._parse_addr(base))
+        return result
 
     def _attach(self, params: dict[str, Any]) -> dict[str, Any]:
         pid = int(params["pid"])

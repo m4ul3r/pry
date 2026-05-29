@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import struct
 import sys
 import types
 from pathlib import Path
@@ -1185,3 +1186,101 @@ def test_dispatch_augments_no_symbol_error(monkeypatch):
     resp = bridge.dispatch({"op": "print", "params": {"expression": "foo"}})
     assert resp["ok"] is False
     assert "functions --query" in resp["error"]
+
+
+def _write_minimal_elf64(path: Path, text_vaddr: int) -> None:
+    """Write a minimal valid ELF64-LE file with a .text section at text_vaddr."""
+    shstrtab = b"\x00.text\x00.shstrtab\x00"  # ".text"@1, ".shstrtab"@7
+    text_name, str_name = 1, 7
+    ehsize, shentsize, shnum, shstrndx = 64, 64, 3, 2
+    shoff = ehsize + len(shstrtab)
+
+    ehdr = bytearray(64)
+    ehdr[0:4] = b"\x7fELF"
+    ehdr[4] = 2  # ELFCLASS64
+    ehdr[5] = 1  # ELFDATA2LSB
+    ehdr[6] = 1  # version
+    struct.pack_into("<H", ehdr, 16, 2)            # e_type ET_EXEC
+    struct.pack_into("<H", ehdr, 18, 0x3E)         # e_machine x86-64
+    struct.pack_into("<I", ehdr, 20, 1)            # e_version
+    struct.pack_into("<Q", ehdr, 0x28, shoff)      # e_shoff
+    struct.pack_into("<H", ehdr, 0x34, ehsize)     # e_ehsize
+    struct.pack_into("<H", ehdr, 0x3A, shentsize)  # e_shentsize
+    struct.pack_into("<H", ehdr, 0x3C, shnum)      # e_shnum
+    struct.pack_into("<H", ehdr, 0x3E, shstrndx)   # e_shstrndx
+
+    def shdr(name, sh_type, addr=0, off=0, size=0):
+        b = bytearray(64)
+        struct.pack_into("<I", b, 0, name)     # sh_name
+        struct.pack_into("<I", b, 4, sh_type)  # sh_type
+        struct.pack_into("<Q", b, 0x10, addr)  # sh_addr
+        struct.pack_into("<Q", b, 0x18, off)   # sh_offset
+        struct.pack_into("<Q", b, 0x20, size)  # sh_size
+        return bytes(b)
+
+    sections = (
+        shdr(0, 0)                                            # null
+        + shdr(text_name, 1, addr=text_vaddr)                 # .text (PROGBITS)
+        + shdr(str_name, 3, off=ehsize, size=len(shstrtab))   # .shstrtab (STRTAB)
+    )
+    path.write_bytes(bytes(ehdr) + shstrtab + sections)
+
+
+def test_elf_text_vaddr_reads_dot_text(monkeypatch, tmp_path):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    elf = tmp_path / "fake.elf"
+    _write_minimal_elf64(elf, 0xFFFFFFFF81000000)
+    assert bridge_mod._elf_text_vaddr(str(elf)) == 0xFFFFFFFF81000000
+    assert bridge_mod._elf_text_vaddr(str(tmp_path / "missing")) is None
+
+
+def test_load_without_base_uses_file(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("load", {"path": "/x/vmlinux"})
+    assert result == {"loaded": "/x/vmlinux"}
+    assert any(c == "file /x/vmlinux" for c in fake_gdb._execute_log)
+
+
+def test_load_with_slide_offsets_all_sections(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("load", {"path": "/x/vmlinux", "slide": "0x7000000"})
+    assert result["loaded"] == "/x/vmlinux"
+    assert result["slide"] == hex(0x7000000)
+    log = fake_gdb._execute_log
+    # Drops any prior copy, then offsets EVERY section by the slide (-o) so both
+    # text and data resolve — and never loads a link-time `file` primary.
+    assert any(c == "remove-symbol-file /x/vmlinux" for c in log)
+    assert any(c == "add-symbol-file /x/vmlinux -o 0x7000000" for c in log)
+    assert not any(c.startswith("file ") for c in log)
+
+
+def test_load_with_base_computes_slide_from_elf(monkeypatch, tmp_path):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = tmp_path / "vmlinux"
+    _write_minimal_elf64(elf, 0xFFFFFFFF81000000)
+
+    base = 0xFFFFFFFF88000000
+    result = bridge._dispatch_op("load", {"path": str(elf), "base": hex(base)})
+    assert result["base"] == hex(base)
+    assert result["slide"] == hex(0x7000000)  # base - link .text
+    assert any(
+        c == f"add-symbol-file {elf} -o 0x7000000" for c in fake_gdb._execute_log
+    )
+
+
+def test_load_with_base_errors_when_text_unreadable(monkeypatch, tmp_path):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    notelf = tmp_path / "notelf"
+    notelf.write_bytes(b"not an elf")
+
+    resp = bridge.dispatch(
+        {"op": "load", "params": {"path": str(notelf), "base": "0xffffffff88000000"}}
+    )
+    assert resp["ok"] is False
+    assert "--slide" in resp["error"]
