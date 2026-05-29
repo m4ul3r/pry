@@ -1284,3 +1284,32 @@ def test_load_with_base_errors_when_text_unreadable(monkeypatch, tmp_path):
     )
     assert resp["ok"] is False
     assert "--slide" in resp["error"]
+
+
+def test_parse_disassemble_output(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    sample = (
+        "Dump of assembler code for function main:\n"
+        "   0x0000000000401136 <+0>:\tpush   %rbp\n"
+        "=> 0x000000000040113a <main+4>:\tmov    %rsp,%rbp\n"
+        "End of assembler dump.\n"
+    )
+    rows = bridge_mod._parse_disassemble_output(sample)
+    assert len(rows) == 2
+    assert rows[0] == {"address": "0x0000000000401136", "asm": "push   %rbp", "symbol": "+0"}
+    assert rows[1]["address"] == "0x000000000040113a"
+    assert rows[1]["symbol"] == "main+4"
+
+
+def test_disasm_fallback_returns_list(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _unresolvable(expr):
+        raise fake_gdb.error("not a single address")
+
+    fake_gdb.parse_and_eval = _unresolvable  # force the range-expr fallback path
+    bridge = bridge_mod.GdbBridge()
+    result = bridge._dispatch_op("disasm", {"location": "main,+8"})
+    assert isinstance(result, list)
+    assert result[0]["address"].startswith("0x")
+    assert "asm" in result[0]

@@ -316,6 +316,15 @@ def _render_doctor_text(value: Any) -> str:
         gdb_version = doctor.get("gdb_version")
         if gdb_version:
             lines.append(f"  gdb: {gdb_version}")
+        # Show the loaded binary so concurrent sessions are distinguishable
+        # after the launch pid scrolls away.
+        inferiors = doctor.get("inferiors") if isinstance(doctor.get("inferiors"), list) else []
+        for inf in inferiors:
+            if isinstance(inf, dict) and inf.get("executable"):
+                ipid = inf.get("pid") or 0
+                suffix = f" (inferior pid {ipid})" if ipid else ""
+                lines.append(f"  binary: {inf['executable']}{suffix}")
+                break
         error = doctor.get("error")
         if error:
             lines.append(f"  error: {error}")
@@ -446,6 +455,37 @@ def _render_disconnect_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     return "disconnected"
+
+
+def _render_attach_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    parts = [f"attached to pid {value.get('attached', '?')}"]
+    frame = value.get("frame") or {}
+    func = frame.get("function")
+    if func:
+        loc = func
+        f = frame.get("file")
+        line = frame.get("line")
+        if f:
+            loc += f" at {f}" + (f":{line}" if line is not None else "")
+        parts.append(f"frame: {loc}")
+    return "\n".join(parts)
+
+
+def _render_interrupt_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if value.get("interrupted"):
+        return "interrupted"
+    state = value.get("state")
+    return f"not interrupted (inferior is {state})" if state else "not interrupted (inferior was not running)"
+
+
+def _render_memory_write_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"wrote {value.get('written', '?')} bytes to {value.get('address', '?')}"
 
 
 def _render_target_info_text(value: Any) -> str:
@@ -801,12 +841,28 @@ def _render_type_info_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     layout = value.get("layout")
-    if isinstance(layout, str) and layout:
-        return layout
-    decl = value.get("decl")
-    if isinstance(decl, str) and decl:
-        return decl
-    return _render_fallback_text(value)
+    base = layout if (isinstance(layout, str) and layout) else value.get("decl")
+    if not (isinstance(base, str) and base):
+        return _render_fallback_text(value)
+    # ptype/decl omits byte offsets; append them from the field metadata the
+    # bridge already computes, so an agent doesn't have to switch to JSON or
+    # compute offsetof() by hand.
+    fields = value.get("fields")
+    rows = []
+    if isinstance(fields, list):
+        for f in fields:
+            if not isinstance(f, dict) or f.get("name") is None:
+                continue
+            bitpos = f.get("bitpos")
+            if not isinstance(bitpos, int):
+                continue
+            typ = f.get("type") or ""
+            rows.append(f"  +{bitpos // 8:<5} {typ} {f['name']}".rstrip())
+    if rows:
+        sizeof = value.get("sizeof")
+        header = f"offsets (sizeof={sizeof}):" if sizeof is not None else "offsets:"
+        return base.rstrip() + "\n\n" + header + "\n" + "\n".join(rows)
+    return base
 
 
 def _render_source_text(value: Any) -> str:
@@ -1433,6 +1489,7 @@ def _attach(args: argparse.Namespace) -> int:
         args,
         "attach",
         {"pid": args.pid},
+        text_renderer=_render_attach_text,
         stem="attach",
     )
 
@@ -1596,7 +1653,7 @@ def _until(args: argparse.Namespace) -> int:
 
 
 def _interrupt(args: argparse.Namespace) -> int:
-    return _call(args, "interrupt", stem="interrupt")
+    return _call(args, "interrupt", text_renderer=_render_interrupt_text, stem="interrupt")
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -1803,6 +1860,7 @@ def _memory_write(args: argparse.Namespace) -> int:
         args,
         "memory_write",
         {"address": args.address, "value": args.value},
+        text_renderer=_render_memory_write_text,
         stem="memory_write",
     )
 
@@ -2211,7 +2269,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- interrupt ---
     interrupt = subparsers.add_parser("interrupt", help="Interrupt the running inferior")
-    _common_io_options(interrupt, default_format="json")
+    _common_io_options(interrupt)
     interrupt.set_defaults(handler=_interrupt)
 
     # --- status ---

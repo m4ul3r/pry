@@ -1431,3 +1431,88 @@ def test_logs_no_session(monkeypatch, capsys):
     rc = pry.cli.main(["logs"])
     assert rc == 0
     assert "No running GDB session" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Review nice-to-haves: doctor binary, action text renderers, type offsets
+# ---------------------------------------------------------------------------
+
+def test_doctor_text_shows_binary(monkeypatch, capsys):
+    inst = _mk_instance(__import__("pathlib").Path("/tmp"), 555)
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+
+    def fake_send(instance, op, params=None, **kw):
+        return {"ok": True, "result": {
+            "plugin_version": "0.1.0", "plugin_build_id": "abc", "gdb_version": "17.2",
+            "inferiors": [{"num": 1, "pid": 777, "executable": "/tmp/target", "selected": True}],
+        }}
+
+    monkeypatch.setattr(pry.cli, "_send_request_to_instance", fake_send)
+    rc = pry.cli.main(["doctor"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "binary: /tmp/target (inferior pid 777)" in out
+
+
+def test_attach_text_rendering(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"attached": 1234, "status": "stopped",
+                                       "frame": {"function": "main", "file": "a.c", "line": 5}}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["attach", "1234", "--format", "text"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "attached to pid 1234" in out
+    assert "frame: main at a.c:5" in out
+
+
+def test_interrupt_text_default(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"interrupted": True}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["interrupt"])  # default is now text
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "interrupted"
+
+
+def test_interrupt_text_not_running(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"interrupted": False, "state": "stopped"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["interrupt"])
+    assert rc == 0
+    assert "not interrupted (inferior is stopped)" in capsys.readouterr().out
+
+
+def test_memory_write_text_rendering(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"written": 4, "address": "0x401000"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["memory", "write", "0x401000", "deadbeef", "--format", "text"])
+    assert rc == 0
+    assert "wrote 4 bytes to 0x401000" in capsys.readouterr().out
+
+
+def test_types_show_text_includes_offsets(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {
+            "name": "struct config", "sizeof": 24,
+            "decl": "type = struct config {\n    int id;\n    char tag[8];\n    long flags;\n}",
+            "fields": [
+                {"name": "id", "type": "int", "bitpos": 0},
+                {"name": "tag", "type": "char [8]", "bitpos": 32},
+                {"name": "flags", "type": "long", "bitpos": 128},
+            ],
+        }}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["types", "show", "struct config"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "offsets (sizeof=24):" in out
+    assert "+0" in out and "+4" in out and "+16" in out
+    assert "flags" in out

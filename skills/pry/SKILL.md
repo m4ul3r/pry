@@ -133,7 +133,9 @@ pry run
 
 Outputs above 10,000 `o200k_base` tokens auto-spill to disk. When that happens, **stdout carries the artifact envelope** (a JSON object with `artifact_path`, `bytes`, `tokens`, `sha256`, `summary`) and stderr gets a one-line `warning: ... spilled to <path>` note. Read `artifact_path` from the stdout envelope to retrieve the full data.
 
-4. **Parallel calls are safe.** All pry commands exit 0 — errors are reported in stderr, never via exit code. Read-only inspection commands (`backtrace`, `registers`, `locals`, `memory read`, `disasm`, `print`, etc.) can be batched in parallel freely. Avoid parallelising execution/mutation commands (`run`, `continue`, `step`, `break set`, `memory write`) as they acquire an exclusive lock and will serialise anyway.
+4. **Output/exit-code contract** (important for programmatic use): a command **always exits 0**. On success the result goes to **stdout** — in JSON mode a bare value/object (NOT wrapped in `{"ok":true}`). On failure nothing goes to stdout; the error goes to **stderr** (`--format json` makes it `{"ok": false, "error": "..."}`). So: don't gate on `$?` (always 0) and don't expect a success result to have an `ok` field — detect failure by a non-empty stderr / a missing-or-unparseable stdout result.
+
+5. **Parallel calls are safe.** Because every command exits 0 with errors on stderr, read-only inspection commands (`backtrace`, `registers`, `locals`, `memory read`, `disasm`, `print`, etc.) can be batched in parallel freely. Avoid parallelising execution/mutation commands (`run`, `continue`, `step`, `break set`, `memory write`) as they acquire an exclusive lock and will serialise anyway.
 
 ## Execution Control
 
@@ -347,7 +349,7 @@ pry gdb checksec                      # Binary security (NX, PIE, RELRO, canary)
 pry gdb vmmap                         # Virtual memory map
 ```
 
-For KASLR, rebase vmlinux with `pry load vmlinux --base <kbase>` — **not** `kbase -r`, which leaves a stale duplicate and doesn't relocate data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
+For KASLR symbol rebasing use `pry load vmlinux --base <kbase>` — see **Remote Debugging → KASLR kernels** above for the recipe and [reference/pwndbg.md](reference/pwndbg.md) for why not `kbase -r`.
 
 Prefer the first-class structured commands where they exist — `pry mappings` (over `vmmap`), `pry registers` / `pry registers write`, `pry disasm` (symbol-annotated), `pry backtrace` — and drop to `pry gdb` for everything else.
 

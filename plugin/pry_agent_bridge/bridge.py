@@ -232,6 +232,29 @@ def _elf_text_vaddr(path: str) -> int | None:
     return None
 
 
+_DISASM_LINE_RE = re.compile(
+    r"^\s*(?:=>\s*)?(0x[0-9a-fA-F]+)\s*(?:<([^>]+)>)?:\s*(.+?)\s*$"
+)
+
+
+def _parse_disassemble_output(output: str) -> list[dict[str, Any]]:
+    """Parse GDB ``disassemble`` text into the same list shape as the
+    architecture-based fast path: [{address, asm, symbol?}]. Returns [] if
+    nothing parses (caller then falls back to the raw text)."""
+    result: list[dict[str, Any]] = []
+    for raw in output.splitlines():
+        m = _DISASM_LINE_RE.match(raw)
+        if not m:
+            continue
+        entry: dict[str, Any] = {"address": m.group(1), "asm": m.group(3)}
+        sym = m.group(2)
+        if sym:
+            # Normalise "func+4" / "func + 4" -> "func+4".
+            entry["symbol"] = re.sub(r"\s*\+\s*", "+", sym.strip())
+        result.append(entry)
+    return result
+
+
 def _parse_info_functions(output: str) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     current_file: str | None = None
@@ -1989,10 +2012,14 @@ class GdbBridge:
             except Exception:
                 pass
 
-        # Fallback: GDB's disassemble command. This path ignores --count
-        # because `disassemble FUNC` emits the whole function.
+        # Fallback: GDB's disassemble command (handles range exprs like
+        # "main,+16" that don't resolve to a single address). Parse it into the
+        # same list shape as the fast path so `disasm` output is structurally
+        # stable for JSON consumers regardless of location form.
         cmd = f"disassemble {location}" if location else "disassemble"
-        return gdb.execute(cmd, to_string=True)
+        output = gdb.execute(cmd, to_string=True)
+        parsed = _parse_disassemble_output(output)
+        return parsed if parsed else output
 
     def _functions(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         query = params.get("query")
