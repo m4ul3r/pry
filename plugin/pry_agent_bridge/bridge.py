@@ -547,6 +547,10 @@ class GdbBridge:
             value = self._safe_eval_str(expression)
             if value is not None:
                 self._watchpoint_values[bp.number] = value
+            else:
+                # Transiently unevaluable: drop any stale snapshot so the next
+                # hit reports no old_value rather than one from an earlier resume.
+                self._watchpoint_values.pop(bp.number, None)
 
     def _bp_reason(self, bp) -> dict[str, Any]:
         """Build a stop-reason dict for a breakpoint/watchpoint."""
@@ -734,7 +738,9 @@ class GdbBridge:
                 "(`pry functions --query NAME`), a global (`pry symbols "
                 "--query NAME`), or live in another frame (`pry frame select N`)"
             )
-        elif "no stack" in low:
+        elif "no stack" in low or "no registers" in low:
+            # GDB 17.2 raises "No registers." (not "No stack.") from
+            # gdb.newest_frame() when nothing is running.
             hint = "the inferior is not running — use `pry run` or `pry continue`"
         elif "cannot access memory" in low:
             hint = "address not mapped — check `pry mappings` for valid ranges"
@@ -1739,6 +1745,25 @@ class GdbBridge:
     def _register_write(self, params: dict[str, Any]) -> dict[str, Any]:
         name = str(params["name"]).lstrip("$")
         value = params["value"]
+        # `set $name = ...` for an unknown name silently creates a GDB
+        # convenience variable and writes no real register. Validate against
+        # the live frame's register set so we don't report a misleading
+        # success. read_register accepts aliases (pc/sp/fp) and sub-registers
+        # (eax) and raises for unknown names.
+        try:
+            frame = gdb.selected_frame()
+        except gdb.error:
+            raise ValueError(
+                f"cannot write ${name}: the inferior is not running — "
+                "use `pry run` or `pry continue` first"
+            )
+        try:
+            frame.read_register(name)
+        except (ValueError, gdb.error):
+            raise ValueError(
+                f"unknown register {name!r} — run `pry registers` "
+                "(or `pry registers --all`) to see valid names"
+            )
         gdb.execute(f"set ${name} = {value}", to_string=True)
         readback = self._safe_eval_str(f"${name}")
         result: dict[str, Any] = {"register": name, "value": str(value)}

@@ -104,6 +104,16 @@ def _load_bridge(monkeypatch):
         def read_var(self, sym):
             return sym._value
 
+        def read_register(self, name):
+            # Mirror real GDB: accept register names/aliases, raise for unknown.
+            valid = {
+                "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                "rip", "r15", "eax", "pc", "sp", "fp",
+            }
+            if name not in valid:
+                raise ValueError(f"Invalid register `{name}'")
+            return 0
+
         def architecture(self):
             return _FakeArchitecture()
 
@@ -1099,11 +1109,14 @@ def test_disasm_annotates_symbol(monkeypatch):
     assert insns[0]["symbol"] == "main+4"
 
 
-def test_backtrace_no_stack_is_actionable(monkeypatch):
+@pytest.mark.parametrize("gdb_msg", ["No registers.", "No stack."])
+def test_backtrace_no_inferior_is_actionable(monkeypatch, gdb_msg):
+    # GDB 17.2 raises "No registers." (not "No stack.") from newest_frame()
+    # when nothing is running; both must surface the actionable hint.
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
 
     def _boom():
-        raise fake_gdb.error("No stack.")
+        raise fake_gdb.error(gdb_msg)
 
     fake_gdb.newest_frame = _boom
     bridge = bridge_mod.GdbBridge()
@@ -1111,6 +1124,53 @@ def test_backtrace_no_stack_is_actionable(monkeypatch):
     resp = bridge.dispatch({"op": "backtrace", "params": {}})
     assert resp["ok"] is False
     assert "not running" in resp["error"]
+
+
+def test_register_write_rejects_unknown_register(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch(
+        {"op": "register_write", "params": {"name": "bogus_reg", "value": "0x1"}}
+    )
+    assert resp["ok"] is False
+    assert "unknown register" in resp["error"]
+    # Must not have silently created a convenience variable.
+    assert not any("set $bogus_reg" in c for c in fake_gdb._execute_log)
+
+
+def test_register_write_requires_live_inferior(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _no_frame():
+        raise fake_gdb.error("No frame selected.")
+
+    fake_gdb.selected_frame = _no_frame
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch(
+        {"op": "register_write", "params": {"name": "rax", "value": "0x1"}}
+    )
+    assert resp["ok"] is False
+    assert "not running" in resp["error"]
+
+
+def test_snapshot_drops_unevaluable_watchpoint(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    bp = bridge._dispatch_op("watch_set", {"expression": "counter"})  # seeds value
+    bp_obj = fake_gdb.breakpoints()[0]
+    bp_obj.type = fake_gdb.BP_HARDWARE_WATCHPOINT
+    assert bridge._watchpoint_values.get(bp["number"]) is not None
+
+    def _boom(expr):
+        raise fake_gdb.error("value optimized out")
+
+    fake_gdb.parse_and_eval = _boom
+    bridge._snapshot_watchpoints()
+    # Stale snapshot dropped, so the next hit won't diff against a stale value.
+    assert bp["number"] not in bridge._watchpoint_values
 
 
 def test_dispatch_augments_no_symbol_error(monkeypatch):
