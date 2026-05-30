@@ -1140,3 +1140,402 @@ def test_trace_text_truncated_warning(monkeypatch, capsys):
     assert rc == 0
     output = capsys.readouterr().out
     assert "hit limit reached" in output
+
+
+# ---------------------------------------------------------------------------
+# Agent-usability improvements
+# ---------------------------------------------------------------------------
+
+def test_spill_writes_envelope_to_stdout(monkeypatch, capsys):
+    from pry.output import OutputWriteResult
+
+    artifact = {
+        "artifact_path": "/tmp/pry/x.json",
+        "format": "json",
+        "bytes": 99999,
+        "tokens": 12345,
+        "tokenizer": "o200k_base",
+        "sha256": "abc",
+        "summary": {"kind": "array", "count": 500},
+    }
+    envelope = '{"artifact_path": "/tmp/pry/x.json"}\n'
+
+    monkeypatch.setattr(
+        pry.cli,
+        "write_output_result",
+        lambda *a, **k: OutputWriteResult(rendered=envelope, artifact=artifact, spilled=True),
+    )
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"value": "42"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["print", "x"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    # The artifact envelope is the result and must land on stdout.
+    assert envelope in captured.out
+    # A concise note goes to stderr.
+    assert "spilled to /tmp/pry/x.json" in captured.err
+    assert "12345 tokens" in captured.err
+
+
+def test_continue_renders_watchpoint_old_new(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {
+                "status": "stopped",
+                "reason": {
+                    "kind": "watchpoint-hit", "number": 2, "expression": "counter",
+                    "old_value": "0x3", "new_value": "0x4",
+                },
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["continue"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "watchpoint #2 (counter) hit: 0x3 -> 0x4" in output
+
+
+def test_backtrace_renders_unresolved_frame_as_qq(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": [
+                {"level": 0, "function": "vuln", "address": "0x401147"},
+                {"level": 1, "function": None, "address": "0x4141414141414141"},
+            ],
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["backtrace"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "#1 0x4141414141414141 in ??" in output
+    assert "None" not in output
+
+
+def test_watch_delete_renders_watchpoint_noun(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"deleted": 2, "kind": "hw-watchpoint"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["watch", "delete", "2"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "watchpoint #2 deleted" in output
+
+
+def test_gdb_exec_json_strips_ansi(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"output": "\x1b[33mPartial RELRO\x1b[0m\n"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["gdb", "--format", "json", "checksec"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["output"] == "Partial RELRO\n"
+    assert "\x1b" not in out
+
+
+def test_register_write_sends_op_and_renders(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"register": "rip", "value": "0x401234", "readback": "0x401234"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["registers", "write", "rip", "0x401234", "--format", "text"])
+    assert rc == 0
+    assert captured["op"] == "register_write"
+    assert captured["params"] == {"name": "rip", "value": "0x401234"}
+    output = capsys.readouterr().out
+    assert "$rip = 0x401234" in output
+
+
+def test_mappings_sends_op_and_renders(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": [
+                {"start": "0x555555554000", "end": "0x555555555000", "perms": "r-xp",
+                 "offset": "0x0", "objfile": "/usr/bin/app", "size": 4096},
+            ],
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["mappings", "--name", "app"])
+    assert rc == 0
+    assert captured["op"] == "mappings"
+    assert captured["params"] == {"name": "app"}
+    output = capsys.readouterr().out
+    assert "/usr/bin/app" in output
+    assert "r-xp" in output
+
+
+def test_disasm_renders_symbol_annotation(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": [{"address": "0x401147", "asm": "ret", "symbol": "vuln+33"}]}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["disasm", "vuln"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "0x401147 <vuln+33>:  ret" in output
+
+
+def test_args_empty_renders_no_args(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["args"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "no args" in output
+
+
+def test_print_renders_stale_note(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {
+                "value": "0x0", "type": "int", "live": False,
+                "note": "no live inferior — value read from the static binary image, not live memory",
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["print", "counter"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "(int) 0x0" in output
+    assert "note: no live inferior" in output
+
+
+def test_load_base_sends_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"loaded": params["path"], "base": "0xffffffff84400000", "slide": "0x3400000"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["load", "/x/vmlinux", "--base", "0xffffffff84400000", "--format", "text"])
+    assert rc == 0
+    assert captured["op"] == "load"
+    assert captured["params"]["base"] == "0xffffffff84400000"
+    out = capsys.readouterr().out
+    assert "loaded /x/vmlinux @ 0xffffffff84400000 (slide 0x3400000)" in out
+
+
+def test_load_slide_sends_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"loaded": params["path"], "slide": params.get("slide")}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["load", "/x/vmlinux", "--slide", "0x7000000", "--format", "text"])
+    assert rc == 0
+    assert captured["params"]["slide"] == "0x7000000"
+    out = capsys.readouterr().out
+    assert "loaded /x/vmlinux (slide 0x7000000)" in out
+
+
+# ---------------------------------------------------------------------------
+# Agent-ease review fixes: kill --all, logs
+# ---------------------------------------------------------------------------
+
+def _mk_instance(tmp_path, pid):
+    from pry.transport import BridgeInstance
+    return BridgeInstance(
+        pid=pid, socket_path=tmp_path / f"{pid}.sock", registry_path=tmp_path / f"{pid}.json",
+        plugin_name="pry_agent_bridge", plugin_version="0.1.0", started_at=None, meta={},
+    )
+
+
+def test_kill_all(monkeypatch, capsys, tmp_path):
+    instances = [_mk_instance(tmp_path, 111), _mk_instance(tmp_path, 222)]
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: instances)
+    monkeypatch.setattr(pry.cli.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+
+    rc = pry.cli.main(["kill", "--all"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "111" in out and "222" in out
+
+
+def test_kill_all_none_running(monkeypatch, capsys):
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    rc = pry.cli.main(["kill", "--all"])
+    assert rc == 0
+    assert "No running GDB sessions" in capsys.readouterr().out
+
+
+def test_logs_reads_instance_log(monkeypatch, capsys, tmp_path):
+    inst = _mk_instance(tmp_path, 4242)
+    logf = tmp_path / "4242.log"
+    logf.write_text("starting\nWIN reached\ndone\n")
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(pry.cli, "gdb_log_path", lambda pid=None: logf)
+
+    rc = pry.cli.main(["logs"])
+    assert rc == 0
+    assert "WIN reached" in capsys.readouterr().out
+
+
+def test_logs_tail_lines(monkeypatch, capsys, tmp_path):
+    inst = _mk_instance(tmp_path, 4242)
+    logf = tmp_path / "4242.log"
+    logf.write_text("a\nb\nc\nd\n")
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(pry.cli, "gdb_log_path", lambda pid=None: logf)
+
+    rc = pry.cli.main(["logs", "-n", "2"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "c\nd" in out and "a\n" not in out
+
+
+def test_logs_json_envelope(monkeypatch, capsys, tmp_path):
+    inst = _mk_instance(tmp_path, 4242)
+    logf = tmp_path / "4242.log"
+    logf.write_text("hello\n")
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(pry.cli, "gdb_log_path", lambda pid=None: logf)
+
+    rc = pry.cli.main(["logs", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pid"] == 4242
+    assert payload["content"] == "hello\n"
+
+
+def test_logs_no_session(monkeypatch, capsys):
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    rc = pry.cli.main(["logs"])
+    assert rc == 0
+    assert "No running GDB session" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Review nice-to-haves: doctor binary, action text renderers, type offsets
+# ---------------------------------------------------------------------------
+
+def test_doctor_text_shows_binary(monkeypatch, capsys):
+    inst = _mk_instance(__import__("pathlib").Path("/tmp"), 555)
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [inst])
+
+    def fake_send(instance, op, params=None, **kw):
+        return {"ok": True, "result": {
+            "plugin_version": "0.1.0", "plugin_build_id": "abc", "gdb_version": "17.2",
+            "inferiors": [{"num": 1, "pid": 777, "executable": "/tmp/target", "selected": True}],
+        }}
+
+    monkeypatch.setattr(pry.cli, "_send_request_to_instance", fake_send)
+    rc = pry.cli.main(["doctor"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "binary: /tmp/target (inferior pid 777)" in out
+
+
+def test_attach_text_rendering(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"attached": 1234, "status": "stopped",
+                                       "frame": {"function": "main", "file": "a.c", "line": 5}}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["attach", "1234", "--format", "text"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "attached to pid 1234" in out
+    assert "frame: main at a.c:5" in out
+
+
+def test_interrupt_text_default(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"interrupted": True}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["interrupt"])  # default is now text
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "interrupted"
+
+
+def test_interrupt_text_not_running(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"interrupted": False, "state": "stopped"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["interrupt"])
+    assert rc == 0
+    assert "not interrupted (inferior is stopped)" in capsys.readouterr().out
+
+
+def test_memory_write_text_rendering(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"written": 4, "address": "0x401000"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["memory", "write", "0x401000", "deadbeef", "--format", "text"])
+    assert rc == 0
+    assert "wrote 4 bytes to 0x401000" in capsys.readouterr().out
+
+
+def test_types_show_text_includes_offsets(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {
+            "name": "struct config", "sizeof": 24,
+            "decl": "type = struct config {\n    int id;\n    char tag[8];\n    long flags;\n}",
+            "fields": [
+                {"name": "id", "type": "int", "bitpos": 0},
+                {"name": "tag", "type": "char [8]", "bitpos": 32},
+                {"name": "flags", "type": "long", "bitpos": 128},
+            ],
+        }}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["types", "show", "struct config"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "offsets (sizeof=24):" in out
+    assert "+0" in out and "+4" in out and "+16" in out
+    assert "flags" in out
+
+
+# ---------------------------------------------------------------------------
+# Edge-case hardening (adversarial hunt fixes)
+# ---------------------------------------------------------------------------
+
+def test_out_to_bad_path_exits_zero_with_error(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    rc = pry.cli.main(["doctor", "--out", str(tmp_path)])  # tmp_path is a directory
+    assert rc == 0  # always-exit-0 contract holds
+    err = capsys.readouterr().err
+    assert "cannot write output" in err
+
+
+def test_mappings_filter_no_match_message(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["mappings", "--name", "libxyz"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no mappings match --name libxyz" in out

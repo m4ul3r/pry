@@ -156,8 +156,14 @@ def _common_io_options(
 
 
 def _add_paged_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument(
+        "--offset", type=int, default=0,
+        help="Skip this many results (for paging; default: 0)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=100,
+        help="Max results to return; on truncation a stderr note shows the next --offset (default: 100)",
+    )
 
 
 def _render_result(
@@ -169,39 +175,36 @@ def _render_result(
     spill_label: str | None = None,
     spill_context: Any = None,
 ) -> None:
-    result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
+    try:
+        result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
+    except OSError as exc:
+        # A bad --out (or unwritable spill dir) must surface as the standard
+        # exit-0 error envelope, not a raw traceback with exit 1.
+        raise BridgeError(f"cannot write output to {out_path or '<spill dir>'}: {exc}")
     if result.spilled and result.artifact:
         label = spill_label or stem.replace("_", " ")
         artifact = result.artifact
-        lines = [
-            f"warning: {label} output spilled",
-            f"path: {artifact['artifact_path']}",
-            f"format: {artifact['format']}",
-            f"bytes: {artifact['bytes']}",
-            f"tokens: {artifact['tokens']}",
-            f"tokenizer: {artifact['tokenizer']}",
-        ]
-        if isinstance(artifact.get("sha256"), str):
-            lines.append(f"sha256: {artifact['sha256']}")
+        # The artifact envelope (path/tokens/summary/...) is the real result
+        # once output spills, so it must go to STDOUT — agents that read
+        # stdout as the result would otherwise see nothing and conclude the
+        # command produced no data. A concise note also goes to stderr for
+        # humans.
         summary = artifact.get("summary")
+        summary_note = ""
         if isinstance(summary, dict):
-            summary_parts = []
             kind = summary.get("kind")
+            count = summary.get("count")
             if kind is not None:
-                summary_parts.append(f"kind={kind}")
-            for key in sorted(summary):
-                if key == "kind":
-                    continue
-                summary_parts.append(
-                    f"{key}={json.dumps(summary[key], sort_keys=True, default=str)}"
-                )
-            if summary_parts:
-                lines.append(f"summary: {', '.join(summary_parts)}")
-        if isinstance(spill_context, list):
-            lines.append(f"items: {len(spill_context)}")
-        if isinstance(value, str):
-            lines.append(f"lines: {len(value.splitlines())}")
-        print("\n".join(lines), file=sys.stderr)
+                summary_note = f", {kind}"
+                if count is not None:
+                    summary_note += f" of {count}"
+        print(
+            f"warning: {label} output spilled to {artifact['artifact_path']} "
+            f"({artifact['tokens']} tokens{summary_note}); "
+            f"full envelope on stdout",
+            file=sys.stderr,
+        )
+        sys.stdout.write(result.rendered)
         return
     sys.stdout.write(result.rendered)
 
@@ -218,6 +221,7 @@ def _call(
     params: dict[str, Any] | None = None,
     *,
     text_renderer: Callable[[Any], str] | None = None,
+    map_result: Callable[[Any], Any] | None = None,
     page_limit: int | None = None,
     page_offset: int = 0,
     page_label: str | None = None,
@@ -243,6 +247,11 @@ def _call(
         **kw,
     )
     result = response["result"]
+    # Normalise the raw result for ALL output formats (e.g. strip ANSI from
+    # gdb passthrough) before exit-code/pagination/render decisions, so JSON
+    # consumers get the same clean payload that text mode does.
+    if map_result is not None:
+        result = map_result(result)
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
     if effective_page_limit is not None and isinstance(result, list) and len(result) > effective_page_limit:
         result = result[:effective_page_limit]
@@ -312,6 +321,15 @@ def _render_doctor_text(value: Any) -> str:
         gdb_version = doctor.get("gdb_version")
         if gdb_version:
             lines.append(f"  gdb: {gdb_version}")
+        # Show the loaded binary so concurrent sessions are distinguishable
+        # after the launch pid scrolls away.
+        inferiors = doctor.get("inferiors") if isinstance(doctor.get("inferiors"), list) else []
+        for inf in inferiors:
+            if isinstance(inf, dict) and inf.get("executable"):
+                ipid = inf.get("pid") or 0
+                suffix = f" (inferior pid {ipid})" if ipid else ""
+                lines.append(f"  binary: {inf['executable']}{suffix}")
+                break
         error = doctor.get("error")
         if error:
             lines.append(f"  error: {error}")
@@ -329,9 +347,14 @@ def _format_stop_reason(reason: Any) -> str | None:
     if kind == "watchpoint-hit":
         num = reason.get("number", "?")
         expr = reason.get("expression")
-        if expr:
-            return f"watchpoint #{num} ({expr}) hit"
-        return f"watchpoint #{num} hit"
+        base = f"watchpoint #{num} ({expr}) hit" if expr else f"watchpoint #{num} hit"
+        old = reason.get("old_value")
+        new = reason.get("new_value")
+        if new is not None and old is not None:
+            base += f": {old} -> {new}"
+        elif new is not None:
+            base += f": value = {new}"
+        return base
     if kind == "signal":
         sig = reason.get("signal", "unknown")
         return f"signal {sig}"
@@ -439,6 +462,37 @@ def _render_disconnect_text(value: Any) -> str:
     return "disconnected"
 
 
+def _render_attach_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    parts = [f"attached to pid {value.get('attached', '?')}"]
+    frame = value.get("frame") or {}
+    func = frame.get("function")
+    if func:
+        loc = func
+        f = frame.get("file")
+        line = frame.get("line")
+        if f:
+            loc += f" at {f}" + (f":{line}" if line is not None else "")
+        parts.append(f"frame: {loc}")
+    return "\n".join(parts)
+
+
+def _render_interrupt_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if value.get("interrupted"):
+        return "interrupted"
+    state = value.get("state")
+    return f"not interrupted (inferior is {state})" if state else "not interrupted (inferior was not running)"
+
+
+def _render_memory_write_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"wrote {value.get('written', '?')} bytes to {value.get('address', '?')}"
+
+
 def _render_target_info_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -540,7 +594,9 @@ def _render_breakpoint_delete_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     num = value.get("deleted", "?")
-    return f"breakpoint #{num} deleted"
+    # break/watch share a number space; name the deleted object correctly.
+    noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
+    return f"{noun} #{num} deleted"
 
 
 def _render_breakpoint_state_text(value: Any) -> str:
@@ -574,7 +630,9 @@ def _render_backtrace_text(value: Any) -> str:
             lines.append(str(frame))
             continue
         level = frame.get("level", "?")
-        func = frame.get("function", "<unknown>")
+        # An unresolved frame carries function=None (e.g. a smashed return
+        # address); render GDB's "??" rather than the literal "None".
+        func = frame.get("function") or "??"
         addr = frame.get("address", "")
         entry = f"#{level} {addr} in {func}"
         f = frame.get("file")
@@ -596,7 +654,7 @@ def _render_frame_info_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     level = value.get("level", "?")
-    func = value.get("function", "<unknown>")
+    func = value.get("function") or "??"
     addr = value.get("address", "")
     entry = f"#{level} {addr} in {func}"
     f = value.get("file")
@@ -625,6 +683,43 @@ def _render_locals_text(value: Any) -> str:
             lines.append(f"{typ} {name} = {val}")
         else:
             lines.append(f"{name} = {val}")
+    return "\n".join(lines)
+
+
+def _render_args_text(value: Any) -> str:
+    # Same formatting as locals, but the empty case is "no args" (a frame with
+    # no parameters), not "no locals".
+    if isinstance(value, list) and not value:
+        return "no args"
+    return _render_locals_text(value)
+
+
+def _render_register_write_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    name = value.get("register", "?")
+    readback = value.get("readback")
+    if readback is not None:
+        return f"${name} = {readback}"
+    return f"${name} set to {value.get('value', '?')}"
+
+
+def _render_mappings_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "no mappings (inferior not running, or target has no proc maps)"
+    lines = []
+    for m in value:
+        if not isinstance(m, dict):
+            lines.append(str(m))
+            continue
+        start = m.get("start", "?")
+        end = m.get("end", "?")
+        perms = m.get("perms", "----")
+        offset = m.get("offset", "")
+        objfile = m.get("objfile", "")
+        lines.append(f"{start}-{end}  {perms:<5} {offset:>12}  {objfile}".rstrip())
     return "\n".join(lines)
 
 
@@ -697,7 +792,11 @@ def _render_disasm_text(value: Any) -> str:
             continue
         addr = insn.get("address", "")
         asm_text = insn.get("asm", "")
-        lines.append(f"{addr}:  {asm_text}")
+        symbol = insn.get("symbol")
+        if symbol:
+            lines.append(f"{addr} <{symbol}>:  {asm_text}")
+        else:
+            lines.append(f"{addr}:  {asm_text}")
     return "\n".join(lines)
 
 
@@ -705,7 +804,7 @@ def _render_name_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return "no matches"
     # Align the name column when addresses are present so the eye can scan
     # down. Trailing columns (file:line, signature/decl) fall where they may.
     rows: list[tuple[str, str, str]] = []
@@ -747,12 +846,28 @@ def _render_type_info_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     layout = value.get("layout")
-    if isinstance(layout, str) and layout:
-        return layout
-    decl = value.get("decl")
-    if isinstance(decl, str) and decl:
-        return decl
-    return _render_fallback_text(value)
+    base = layout if (isinstance(layout, str) and layout) else value.get("decl")
+    if not (isinstance(base, str) and base):
+        return _render_fallback_text(value)
+    # ptype/decl omits byte offsets; append them from the field metadata the
+    # bridge already computes, so an agent doesn't have to switch to JSON or
+    # compute offsetof() by hand.
+    fields = value.get("fields")
+    rows = []
+    if isinstance(fields, list):
+        for f in fields:
+            if not isinstance(f, dict) or f.get("name") is None:
+                continue
+            bitpos = f.get("bitpos")
+            if not isinstance(bitpos, int):
+                continue
+            typ = f.get("type") or ""
+            rows.append(f"  +{bitpos // 8:<5} {typ} {f['name']}".rstrip())
+    if rows:
+        sizeof = value.get("sizeof")
+        header = f"offsets (sizeof={sizeof}):" if sizeof is not None else "offsets:"
+        return base.rstrip() + "\n\n" + header + "\n" + "\n".join(rows)
+    return base
 
 
 def _render_source_text(value: Any) -> str:
@@ -768,9 +883,11 @@ def _render_print_text(value: Any) -> str:
         return _render_fallback_text(value)
     val = value.get("value", "<unknown>")
     typ = value.get("type")
-    if typ:
-        return f"({typ}) {val}"
-    return str(val)
+    base = f"({typ}) {val}" if typ else str(val)
+    note = value.get("note")
+    if note:
+        base += f"\nnote: {note}"
+    return base
 
 
 def _render_inferior_list_text(value: Any) -> str:
@@ -1232,6 +1349,21 @@ def _launch(args: argparse.Namespace) -> int:
 
 
 def _kill(args: argparse.Namespace) -> int:
+    if getattr(args, "all", False):
+        killed = []
+        for inst in list_instances():
+            _kill_instance(inst.pid)
+            killed.append(inst.pid)
+        if args.format == "text":
+            msg = (
+                f"Killed {len(killed)} GDB session(s): {', '.join(map(str, killed))}"
+                if killed else "No running GDB sessions to kill."
+            )
+            _render_result(msg, fmt="text", out_path=args.out, stem="kill")
+        else:
+            _render_result({"killed": True, "pids": killed}, fmt=args.format, out_path=args.out, stem="kill")
+        return 0
+
     target_pid: int | None = getattr(args, "instance", None)
 
     if target_pid is None:
@@ -1253,6 +1385,47 @@ def _kill(args: argparse.Namespace) -> int:
         _render_result(f"Killed GDB (pid={target_pid})", fmt="text", out_path=args.out, stem="kill")
     else:
         _render_result(result, fmt=args.format, out_path=args.out, stem="kill")
+    return 0
+
+
+def _logs(args: argparse.Namespace) -> int:
+    """Show a session's captured inferior stdout/stderr (and GDB's own output).
+
+    The inferior's output is written to ~/.cache/pry/instances/<pid>.log; this
+    is the only place an agent can see what the debugged program printed.
+    """
+    target_pid: int | None = getattr(args, "instance", None)
+    if target_pid is None:
+        instances = list_instances()
+        if not instances:
+            raise BridgeError("No running GDB session found. Launch one with 'pry launch <binary>'.")
+        if len(instances) > 1:
+            pids = ", ".join(str(i.pid) for i in instances)
+            raise BridgeError(
+                f"Multiple bridge instances running (pids: {pids}). Use --instance <pid>."
+            )
+        target_pid = instances[0].pid
+
+    log_path = gdb_log_path(target_pid)
+    if not log_path.exists():
+        raise BridgeError(f"No log found for instance {target_pid} (expected {log_path}).")
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise BridgeError(f"Could not read log {log_path}: {exc}")
+
+    lines = getattr(args, "lines", None)
+    if lines is not None and lines > 0:
+        tail = text.splitlines()[-lines:]
+        text = ("\n".join(tail) + "\n") if tail else ""
+
+    if args.format == "text":
+        _render_result(text, fmt="text", out_path=args.out, stem="logs")
+    else:
+        _render_result(
+            {"pid": target_pid, "log_path": str(log_path), "content": text},
+            fmt=args.format, out_path=args.out, stem="logs",
+        )
     return 0
 
 
@@ -1293,11 +1466,32 @@ def _kill_instance(pid: int) -> None:
 
 # --- Session management ---
 
+def _render_load_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    path = value.get("loaded", "<unknown>")
+    base = value.get("base")
+    slide = value.get("slide")
+    if base:
+        return f"loaded {path} @ {base} (slide {slide})"
+    if slide:
+        return f"loaded {path} (slide {slide})"
+    return f"loaded {path}"
+
+
 def _load(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"path": str(Path(args.path).expanduser().resolve())}
+    base = getattr(args, "base", None)
+    slide = getattr(args, "slide", None)
+    if base:
+        params["base"] = base
+    if slide:
+        params["slide"] = slide
     return _call(
         args,
         "load",
-        {"path": str(Path(args.path).expanduser().resolve())},
+        params,
+        text_renderer=_render_load_text,
         stem="load",
     )
 
@@ -1307,6 +1501,7 @@ def _attach(args: argparse.Namespace) -> int:
         args,
         "attach",
         {"pid": args.pid},
+        text_renderer=_render_attach_text,
         stem="attach",
     )
 
@@ -1470,7 +1665,7 @@ def _until(args: argparse.Namespace) -> int:
 
 
 def _interrupt(args: argparse.Namespace) -> int:
-    return _call(args, "interrupt", stem="interrupt")
+    return _call(args, "interrupt", text_renderer=_render_interrupt_text, stem="interrupt")
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -1588,7 +1783,7 @@ def _args(args: argparse.Namespace) -> int:
     return _call(
         args,
         "args",
-        text_renderer=_render_locals_text,
+        text_renderer=_render_args_text,
         stem="args",
     )
 
@@ -1613,6 +1808,43 @@ def _registers(args: argparse.Namespace) -> int:
         params,
         text_renderer=_render_registers_text,
         stem="registers",
+    )
+
+
+def _register_write(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "register_write",
+        {"name": args.name, "value": args.value},
+        text_renderer=_render_register_write_text,
+        stem="register_write",
+    )
+
+
+def _mappings(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    contains = getattr(args, "contains", None)
+    name = getattr(args, "name", None)
+    if contains:
+        params["contains"] = contains
+    if name:
+        params["name"] = name
+    has_filter = bool(contains or name)
+
+    def render(value: Any) -> str:
+        # Distinguish "filter matched nothing" from "no mappings at all" so the
+        # empty case doesn't always (falsely) claim the inferior isn't running.
+        if isinstance(value, list) and not value and has_filter:
+            filt = f"--contains {contains}" if contains else f"--name {name}"
+            return f"no mappings match {filt}"
+        return _render_mappings_text(value)
+
+    return _call(
+        args,
+        "mappings",
+        params or None,
+        text_renderer=render,
+        stem="mappings",
     )
 
 
@@ -1652,6 +1884,7 @@ def _memory_write(args: argparse.Namespace) -> int:
         args,
         "memory_write",
         {"address": args.address, "value": args.value},
+        text_renderer=_render_memory_write_text,
         stem="memory_write",
     )
 
@@ -1755,6 +1988,23 @@ def _source_list(args: argparse.Namespace) -> int:
 
 # --- Raw GDB command passthrough ---
 
+def _strip_gdb_exec_ansi(result: Any) -> Any:
+    """Strip ANSI escapes from gdb passthrough output for non-TTY consumers.
+
+    pwndbg emits color even over a pipe. The text renderer already strips for
+    non-TTY stdout, but the JSON/ndjson paths bypass it — so do it on the raw
+    result here, leaving color intact only for an interactive terminal.
+    """
+    if (
+        isinstance(result, dict)
+        and isinstance(result.get("output"), str)
+        and not sys.stdout.isatty()
+    ):
+        result = dict(result)
+        result["output"] = _ANSI_ESCAPE_RE.sub("", result["output"])
+    return result
+
+
 def _gdb_exec(args: argparse.Namespace) -> int:
     command = args.command
     timeout = getattr(args, "timeout", None)
@@ -1766,6 +2016,7 @@ def _gdb_exec(args: argparse.Namespace) -> int:
         "gdb_exec",
         params,
         text_renderer=_render_gdb_exec_text,
+        map_result=_strip_gdb_exec_ansi,
         stem="gdb_exec",
         timeout=timeout,
     )
@@ -1926,12 +2177,31 @@ def build_parser() -> argparse.ArgumentParser:
     # --- kill ---
     kill = subparsers.add_parser("kill", help="Kill a running GDB bridge session")
     _common_io_options(kill)
+    kill.add_argument("--all", action="store_true", help="Kill all running GDB bridge sessions")
     kill.set_defaults(handler=_kill)
+
+    # --- logs ---
+    logs = subparsers.add_parser("logs", help="Show a session's captured inferior stdout/stderr (and GDB output)")
+    _common_io_options(logs)
+    logs.add_argument("-n", "--lines", type=int, default=None, metavar="N", help="Show only the last N lines")
+    logs.set_defaults(handler=_logs)
 
     # --- load ---
     load = subparsers.add_parser("load", help="Load a binary into GDB")
     _common_io_options(load, default_format="json")
     load.add_argument("path", help="Path to binary")
+    load.add_argument(
+        "--base", metavar="ADDR",
+        help="Load symbols so .text lands at this runtime base, as the sole copy, "
+             "offsetting ALL sections uniformly (text+data). For relocated/PIE/KASLR "
+             "modules; avoids the duplicate-symbol and data-not-relocated traps of "
+             '`kbase -r`. Get a kernel base from `pry gdb "kbase"`.',
+    )
+    load.add_argument(
+        "--slide", metavar="OFFSET",
+        help="Offset added to every section (alternative to --base when the file's "
+             ".text address can't be read).",
+    )
     load.set_defaults(handler=_load)
 
     # --- attach ---
@@ -2023,7 +2293,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- interrupt ---
     interrupt = subparsers.add_parser("interrupt", help="Interrupt the running inferior")
-    _common_io_options(interrupt, default_format="json")
+    _common_io_options(interrupt)
     interrupt.set_defaults(handler=_interrupt)
 
     # --- status ---
@@ -2134,10 +2404,16 @@ def build_parser() -> argparse.ArgumentParser:
     print_cmd.set_defaults(handler=_print_expr)
 
     # --- registers ---
-    regs = subparsers.add_parser("registers", help="Show register values")
+    regs = subparsers.add_parser("registers", help="Show or write register values")
     _common_io_options(regs)
     regs.add_argument("--all", action="store_true", help="Show all registers including floating-point")
     regs.set_defaults(handler=_registers)
+    regs_sub = regs.add_subparsers(dest="registers_command")
+    regs_write = regs_sub.add_parser("write", help="Write a register value (e.g. registers write rip 0x401234)")
+    _common_io_options(regs_write, default_format="json")
+    regs_write.add_argument("name", help="Register name (rip, rax, pc, ...; leading $ optional)")
+    regs_write.add_argument("value", help="Value to set (hex, decimal, or a GDB expression)")
+    regs_write.set_defaults(handler=_register_write)
 
     # --- memory ---
     mem = subparsers.add_parser("memory", help="Memory read/write")
@@ -2159,6 +2435,13 @@ def build_parser() -> argparse.ArgumentParser:
     mem_write.add_argument("value", help="Value to write (hex string)")
     mem_write.set_defaults(handler=_memory_write)
 
+    # --- mappings ---
+    mappings = subparsers.add_parser("mappings", help="List process memory mappings (structured vmmap)")
+    _common_io_options(mappings)
+    mappings.add_argument("--contains", metavar="ADDR", help="Only the mapping containing this address (hex or expression)")
+    mappings.add_argument("--name", help="Filter mappings whose objfile contains this substring")
+    mappings.set_defaults(handler=_mappings)
+
     # --- disasm ---
     disasm = subparsers.add_parser("disasm", help="Disassemble instructions")
     _common_io_options(disasm)
@@ -2170,14 +2453,14 @@ def build_parser() -> argparse.ArgumentParser:
     funcs = subparsers.add_parser("functions", help="List or search functions")
     _common_io_options(funcs)
     _add_paged_args(funcs)
-    funcs.add_argument("--query", help="Search pattern")
+    funcs.add_argument("--query", help="Search pattern (matches function names/signatures)")
     funcs.set_defaults(handler=_functions)
 
     # --- symbols ---
     syms = subparsers.add_parser("symbols", help="List or search symbols")
     _common_io_options(syms)
     _add_paged_args(syms)
-    syms.add_argument("--query", help="Search pattern")
+    syms.add_argument("--query", help="Search pattern (data/variable symbols only — use `functions --query` for functions)")
     syms.set_defaults(handler=_symbols)
 
     # --- types ---

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import struct
 import sys
 import types
 from pathlib import Path
@@ -103,6 +104,16 @@ def _load_bridge(monkeypatch):
 
         def read_var(self, sym):
             return sym._value
+
+        def read_register(self, name):
+            # Mirror real GDB: accept register names/aliases, raise for unknown.
+            valid = {
+                "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                "rip", "r15", "eax", "pc", "sp", "fp",
+            }
+            if name not in valid:
+                raise ValueError(f"Invalid register `{name}'")
+            return 0
 
         def architecture(self):
             return _FakeArchitecture()
@@ -1007,3 +1018,428 @@ def test_break_set_rebase_module_not_found(monkeypatch):
             "location": "*0x1234",
             "rebase_module": "nonexistent",
         })
+
+
+# ---------------------------------------------------------------------------
+# Agent-usability improvements
+# ---------------------------------------------------------------------------
+
+def test_watchpoint_reason_reports_old_and_new_values(monkeypatch):
+    """A watchpoint-hit reason carries old -> new values (re-evaluated)."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    seq = ["0x3", "0x4"]  # set-time seed, then the value at the hit
+    state = {"i": 0}
+
+    class _V:
+        def __init__(self, s):
+            self.s = s
+            self.type = "int"
+
+        def __str__(self):
+            return self.s
+
+        def __int__(self):
+            return int(self.s, 16)
+
+    def _eval(expr):
+        s = seq[min(state["i"], len(seq) - 1)]
+        state["i"] += 1
+        return _V(s)
+
+    fake_gdb.parse_and_eval = _eval
+
+    bridge = bridge_mod.GdbBridge()
+    bridge._dispatch_op("watch_set", {"expression": "counter"})  # seeds 0x3
+    bp_obj = fake_gdb.breakpoints()[0]
+    bp_obj.type = fake_gdb.BP_HARDWARE_WATCHPOINT
+
+    fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([bp_obj]))  # evals 0x4
+    reason = bridge._stop_info()["reason"]
+    assert reason["kind"] == "watchpoint-hit"
+    assert reason["new_value"] == "0x4"
+    assert reason["old_value"] == "0x3"
+
+
+def test_break_delete_returns_kind(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    bp = bridge._dispatch_op("watch_set", {"expression": "buf"})
+    result = bridge._dispatch_op("break_delete", {"number": bp["number"]})
+    assert result["deleted"] == bp["number"]
+    assert result["kind"] == "watchpoint"
+
+
+def test_print_flags_static_read_without_live_inferior(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("print", {"expression": "counter"})
+    assert result["live"] is False
+    assert "static" in result["note"]
+
+
+def test_print_no_note_when_inferior_live(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("print", {"expression": "argc"})
+    assert "note" not in result
+    assert "live" not in result
+
+
+def test_register_write(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("register_write", {"name": "$rip", "value": "0x401234"})
+    assert result["register"] == "rip"
+    assert result["value"] == "0x401234"
+    assert result["readback"] == "42"
+    assert any("set $rip = 0x401234" in c for c in fake_gdb._execute_log)
+
+
+def test_mappings_parses_and_filters(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    sample = (
+        "          Start Addr           End Addr       Size     Offset  Perms  objfile\n"
+        "      0x555555554000     0x555555555000     0x1000        0x0  r-xp   /usr/bin/app\n"
+        "      0x7ffff7d00000     0x7ffff7d22000    0x22000        0x0  r--p   /usr/lib/libc.so.6\n"
+    )
+    original = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        if cmd.startswith("info proc mappings"):
+            return sample
+        return original(cmd, to_string)
+
+    fake_gdb.execute = _exec
+    bridge = bridge_mod.GdbBridge()
+
+    allm = bridge._dispatch_op("mappings", {})
+    assert len(allm) == 2
+    assert allm[0]["start"] == hex(0x555555554000)
+    assert allm[0]["perms"] == "r-xp"
+    assert allm[0]["objfile"] == "/usr/bin/app"
+    assert allm[0]["size"] == 0x1000
+
+    libc = bridge._dispatch_op("mappings", {"name": "libc"})
+    assert len(libc) == 1 and "libc" in libc[0]["objfile"]
+
+    one = bridge._dispatch_op("mappings", {"contains": "0x555555554500"})
+    assert len(one) == 1 and one[0]["objfile"] == "/usr/bin/app"
+
+
+def test_disasm_annotates_symbol(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    original = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        if cmd.startswith("info symbol"):
+            return "main + 4 in section .text\n"
+        return original(cmd, to_string)
+
+    fake_gdb.execute = _exec
+    bridge = bridge_mod.GdbBridge()
+
+    insns = bridge._dispatch_op("disasm", {"location": "main", "count": 2})
+    assert insns[0]["symbol"] == "main+4"
+
+
+@pytest.mark.parametrize("gdb_msg", ["No registers.", "No stack."])
+def test_backtrace_no_inferior_is_actionable(monkeypatch, gdb_msg):
+    # GDB 17.2 raises "No registers." (not "No stack.") from newest_frame()
+    # when nothing is running; both must surface the actionable hint.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _boom():
+        raise fake_gdb.error(gdb_msg)
+
+    fake_gdb.newest_frame = _boom
+    # No inferior -> pid 0, so the hint resolves to "not running".
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch({"op": "backtrace", "params": {}})
+    assert resp["ok"] is False
+    assert "not running" in resp["error"]
+
+
+def test_register_write_rejects_unknown_register(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch(
+        {"op": "register_write", "params": {"name": "bogus_reg", "value": "0x1"}}
+    )
+    assert resp["ok"] is False
+    assert "unknown register" in resp["error"]
+    # Must not have silently created a convenience variable.
+    assert not any("set $bogus_reg" in c for c in fake_gdb._execute_log)
+
+
+def test_register_write_requires_live_inferior(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _no_frame():
+        raise fake_gdb.error("No frame selected.")
+
+    fake_gdb.selected_frame = _no_frame
+    # No inferior -> pid 0, so the error says "not running" (vs "running").
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch(
+        {"op": "register_write", "params": {"name": "rax", "value": "0x1"}}
+    )
+    assert resp["ok"] is False
+    assert "not running" in resp["error"]
+
+
+def test_snapshot_drops_unevaluable_watchpoint(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    bp = bridge._dispatch_op("watch_set", {"expression": "counter"})  # seeds value
+    bp_obj = fake_gdb.breakpoints()[0]
+    bp_obj.type = fake_gdb.BP_HARDWARE_WATCHPOINT
+    assert bridge._watchpoint_values.get(bp["number"]) is not None
+
+    def _boom(expr):
+        raise fake_gdb.error("value optimized out")
+
+    fake_gdb.parse_and_eval = _boom
+    bridge._snapshot_watchpoints()
+    # Stale snapshot dropped, so the next hit won't diff against a stale value.
+    assert bp["number"] not in bridge._watchpoint_values
+
+
+def test_dispatch_augments_no_symbol_error(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _boom(expr):
+        raise fake_gdb.error('No symbol "foo" in current context.')
+
+    fake_gdb.parse_and_eval = _boom
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch({"op": "print", "params": {"expression": "foo"}})
+    assert resp["ok"] is False
+    assert "functions --query" in resp["error"]
+
+
+def _write_minimal_elf64(path: Path, text_vaddr: int) -> None:
+    """Write a minimal valid ELF64-LE file with a .text section at text_vaddr."""
+    shstrtab = b"\x00.text\x00.shstrtab\x00"  # ".text"@1, ".shstrtab"@7
+    text_name, str_name = 1, 7
+    ehsize, shentsize, shnum, shstrndx = 64, 64, 3, 2
+    shoff = ehsize + len(shstrtab)
+
+    ehdr = bytearray(64)
+    ehdr[0:4] = b"\x7fELF"
+    ehdr[4] = 2  # ELFCLASS64
+    ehdr[5] = 1  # ELFDATA2LSB
+    ehdr[6] = 1  # version
+    struct.pack_into("<H", ehdr, 16, 2)            # e_type ET_EXEC
+    struct.pack_into("<H", ehdr, 18, 0x3E)         # e_machine x86-64
+    struct.pack_into("<I", ehdr, 20, 1)            # e_version
+    struct.pack_into("<Q", ehdr, 0x28, shoff)      # e_shoff
+    struct.pack_into("<H", ehdr, 0x34, ehsize)     # e_ehsize
+    struct.pack_into("<H", ehdr, 0x3A, shentsize)  # e_shentsize
+    struct.pack_into("<H", ehdr, 0x3C, shnum)      # e_shnum
+    struct.pack_into("<H", ehdr, 0x3E, shstrndx)   # e_shstrndx
+
+    def shdr(name, sh_type, addr=0, off=0, size=0):
+        b = bytearray(64)
+        struct.pack_into("<I", b, 0, name)     # sh_name
+        struct.pack_into("<I", b, 4, sh_type)  # sh_type
+        struct.pack_into("<Q", b, 0x10, addr)  # sh_addr
+        struct.pack_into("<Q", b, 0x18, off)   # sh_offset
+        struct.pack_into("<Q", b, 0x20, size)  # sh_size
+        return bytes(b)
+
+    sections = (
+        shdr(0, 0)                                            # null
+        + shdr(text_name, 1, addr=text_vaddr)                 # .text (PROGBITS)
+        + shdr(str_name, 3, off=ehsize, size=len(shstrtab))   # .shstrtab (STRTAB)
+    )
+    path.write_bytes(bytes(ehdr) + shstrtab + sections)
+
+
+def test_elf_text_vaddr_reads_dot_text(monkeypatch, tmp_path):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    elf = tmp_path / "fake.elf"
+    _write_minimal_elf64(elf, 0xFFFFFFFF81000000)
+    assert bridge_mod._elf_text_vaddr(str(elf)) == 0xFFFFFFFF81000000
+    assert bridge_mod._elf_text_vaddr(str(tmp_path / "missing")) is None
+
+
+def test_load_without_base_uses_file(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("load", {"path": "/x/vmlinux"})
+    assert result == {"loaded": "/x/vmlinux"}
+    assert any(c == "file /x/vmlinux" for c in fake_gdb._execute_log)
+
+
+def test_load_with_slide_offsets_all_sections(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("load", {"path": "/x/vmlinux", "slide": "0x7000000"})
+    assert result["loaded"] == "/x/vmlinux"
+    assert result["slide"] == hex(0x7000000)
+    log = fake_gdb._execute_log
+    # Drops any prior copy, then offsets EVERY section by the slide (-o) so both
+    # text and data resolve — and never loads a link-time `file` primary.
+    assert any(c == "remove-symbol-file /x/vmlinux" for c in log)
+    assert any(c == "add-symbol-file /x/vmlinux -o 0x7000000" for c in log)
+    assert not any(c.startswith("file ") for c in log)
+
+
+def test_load_with_base_computes_slide_from_elf(monkeypatch, tmp_path):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = tmp_path / "vmlinux"
+    _write_minimal_elf64(elf, 0xFFFFFFFF81000000)
+
+    base = 0xFFFFFFFF88000000
+    result = bridge._dispatch_op("load", {"path": str(elf), "base": hex(base)})
+    assert result["base"] == hex(base)
+    assert result["slide"] == hex(0x7000000)  # base - link .text
+    assert any(
+        c == f"add-symbol-file {elf} -o 0x7000000" for c in fake_gdb._execute_log
+    )
+
+
+def test_load_with_base_errors_when_text_unreadable(monkeypatch, tmp_path):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    notelf = tmp_path / "notelf"
+    notelf.write_bytes(b"not an elf")
+
+    resp = bridge.dispatch(
+        {"op": "load", "params": {"path": str(notelf), "base": "0xffffffff88000000"}}
+    )
+    assert resp["ok"] is False
+    assert "--slide" in resp["error"]
+
+
+def test_parse_disassemble_output(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    sample = (
+        "Dump of assembler code for function main:\n"
+        "   0x0000000000401136 <+0>:\tpush   %rbp\n"
+        "=> 0x000000000040113a <main+4>:\tmov    %rsp,%rbp\n"
+        "End of assembler dump.\n"
+    )
+    rows = bridge_mod._parse_disassemble_output(sample)
+    assert len(rows) == 2
+    assert rows[0] == {"address": "0x0000000000401136", "asm": "push   %rbp", "symbol": "+0"}
+    assert rows[1]["address"] == "0x000000000040113a"
+    assert rows[1]["symbol"] == "main+4"
+
+
+def test_disasm_fallback_returns_list(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _unresolvable(expr):
+        raise fake_gdb.error("not a single address")
+
+    fake_gdb.parse_and_eval = _unresolvable  # force the range-expr fallback path
+    bridge = bridge_mod.GdbBridge()
+    result = bridge._dispatch_op("disasm", {"location": "main,+8"})
+    assert isinstance(result, list)
+    assert result[0]["address"].startswith("0x")
+    assert "asm" in result[0]
+
+
+# ---------------------------------------------------------------------------
+# Edge-case hardening (adversarial hunt fixes)
+# ---------------------------------------------------------------------------
+
+def test_status_not_started_vs_exited(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    fake_gdb.selected_thread = lambda: None
+    bridge = bridge_mod.GdbBridge()
+
+    resp = bridge.dispatch({"op": "status", "params": {}})
+    assert resp["result"]["state"] == "not-started"
+
+    bridge._has_run = True  # simulate a run that has since exited
+    resp2 = bridge.dispatch({"op": "status", "params": {}})
+    assert resp2["result"]["state"] == "exited"
+
+
+def test_register_write_while_running_says_interrupt(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _no_frame():
+        raise fake_gdb.error("No frame selected.")
+
+    fake_gdb.selected_frame = _no_frame  # frame unavailable while running
+    bridge = bridge_mod.GdbBridge()       # default fake pid is live (running)
+
+    resp = bridge.dispatch({"op": "register_write", "params": {"name": "rax", "value": "0x1"}})
+    assert resp["ok"] is False
+    assert "running" in resp["error"] and "interrupt" in resp["error"].lower()
+
+
+def test_augment_error_does_not_overmatch_substrings(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    def _boom(expr):
+        raise fake_gdb.error("No registers available in my custom module")
+
+    fake_gdb.parse_and_eval = _boom
+    bridge = bridge_mod.GdbBridge()
+    resp = bridge.dispatch({"op": "print", "params": {"expression": "x"}})
+    assert resp["ok"] is False
+    assert "not running" not in resp["error"]
+    assert "interrupt" not in resp["error"].lower()
+
+
+def test_load_rejects_base_and_slide_together(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    resp = bridge.dispatch({"op": "load", "params": {"path": "/x", "base": "0x1000", "slide": "0x10"}})
+    assert resp["ok"] is False
+    assert "both" in resp["error"]
+
+
+def test_disasm_count_zero_or_negative_returns_empty_list(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    assert bridge._dispatch_op("disasm", {"count": 0}) == []
+    assert bridge._dispatch_op("disasm", {"count": -5}) == []
+
+
+def test_parse_addr_masks_high_bit_to_unsigned(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    class _Neg:
+        def __int__(self):
+            return -10485760  # 0xffffffffff600000 interpreted signed
+
+    fake_gdb.parse_and_eval = lambda e: _Neg()
+    assert bridge_mod.GdbBridge._parse_addr("$rax") == 0xFFFFFFFFFF600000
+
+
+def test_watchpoint_unreadable_new_value_keeps_old(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    bp = bridge._dispatch_op("watch_set", {"expression": "p"})  # seeds "42"
+    bp_obj = fake_gdb.breakpoints()[0]
+    bp_obj.type = fake_gdb.BP_HARDWARE_WATCHPOINT
+
+    def _boom(expr):
+        raise fake_gdb.error("Cannot access memory")
+
+    fake_gdb.parse_and_eval = _boom
+    reason = bridge._bp_reason(bp_obj)
+    assert reason["old_value"] == "42"
+    assert reason["new_value"] == "<unreadable>"
