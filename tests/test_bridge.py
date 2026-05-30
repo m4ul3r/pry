@@ -399,6 +399,44 @@ def test_break_set_and_list(monkeypatch):
     assert any(bp["location"] == "main" for bp in bp_list)
 
 
+def test_break_set_auto_prefixes_bare_hex_address(monkeypatch):
+    """A bare hex literal like '0x401f0e' is what users mean when they
+    say 'break at this address'. GDB's own syntax requires the '*'
+    prefix; without it, the bare hex is interpreted as a source line
+    number and the breakpoint silently goes pending. The bridge
+    auto-prefixes so the obvious form just works."""
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    bp = bridge._dispatch_op("break_set", {"location": "0x401f0e"})
+    assert bp["location"] == "*0x401f0e"
+
+    # Already-prefixed addresses are left alone.
+    bp2 = bridge._dispatch_op("break_set",
+                              {"location": "*0x401f17"})
+    assert bp2["location"] == "*0x401f17"
+
+    # Symbolic locations (function names, file:line) are not touched.
+    bp3 = bridge._dispatch_op("break_set", {"location": "main"})
+    assert bp3["location"] == "main"
+
+
+def test_looks_like_bare_hex_address(monkeypatch):
+    """Helper precision matters — must not auto-prefix things that
+    happen to start with '0x' but aren't pure hex addresses."""
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    fn = bridge_mod._looks_like_bare_hex_address
+    assert fn("0x401f0e")
+    assert fn("0X401F0E")
+    assert fn("0x0")
+    assert not fn("")
+    assert not fn("0x")            # no digits after prefix
+    assert not fn("main")          # symbolic
+    assert not fn("*0x401f0e")     # already prefixed
+    assert not fn("0x401f0e foo")  # contains trailing garbage
+    assert not fn("0xZZ")          # not hex
+
+
 def test_break_delete(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
