@@ -76,12 +76,15 @@ READ_LOCKED_OPS = {
     "backtrace",
     "frame_info",
     "frame_select",
+    "frame_up",
+    "frame_down",
     "locals",
     "args",
     "print",
     "registers",
     "memory_read",
     "disasm",
+    "examine",
     "functions",
     "symbols",
     "types_show",
@@ -92,6 +95,7 @@ READ_LOCKED_OPS = {
     "list_threads",
     "target_info",
     "mappings",
+    "display_list",
 }
 
 EXEC_OPS = {
@@ -103,6 +107,7 @@ EXEC_OPS = {
     "nexti",
     "finish",
     "until",
+    "jump",
 }
 
 WRITE_LOCKED_OPS = {
@@ -118,6 +123,7 @@ WRITE_LOCKED_OPS = {
     "nexti",
     "finish",
     "until",
+    "jump",
     "break_set",
     "break_delete",
     "break_enable",
@@ -125,6 +131,10 @@ WRITE_LOCKED_OPS = {
     "watch_set",
     "memory_write",
     "register_write",
+    "thread_select",
+    "call",
+    "display_add",
+    "display_remove",
     "py_exec",
     "gdb_exec",
 }
@@ -590,6 +600,11 @@ def _breakpoint_to_dict(bp) -> dict[str, Any]:
         # or a typo'd function name). Agents otherwise can't tell a zombie
         # BP from a live one.
         "pending": bool(getattr(bp, "pending", False)),
+        # Thread restriction (None = fires on any thread) and ignore count
+        # are otherwise invisible — a thread-scoped or ignore-gated breakpoint
+        # looks identical to a plain one in the list.
+        "thread": getattr(bp, "thread", None),
+        "ignore": getattr(bp, "ignore_count", 0),
     }
     return result
 
@@ -624,6 +639,10 @@ class GdbBridge:
         # return type (to cast the ABI return register).
         self._finish_frame = None
         self._finish_ret_type = None
+        # Auto-display expressions: re-evaluated and attached to every stop
+        # result. Each entry is {"number": int, "expr": str}.
+        self._displays: list[dict[str, Any]] = []
+        self._display_counter = 0
         gdb.events.stop.connect(self._on_stop)
         if hasattr(gdb.events, "exited"):
             gdb.events.exited.connect(self._on_exited)
@@ -751,7 +770,10 @@ class GdbBridge:
         elif hasattr(gdb, "SignalEvent") and isinstance(event, gdb.SignalEvent):
             reason["kind"] = "signal"
             reason["signal"] = event.stop_signal
-        self._last_stop_reason = reason or None
+        # A plain stop with no breakpoint/signal is a completed step/next/
+        # finish/until. Record a generic reason so `status`/`wait` can always
+        # answer "why is it stopped?" instead of returning nothing.
+        self._last_stop_reason = reason or {"kind": "step"}
 
     def _on_exited(self, event):
         """GDB exited-event callback — clears stale stop reason."""
@@ -982,6 +1004,8 @@ class GdbBridge:
             result.update(info)
             if self._last_stop_reason:
                 result["reason"] = self._last_stop_reason
+            if self._displays and result["state"] == "stopped":
+                result["displays"] = self._eval_displays()
         if self._background_result is not None:
             result["last_background_result"] = self._background_result
         return _json_response(ok=True, result=result)
@@ -1077,6 +1101,8 @@ class GdbBridge:
                 rv = self._finish_return_value()
                 if rv is not None:
                     result["return_value"] = rv
+            if self._displays:
+                result["displays"] = self._eval_displays()
             result_box.append(result)
             completion.set()
 
@@ -1336,6 +1362,26 @@ class GdbBridge:
     # ------------------------------------------------------------------
 
     def _dispatch_op(self, op: str, params: dict[str, Any]) -> Any:
+        # `--thread N` on an inspection command: run it against that thread,
+        # then restore the previously selected thread so the choice is a
+        # side-effect-free, per-command override (unlike `thread_select`).
+        tid = params.pop("thread", None)
+        if tid is None:
+            return self._run_op(op, params)
+        prev = None
+        try:
+            prev = gdb.selected_thread()
+        except Exception:
+            prev = None
+        gdb.execute(f"thread {int(tid)}", to_string=True)
+        try:
+            return self._run_op(op, params)
+        finally:
+            if prev is not None:
+                with contextlib.suppress(Exception):
+                    prev.switch()
+
+    def _run_op(self, op: str, params: dict[str, Any]) -> Any:
         if op == "doctor":
             return self._doctor()
         if op == "list_inferiors":
@@ -1372,6 +1418,8 @@ class GdbBridge:
             return self._finish(params)
         if op == "until":
             return self._until(params)
+        if op == "jump":
+            return self._jump(params)
         if op == "interrupt":
             return self._interrupt(params)
 
@@ -1389,6 +1437,10 @@ class GdbBridge:
         if op == "watch_set":
             return self._watch_set(params)
 
+        # Threads
+        if op == "thread_select":
+            return self._thread_select(params)
+
         # Inspection
         if op == "backtrace":
             return self._backtrace(params)
@@ -1396,12 +1448,18 @@ class GdbBridge:
             return self._frame_info(params)
         if op == "frame_select":
             return self._frame_select(params)
+        if op == "frame_up":
+            return self._frame_up(params)
+        if op == "frame_down":
+            return self._frame_down(params)
         if op == "locals":
             return self._locals(params)
         if op == "args":
             return self._args(params)
         if op == "print":
             return self._print(params)
+        if op == "call":
+            return self._call(params)
         if op == "registers":
             return self._registers(params)
         if op == "register_write":
@@ -1414,6 +1472,16 @@ class GdbBridge:
             return self._memory_write(params)
         if op == "disasm":
             return self._disasm(params)
+        if op == "examine":
+            return self._examine(params)
+
+        # Auto-display
+        if op == "display_add":
+            return self._display_add(params)
+        if op == "display_list":
+            return self._display_list(params)
+        if op == "display_remove":
+            return self._display_remove(params)
         if op == "functions":
             return self._functions(params)
         if op == "symbols":
@@ -1534,6 +1602,19 @@ class GdbBridge:
             except Exception:
                 pass
         return threads
+
+    def _thread_select(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Make a thread the persistently selected one (GDB's `thread N`)."""
+        num = int(params["num"])
+        gdb.execute(f"thread {num}", to_string=True)
+        selected = None
+        try:
+            selected = gdb.selected_thread()
+        except Exception:
+            selected = None
+        if selected is None:
+            return {"selected": num}
+        return self._thread_dict(selected, selected_thread=selected)
 
     # ------------------------------------------------------------------
     # Session management
@@ -1730,6 +1811,12 @@ class GdbBridge:
         location = params["location"]
         return self._exec_and_stop(f"until {location}")
 
+    def _jump(self, params: dict[str, Any]) -> dict[str, Any]:
+        # Resume execution at *location* (GDB's `jump`), unlike a raw $pc write:
+        # GDB sets up a proper transfer so the program keeps running from there.
+        location = params["location"]
+        return self._exec_and_stop(f"jump {location}")
+
     def _interrupt(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._exec_and_stop("interrupt")
 
@@ -1832,7 +1919,30 @@ class GdbBridge:
 
     def _break_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         bps = gdb.breakpoints() or []
-        return [_breakpoint_to_dict(bp) for bp in bps]
+        result = [_breakpoint_to_dict(bp) for bp in bps]
+        # The Python API exposes no detail for catchpoints (location/expression
+        # are None), so a `catch syscall write` is indistinguishable from any
+        # other catchpoint. Recover the "what" column from `info breakpoints`.
+        if any(b.get("kind") == "catchpoint" for b in result):
+            whats = self._catchpoint_whats()
+            for b in result:
+                if b.get("kind") == "catchpoint" and b["number"] in whats:
+                    b["what"] = whats[b["number"]]
+        return result
+
+    @staticmethod
+    def _catchpoint_whats() -> dict[int, str]:
+        """Map catchpoint number -> its 'what' text from `info breakpoints`."""
+        whats: dict[int, str] = {}
+        try:
+            out = gdb.execute("info breakpoints", to_string=True)
+        except gdb.error:
+            return whats
+        for line in out.splitlines():
+            m = re.match(r"\s*(\d+)\s+catchpoint\s+keep\s+[yn]\s+(.+?)\s*$", line)
+            if m:
+                whats[int(m.group(1))] = m.group(2).strip()
+        return whats
 
     def _break_delete(self, params: dict[str, Any]) -> dict[str, Any]:
         number = int(params["number"])
@@ -1967,6 +2077,16 @@ class GdbBridge:
         gdb.execute(f"frame {level}", to_string=True)
         return self._frame_info(params)
 
+    def _frame_up(self, params: dict[str, Any]) -> dict[str, Any]:
+        count = int(params.get("count", 1) or 1)
+        gdb.execute(f"up {count}", to_string=True)
+        return self._frame_info(params)
+
+    def _frame_down(self, params: dict[str, Any]) -> dict[str, Any]:
+        count = int(params.get("count", 1) or 1)
+        gdb.execute(f"down {count}", to_string=True)
+        return self._frame_info(params)
+
     def _locals(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         frame = gdb.selected_frame()
         result = []
@@ -2053,6 +2173,23 @@ class GdbBridge:
                 "no live inferior — value read from the static binary image, "
                 "not live memory"
             )
+        return result
+
+    def _call(self, params: dict[str, Any]) -> dict[str, Any]:
+        # Call an inferior function and return its value. GDB's `call` is just
+        # expression evaluation that invokes the function; reuse parse_and_eval
+        # so string-literal args are auto-allocated in the target. A void
+        # result surfaces as None rather than the literal "void".
+        expression = params["expression"]
+        val = gdb.parse_and_eval(expression)
+        rendered = str(val)
+        result: dict[str, Any] = {
+            "value": None if rendered == "void" else rendered,
+        }
+        try:
+            result["type"] = str(val.type)
+        except Exception:
+            pass
         return result
 
     def _registers(self, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2256,6 +2393,24 @@ class GdbBridge:
     def _disasm(self, params: dict[str, Any]) -> Any:
         location = params.get("location")
         count = params.get("count")
+        start = params.get("start")
+        end = params.get("end")
+        source = params.get("source", False)
+
+        # Source-interleaved disassembly: return GDB's raw text so the source
+        # lines survive (the structured parser keeps only instruction lines).
+        if source:
+            if start is not None and end is not None:
+                cmd = f"disassemble /s {start},{end}"
+            else:
+                cmd = f"disassemble /s {location or '$pc'}"
+            return gdb.execute(cmd, to_string=True)
+
+        # Explicit address range. GDB's `disassemble START,END` covers exactly
+        # [START, END).
+        if start is not None and end is not None:
+            cmd = f"disassemble {start},{end}"
+            return _parse_disassemble_output(gdb.execute(cmd, to_string=True))
 
         # Honor --count strictly: 0 or negative means "no instructions". Never
         # silently substitute the whole function (the old fallback did, so the
@@ -2303,6 +2458,62 @@ class GdbBridge:
         # string) so JSON output is structurally stable regardless of form.
         cmd = f"disassemble {location}" if location else "disassemble"
         return _parse_disassemble_output(gdb.execute(cmd, to_string=True))
+
+    def _examine(self, params: dict[str, Any]) -> dict[str, Any]:
+        """GDB-style memory examine (`x/NFU addr`).
+
+        Accepts a raw GDB format spec (e.g. "8xw", "3i", "s") or individual
+        count/format/size pieces. Returns the GDB text plus split lines — x/'s
+        output (instructions, strings, multi-column words) has no single stable
+        structure, so the raw text is the reliable artifact.
+        """
+        address = params["address"]
+        spec = params.get("spec")
+        if not spec:
+            count = params.get("count")
+            fmt = params.get("format", "")
+            size = params.get("size", "")
+            spec = f"{count if count is not None else ''}{fmt}{size}"
+        spec = str(spec).strip()
+        cmd = f"x/{spec} {address}" if spec else f"x {address}"
+        out = gdb.execute(cmd, to_string=True)
+        return {
+            "command": cmd,
+            "text": out,
+            "lines": [ln for ln in out.splitlines() if ln.strip()],
+        }
+
+    # ------------------------------------------------------------------
+    # Auto-display
+    # ------------------------------------------------------------------
+
+    def _display_add(self, params: dict[str, Any]) -> dict[str, Any]:
+        expr = params["expression"]
+        self._display_counter += 1
+        entry = {"number": self._display_counter, "expr": expr}
+        self._displays.append(entry)
+        return dict(entry)
+
+    def _display_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._eval_displays()
+
+    def _display_remove(self, params: dict[str, Any]) -> dict[str, Any]:
+        number = int(params["number"])
+        for i, d in enumerate(self._displays):
+            if d["number"] == number:
+                self._displays.pop(i)
+                return {"removed": number}
+        raise ValueError(f"No display #{number}")
+
+    def _eval_displays(self) -> list[dict[str, Any]]:
+        """Evaluate every registered display expression at the current stop."""
+        out: list[dict[str, Any]] = []
+        for d in self._displays:
+            entry: dict[str, Any] = {"number": d["number"], "expr": d["expr"]}
+            value = self._safe_eval_str(d["expr"])
+            entry["value"] = value if value is not None else "<error>"
+            out.append(entry)
+        return out
 
     def _functions(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         query = params.get("query")

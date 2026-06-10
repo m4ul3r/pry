@@ -1370,6 +1370,50 @@ def test_finish_return_value_skips_when_frame_still_valid(monkeypatch):
     assert bridge._finish_return_value() is None
 
 
+def test_display_add_list_remove(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    a = bridge._display_add({"expression": "head"})
+    assert a == {"number": 1, "expr": "head"}
+    b = bridge._display_add({"expression": "argc"})
+    assert b["number"] == 2
+
+    listed = bridge._display_list({})
+    # _safe_eval_str -> fake parse_and_eval returns 42 for any expr.
+    assert listed == [
+        {"number": 1, "expr": "head", "value": "42"},
+        {"number": 2, "expr": "argc", "value": "42"},
+    ]
+
+    assert bridge._display_remove({"number": 1}) == {"removed": 1}
+    assert [d["number"] for d in bridge._displays] == [2]
+    with pytest.raises(ValueError):
+        bridge._display_remove({"number": 99})
+
+
+def test_examine_builds_command(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    out = bridge._examine({"address": "0x1000", "spec": "4xw"})
+    assert out["command"] == "x/4xw 0x1000"
+    # From parts:
+    out = bridge._examine({"address": "$rsp", "count": 8, "format": "x", "size": "w"})
+    assert out["command"] == "x/8xw $rsp"
+
+
+def test_catchpoint_whats_parse(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    sample = (
+        "Num     Type           Disp Enb Address            What\n"
+        "1       breakpoint     keep y   0x0000000000401156 in make_node\n"
+        "3       catchpoint     keep y                      syscall \"write\"\n"
+    )
+    fake_gdb.execute = lambda cmd, to_string=False: sample
+    whats = bridge_mod.GdbBridge._catchpoint_whats()
+    assert whats == {3: 'syscall "write"'}
+
+
 def test_disasm_fallback_returns_list(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
 

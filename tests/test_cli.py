@@ -1603,3 +1603,136 @@ def test_doctor_instance_not_found_exits_nonzero(monkeypatch, capsys):
     rc = pry.cli.main(["--instance", "424242", "doctor"])
     assert rc == 1
     assert "424242" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Follow-up gap fixes: --thread, examine, disasm range/source, call, frame
+# up/down, thread select, display, jump, break-list enrichment
+# ---------------------------------------------------------------------------
+
+def _capture_send(monkeypatch, result=None):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return {"ok": True, "result": result if result is not None else {}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    return captured
+
+
+def test_thread_flag_plumbed_into_params(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result=[])
+    rc = pry.cli.main(["backtrace", "--thread", "3"])
+    assert rc == 0
+    assert cap["op"] == "backtrace"
+    assert cap["params"]["thread"] == 3
+
+
+def test_no_thread_flag_omits_param(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result=[])
+    pry.cli.main(["backtrace"])
+    assert "thread" not in (cap["params"] or {})
+
+
+def test_examine_builds_spec_from_parts(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"text": "", "lines": []})
+    pry.cli.main(["examine", "$rsp", "--count", "8", "--fmt", "x", "--size", "w"])
+    assert cap["op"] == "examine"
+    assert cap["params"] == {"address": "$rsp", "count": 8, "format": "x", "size": "w"}
+
+
+def test_examine_raw_spec(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"text": "", "lines": []})
+    pry.cli.main(["examine", "0x1000", "--spec", "3i"])
+    assert cap["params"] == {"address": "0x1000", "spec": "3i"}
+
+
+def test_disasm_range_and_source_params(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result=[])
+    pry.cli.main(["disasm", "--start", "main", "--end", "main+16", "--source"])
+    assert cap["params"]["start"] == "main"
+    assert cap["params"]["end"] == "main+16"
+    assert cap["params"]["source"] is True
+
+
+def test_call_sends_call_op(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"value": "0x5", "type": "int"})
+    pry.cli.main(["call", '(int)strlen("hi")'])
+    assert cap["op"] == "call"
+    assert cap["params"]["expression"] == '(int)strlen("hi")'
+
+
+def test_frame_up_down_send_ops(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"level": 1})
+    pry.cli.main(["frame", "up", "2"])
+    assert cap["op"] == "frame_up"
+    assert cap["params"]["count"] == 2
+    cap = _capture_send(monkeypatch, result={"level": 0})
+    pry.cli.main(["frame", "down"])
+    assert cap["op"] == "frame_down"
+
+
+def test_thread_select_sends_op(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"num": 3})
+    pry.cli.main(["thread", "select", "3"])
+    assert cap["op"] == "thread_select"
+    assert cap["params"]["num"] == 3
+
+
+def test_display_add_list_remove_ops(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"number": 1, "expr": "head"})
+    pry.cli.main(["display", "add", "head"])
+    assert cap["op"] == "display_add"
+    assert cap["params"]["expression"] == "head"
+
+    cap = _capture_send(monkeypatch, result=[])
+    pry.cli.main(["display", "list"])
+    assert cap["op"] == "display_list"
+
+    cap = _capture_send(monkeypatch, result={"removed": 2})
+    pry.cli.main(["display", "remove", "2"])
+    assert cap["op"] == "display_remove"
+    assert cap["params"]["number"] == 2
+
+
+def test_jump_sends_op(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"status": "stopped"})
+    pry.cli.main(["jump", "file.c:42"])
+    assert cap["op"] == "jump"
+    assert cap["params"]["location"] == "file.c:42"
+
+
+def test_render_breakpoint_list_thread_ignore_catch():
+    value = [
+        {"number": 1, "kind": "breakpoint", "location": "bump", "enabled": True,
+         "hits": 0, "thread": 3, "ignore": 0},
+        {"number": 2, "kind": "breakpoint", "location": "main", "enabled": True,
+         "hits": 5, "thread": None, "ignore": 4},
+        {"number": 3, "kind": "catchpoint", "location": None, "enabled": True,
+         "hits": 0, "what": 'syscall "write"'},
+    ]
+    text = pry.cli._render_breakpoint_list_text(value)
+    assert "thread 3" in text
+    assert "ignore 4" in text
+    assert 'catchpoint for syscall "write"' in text
+
+
+def test_render_stop_text_shows_displays():
+    value = {
+        "status": "stopped",
+        "frame": {"function": "main"},
+        "displays": [{"number": 1, "expr": "head", "value": "0x405010"}],
+    }
+    text = pry.cli._render_stop_text(value)
+    assert "display #1: head = 0x405010" in text
+
+
+def test_render_display_list_text():
+    text = pry.cli._render_display_list_text(
+        [{"number": 2, "expr": "argc", "value": "0x1"}]
+    )
+    assert "#2: argc = 0x1" in text
+    assert pry.cli._render_display_list_text([]) == "no displays"

@@ -155,6 +155,22 @@ def _common_io_options(
     )
 
 
+def _add_thread_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--thread", type=int, metavar="N",
+        help="Run against thread N (the prior thread selection is restored after)",
+    )
+
+
+def _add_output_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--output", action="store_true",
+        help="Also print new session output (inferior stdout/stderr and GDB "
+             "messages) to stderr; note targets may buffer stdout until they "
+             "flush or exit",
+    )
+
+
 def _add_paged_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--offset", type=int, default=0,
@@ -215,6 +231,44 @@ def _render_fallback_text(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
 
 
+def _resolve_instance_pid(instance_pid: int | None) -> int | None:
+    """Best-effort: the pid of the targeted (or sole) running instance."""
+    if instance_pid is not None:
+        return instance_pid
+    instances = list_instances()
+    return instances[0].pid if len(instances) == 1 else None
+
+
+def _inferior_log_size(instance_pid: int | None) -> int | None:
+    """Current byte size of an instance's session log (None if unavailable)."""
+    pid = _resolve_instance_pid(instance_pid)
+    if pid is None:
+        return None
+    try:
+        return gdb_log_path(pid).stat().st_size
+    except OSError:
+        return None
+
+
+def _inferior_log_delta(instance_pid: int | None, since_size: int | None) -> str:
+    """Read log bytes appended since *since_size* (the inferior's new output).
+
+    Note: targets buffer stdout when it isn't a TTY, so output may not appear
+    until the program flushes or exits — this surfaces whatever is available.
+    """
+    if since_size is None:
+        return ""
+    pid = _resolve_instance_pid(instance_pid)
+    if pid is None:
+        return ""
+    try:
+        with open(gdb_log_path(pid), "rb") as f:
+            f.seek(since_size)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
@@ -235,17 +289,34 @@ def _call(
         effective_page_limit = page_limit
         request_params["limit"] = page_limit + 1
 
+    # `--thread N` on an inspection command runs it against that thread (the
+    # bridge restores the prior selection afterward). Plumbed here so every
+    # command that exposes --thread gets it without per-handler wiring.
+    if getattr(args, "thread", None) is not None:
+        request_params.setdefault("thread", args.thread)
+
     kw: dict[str, Any] = {}
     if timeout is not None:
         kw["timeout"] = timeout
 
     instance_pid = getattr(args, "instance", None)
+
+    # `--output` (exec commands): capture the inferior's new stdout/stderr
+    # produced during this command by diffing the session log around the call.
+    want_output = getattr(args, "output", False)
+    log_before = _inferior_log_size(instance_pid) if want_output else None
+
     response = send_request(
         op,
         params=request_params,
         instance_pid=instance_pid,
         **kw,
     )
+    if want_output:
+        new_output = _inferior_log_delta(instance_pid, log_before)
+        if new_output:
+            print(new_output, end="" if new_output.endswith("\n") else "\n",
+                  file=sys.stderr)
     result = response["result"]
     # Normalise the raw result for ALL output formats (e.g. strip ANSI from
     # gdb passthrough) before exit-code/pagination/render decisions, so JSON
@@ -391,6 +462,11 @@ def _render_stop_text(value: Any) -> str:
     return_value = value.get("return_value")
     if return_value is not None:
         parts.append(f"return value: {return_value}")
+    displays = value.get("displays")
+    if isinstance(displays, list) and displays:
+        for d in displays:
+            if isinstance(d, dict):
+                parts.append(f"  display #{d.get('number')}: {d.get('expr')} = {d.get('value')}")
     return "\n".join(parts)
 
 
@@ -554,8 +630,13 @@ def _render_breakpoint_list_text(value: Any) -> str:
             continue
         num = bp.get("number", "?")
         kind = _bp_kind_label(bp)
-        target = _bp_target_label(bp)
-        prep = _bp_target_preposition(bp)
+        # Catchpoints carry no location/expression; show the "what" instead.
+        if kind == "catchpoint" and bp.get("what"):
+            target = bp["what"]
+            prep = "for"
+        else:
+            target = _bp_target_label(bp)
+            prep = _bp_target_preposition(bp)
         enabled = "enabled" if bp.get("enabled") else "disabled"
         hits = bp.get("hits", 0)
         line = f"#{num} {kind} {prep} {target} [{enabled}] hits={hits}"
@@ -563,6 +644,12 @@ def _render_breakpoint_list_text(value: Any) -> str:
             line += " (pending)"
         if bp.get("temporary"):
             line += " (temporary)"
+        thread = bp.get("thread")
+        if thread is not None:
+            line += f" thread {thread}"
+        ignore = bp.get("ignore")
+        if ignore:
+            line += f" ignore {ignore}"
         cond = bp.get("condition")
         if cond:
             line += f" if {cond}"
@@ -810,6 +897,41 @@ def _render_disasm_text(value: Any) -> str:
         else:
             lines.append(f"{addr}:  {asm_text}")
     return "\n".join(lines)
+
+
+def _render_examine_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return value.get("text") or _render_fallback_text(value)
+    return _render_fallback_text(value)
+
+
+def _render_thread_select_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if "selected" in value and "num" not in value:
+        return f"selected thread {value['selected']}"
+    num = value.get("num", "?")
+    frame = value.get("frame") or {}
+    func = frame.get("function")
+    loc = f" in {func}" if func else ""
+    return f"selected thread {num}{loc}"
+
+
+def _render_display_add_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"display #{value.get('number')}: {value.get('expr')}"
+
+
+def _render_display_list_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "no displays"
+    return "\n".join(
+        f"#{d.get('number')}: {d.get('expr')} = {d.get('value')}"
+        for d in value if isinstance(d, dict)
+    )
 
 
 def _render_name_list_text(value: Any) -> str:
@@ -1706,6 +1828,14 @@ def _until(args: argparse.Namespace) -> int:
     )
 
 
+def _jump(args: argparse.Namespace) -> int:
+    ep, tt = _exec_params(args)
+    params: dict[str, Any] = {"location": args.location}
+    params.update(ep)
+    renderer = _render_background_text if params.get("_background") else _render_stop_text
+    return _call(args, "jump", params, text_renderer=renderer, stem="jump", timeout=tt)
+
+
 def _interrupt(args: argparse.Namespace) -> int:
     return _call(args, "interrupt", text_renderer=_render_interrupt_text, stem="interrupt")
 
@@ -1812,6 +1942,20 @@ def _frame_info(args: argparse.Namespace) -> int:
     )
 
 
+def _frame_up(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if getattr(args, "count", None) is not None:
+        params["count"] = args.count
+    return _call(args, "frame_up", params, text_renderer=_render_frame_info_text, stem="frame_up")
+
+
+def _frame_down(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if getattr(args, "count", None) is not None:
+        params["count"] = args.count
+    return _call(args, "frame_down", params, text_renderer=_render_frame_info_text, stem="frame_down")
+
+
 def _locals(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1837,6 +1981,16 @@ def _print_expr(args: argparse.Namespace) -> int:
         {"expression": args.expression},
         text_renderer=_render_print_text,
         stem="print",
+    )
+
+
+def _call_fn(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "call",
+        {"expression": args.expression},
+        text_renderer=_render_print_text,
+        stem="call",
     )
 
 
@@ -1937,12 +2091,77 @@ def _disasm(args: argparse.Namespace) -> int:
         params["location"] = args.location
     if args.count is not None:
         params["count"] = args.count
+    if getattr(args, "start", None) is not None:
+        params["start"] = args.start
+    if getattr(args, "end", None) is not None:
+        params["end"] = args.end
+    if getattr(args, "source", False):
+        params["source"] = True
     return _call(
         args,
         "disasm",
         params,
         text_renderer=_render_disasm_text,
         stem="disasm",
+    )
+
+
+def _examine(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address}
+    if getattr(args, "spec", None):
+        params["spec"] = args.spec
+    else:
+        if getattr(args, "count", None) is not None:
+            params["count"] = args.count
+        if getattr(args, "x_format", None):
+            params["format"] = args.x_format
+        if getattr(args, "size", None):
+            params["size"] = args.size
+    return _call(
+        args,
+        "examine",
+        params,
+        text_renderer=_render_examine_text,
+        stem="examine",
+    )
+
+
+def _thread_select(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "thread_select",
+        {"num": args.num},
+        text_renderer=_render_thread_select_text,
+        stem="thread_select",
+    )
+
+
+def _display_add(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "display_add",
+        {"expression": args.expression},
+        text_renderer=_render_display_add_text,
+        stem="display_add",
+    )
+
+
+def _display_list(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "display_list",
+        text_renderer=_render_display_list_text,
+        stem="display_list",
+    )
+
+
+def _display_remove(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "display_remove",
+        {"number": args.number},
+        text_renderer=lambda v: f"removed display #{v.get('removed')}" if isinstance(v, dict) else str(v),
+        stem="display_remove",
     )
 
 
@@ -2287,10 +2506,34 @@ def build_parser() -> argparse.ArgumentParser:
     threads.add_argument("--function", help="Only show threads whose frame function contains this text")
     threads.set_defaults(handler=_threads)
 
+    # --- thread (select) ---
+    thread = subparsers.add_parser("thread", help="Thread selection")
+    thread_sub = thread.add_subparsers(dest="thread_command")
+    thread_select = thread_sub.add_parser("select", help="Make a thread the selected one")
+    _common_io_options(thread_select)
+    thread_select.add_argument("num", type=int, help="Thread number (from `pry threads`)")
+    thread_select.set_defaults(handler=_thread_select)
+
+    # --- display (auto-display expressions on each stop) ---
+    display = subparsers.add_parser("display", help="Auto-display expressions on each stop")
+    display_sub = display.add_subparsers(dest="display_command")
+    display_add = display_sub.add_parser("add", help="Register an expression to show on every stop")
+    _common_io_options(display_add)
+    display_add.add_argument("expression", help="Expression to auto-display")
+    display_add.set_defaults(handler=_display_add)
+    display_list = display_sub.add_parser("list", help="List (and evaluate) registered displays")
+    _common_io_options(display_list)
+    display_list.set_defaults(handler=_display_list)
+    display_remove = display_sub.add_parser("remove", help="Remove a registered display")
+    _common_io_options(display_remove)
+    display_remove.add_argument("number", type=int, help="Display number to remove")
+    display_remove.set_defaults(handler=_display_remove)
+
     # --- run ---
     run = subparsers.add_parser("run", help="Run the loaded program")
     _common_io_options(run)
     _add_timeout_arg(run)
+    _add_output_arg(run)
     run.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     run.add_argument("args", nargs="*", help="Program arguments")
     run.set_defaults(handler=_run)
@@ -2299,35 +2542,41 @@ def build_parser() -> argparse.ArgumentParser:
     cont = subparsers.add_parser("continue", help="Continue execution")
     _common_io_options(cont)
     _add_timeout_arg(cont)
+    _add_output_arg(cont)
     cont.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     cont.set_defaults(handler=_continue)
 
     # --- step ---
     step = subparsers.add_parser("step", help="Step into (source-level)")
     _common_io_options(step)
+    _add_output_arg(step)
     step.add_argument("count", nargs="?", type=int, help="Number of steps")
     step.set_defaults(handler=_step)
 
     # --- next ---
     next_cmd = subparsers.add_parser("next", help="Step over (source-level)")
     _common_io_options(next_cmd)
+    _add_output_arg(next_cmd)
     next_cmd.add_argument("count", nargs="?", type=int, help="Number of steps")
     next_cmd.set_defaults(handler=_next)
 
     # --- stepi ---
     stepi = subparsers.add_parser("stepi", help="Step into (instruction-level)")
     _common_io_options(stepi)
+    _add_output_arg(stepi)
     stepi.set_defaults(handler=_stepi)
 
     # --- nexti ---
     nexti = subparsers.add_parser("nexti", help="Step over (instruction-level)")
     _common_io_options(nexti)
+    _add_output_arg(nexti)
     nexti.set_defaults(handler=_nexti)
 
     # --- finish ---
     finish = subparsers.add_parser("finish", help="Run until current function returns")
     _common_io_options(finish)
     _add_timeout_arg(finish)
+    _add_output_arg(finish)
     finish.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     finish.set_defaults(handler=_finish)
 
@@ -2335,9 +2584,19 @@ def build_parser() -> argparse.ArgumentParser:
     until = subparsers.add_parser("until", help="Run until a location is reached")
     _common_io_options(until)
     _add_timeout_arg(until)
+    _add_output_arg(until)
     until.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
     until.add_argument("location", help="Location to run until (function, file:line, or address)")
     until.set_defaults(handler=_until)
+
+    # --- jump ---
+    jump = subparsers.add_parser("jump", help="Resume execution at a location (GDB jump)")
+    _common_io_options(jump)
+    _add_timeout_arg(jump)
+    _add_output_arg(jump)
+    jump.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
+    jump.add_argument("location", help="Location to jump to (function, file:line, or *address)")
+    jump.set_defaults(handler=_jump)
 
     # --- interrupt ---
     interrupt = subparsers.add_parser("interrupt", help="Interrupt the running inferior")
@@ -2420,6 +2679,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- backtrace ---
     bt = subparsers.add_parser("backtrace", help="Print stack backtrace")
     _common_io_options(bt)
+    _add_thread_arg(bt)
     bt.add_argument("--full", action="store_true", help="Show local variables in each frame")
     bt.add_argument("--limit", type=int, help="Maximum number of frames")
     bt.set_defaults(handler=_backtrace)
@@ -2429,31 +2689,54 @@ def build_parser() -> argparse.ArgumentParser:
     frame_sub = frame.add_subparsers(dest="frame_command")
     frame_sel = frame_sub.add_parser("select", help="Select a stack frame")
     _common_io_options(frame_sel)
+    _add_thread_arg(frame_sel)
     frame_sel.add_argument("level", type=int, help="Frame level (0 = innermost)")
     frame_sel.set_defaults(handler=_frame_select)
     frame_inf = frame_sub.add_parser("info", help="Show current frame info")
     _common_io_options(frame_inf)
+    _add_thread_arg(frame_inf)
     frame_inf.set_defaults(handler=_frame_info)
+    frame_up = frame_sub.add_parser("up", help="Move up the stack toward callers")
+    _common_io_options(frame_up)
+    _add_thread_arg(frame_up)
+    frame_up.add_argument("count", nargs="?", type=int, help="Number of frames (default 1)")
+    frame_up.set_defaults(handler=_frame_up)
+    frame_down = frame_sub.add_parser("down", help="Move down the stack toward callees")
+    _common_io_options(frame_down)
+    _add_thread_arg(frame_down)
+    frame_down.add_argument("count", nargs="?", type=int, help="Number of frames (default 1)")
+    frame_down.set_defaults(handler=_frame_down)
 
     # --- locals ---
     locals_cmd = subparsers.add_parser("locals", help="Show local variables")
     _common_io_options(locals_cmd)
+    _add_thread_arg(locals_cmd)
     locals_cmd.set_defaults(handler=_locals)
 
     # --- args ---
     args_cmd = subparsers.add_parser("args", help="Show function arguments")
     _common_io_options(args_cmd)
+    _add_thread_arg(args_cmd)
     args_cmd.set_defaults(handler=_args)
 
     # --- print ---
     print_cmd = subparsers.add_parser("print", help="Evaluate an expression")
     _common_io_options(print_cmd)
+    _add_thread_arg(print_cmd)
     print_cmd.add_argument("expression", help="Expression to evaluate")
     print_cmd.set_defaults(handler=_print_expr)
+
+    # --- call ---
+    call_cmd = subparsers.add_parser("call", help="Call an inferior function and return its value")
+    _common_io_options(call_cmd)
+    _add_thread_arg(call_cmd)
+    call_cmd.add_argument("expression", help="Call expression, e.g. 'func(1, \"x\")'")
+    call_cmd.set_defaults(handler=_call_fn)
 
     # --- registers ---
     regs = subparsers.add_parser("registers", help="Show or write register values")
     _common_io_options(regs)
+    _add_thread_arg(regs)
     regs.add_argument("--all", action="store_true", help="Show all registers including floating-point")
     regs.set_defaults(handler=_registers)
     regs_sub = regs.add_subparsers(dest="registers_command")
@@ -2468,6 +2751,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_sub = mem.add_subparsers(dest="memory_command")
     mem_read = mem_sub.add_parser("read", help="Read memory")
     _common_io_options(mem_read)
+    _add_thread_arg(mem_read)
     mem_read.add_argument("address", help="Start address (hex or expression)")
     mem_read.add_argument("length", type=int, help="Number of bytes to read")
     mem_read.add_argument("--display", dest="mem_format",
@@ -2493,9 +2777,25 @@ def build_parser() -> argparse.ArgumentParser:
     # --- disasm ---
     disasm = subparsers.add_parser("disasm", help="Disassemble instructions")
     _common_io_options(disasm)
+    _add_thread_arg(disasm)
     disasm.add_argument("location", nargs="?", help="Function name, address, or omit for current PC")
     disasm.add_argument("--count", type=int, help="Number of instructions")
+    disasm.add_argument("--start", help="Range start address (use with --end)")
+    disasm.add_argument("--end", help="Range end address (exclusive; use with --start)")
+    disasm.add_argument("--source", action="store_true", help="Interleave source lines (GDB /s)")
     disasm.set_defaults(handler=_disasm)
+
+    # --- examine ---
+    examine = subparsers.add_parser("examine", help="Examine memory GDB-style (x/NFU)")
+    _common_io_options(examine)
+    _add_thread_arg(examine)
+    examine.add_argument("address", help="Address or expression to examine")
+    examine.add_argument("--spec", help="Raw GDB format spec, e.g. '8xw', '3i', 's'")
+    examine.add_argument("--count", type=int, help="Number of units")
+    examine.add_argument("--fmt", dest="x_format", metavar="F",
+                         help="GDB format letter (x,d,u,o,t,a,c,f,s,i,z)")
+    examine.add_argument("--size", choices=("b", "h", "w", "g"), help="Unit size")
+    examine.set_defaults(handler=_examine)
 
     # --- functions ---
     funcs = subparsers.add_parser("functions", help="List or search functions")

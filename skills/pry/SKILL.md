@@ -146,15 +146,19 @@ pry step [count]             # Step into (source-level)
 pry next [count]             # Step over (source-level)
 pry stepi                    # Step into (instruction-level)
 pry nexti                    # Step over (instruction-level)
-pry finish                   # Run until current function returns
+pry finish                   # Run until current function returns (reports return value)
 pry until main.c:42          # Run until a specific location
+pry jump main.c:42           # Resume execution at a location (GDB jump)
 pry interrupt                # Interrupt a running inferior
 pry status                   # Check if inferior is running or stopped
 pry wait                     # Wait for a background exec to stop
 pry threads                  # List threads with selected frame info
 pry threads --pc 0x401400    # Filter threads stopped at an exact PC
 pry threads --function worker  # Filter by current frame function substring
+pry thread select 3          # Make thread 3 the persistently selected one
 ```
+
+`pry finish` reports the function's return value as `return value: ...` (x86-64 integer/pointer returns; void/float/struct are omitted). Most inspection commands accept `--thread N` to run against a specific thread without persistently switching (the prior selection is restored); use `pry thread select N` to switch persistently.
 
 Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
 
@@ -170,7 +174,13 @@ pry logs -n 20               # Just the last 20 lines
 pry logs --instance 12345    # A specific session
 ```
 
-Note: libc line-buffers stdout when not a TTY, so output may be withheld until a flush, a newline, or normal exit — a program that crashes mid-line may show nothing.
+Execution commands also accept `--output` to print any new session output (inferior stdout/stderr plus GDB messages) produced during the command, so you can act and check output in one step:
+
+```bash
+pry continue --output        # Continue, then print new output to stderr
+```
+
+Note: libc line-buffers stdout when not a TTY, so output may be withheld until a flush, a newline, or normal exit — a program that crashes mid-line may show nothing. `--output` surfaces whatever has actually been written.
 
 ### Background execution
 
@@ -197,6 +207,9 @@ Execution commands report the **stop reason** when available:
 - `reason: breakpoint #1 hit` — stopped at a breakpoint
 - `reason: watchpoint #2 (buf) hit` — watchpoint triggered
 - `reason: signal SIGSEGV` — received a signal
+- `reason: step` — a step/next/finish/until completed normally
+
+`pry status` and `pry wait` carry the same `reason`, so you can always ask "why is it stopped?" after a background exec or poll.
 
 ## Breakpoint Management
 
@@ -208,7 +221,7 @@ pry break set *0x1234 --rebase myprog       # PIE: offset from module load base 
 pry break set main --condition "argc > 1"   # Conditional breakpoint
 pry break set main --temporary              # One-shot breakpoint
 pry break set *0x401000 --hardware          # Hardware breakpoint (read-only/remote/kernel memory)
-pry break list                              # List all breakpoints
+pry break list                              # List all breakpoints (shows thread/ignore/condition; catchpoints show their "what")
 pry break delete 1                          # Delete breakpoint #1
 pry break enable 1                          # Enable breakpoint #1
 pry break disable 1                         # Disable breakpoint #1
@@ -266,12 +279,15 @@ pry backtrace                    # Stack backtrace
 pry backtrace --full             # Backtrace with local variables
 pry backtrace --limit 5          # Limit to 5 frames
 pry frame info                   # Current frame info
-pry frame select 3               # Select frame #3
+pry frame select 3               # Select frame #3 (absolute)
+pry frame up                     # Move toward callers (up [N])
+pry frame down                   # Move toward callees (down [N])
 pry locals                       # Local variables
 pry args                         # Function arguments
+pry locals --thread 3            # Any of these can target a specific thread
 pry print argc                   # Evaluate expression
 pry print "sizeof(struct foo)"   # Evaluate C expression
-pry print "malloc(0x100)"        # Inferior function call (runs in the target)
+pry call 'fn(1, "x")'            # Call an inferior function, return its value
 pry registers                    # General-purpose registers
 pry registers --all              # All registers (including FP/SIMD)
 pry registers write rip 0x401234 # Set a register ($pc/$rsp/etc.; leading $ optional)
@@ -280,7 +296,15 @@ pry mappings --contains 0x7ffff7d00000   # Mapping that holds an address
 pry mappings --name libc         # Mappings whose objfile matches a substring
 ```
 
-`pry print "expr"` evaluates C expressions, and when `expr` is a call it runs **inside the inferior** (e.g. `pry print 'malloc(0x100)'` to shape the heap). A watchpoint stop reports the value change as `old -> new` (rendered in the session's output radix — hex by default under pwndbg, e.g. `0x6 -> 0xa`). After the inferior exits, `pry print` reads the static binary image (not live memory) and flags the result with a `note`. `pry disasm` annotates each instruction with its `symbol+offset`.
+**Auto-display:** register expressions that are re-evaluated and attached to every stop result (and shown in `pry status` while stopped):
+
+```bash
+pry display add "head->id"       # Show this on every stop
+pry display list                 # List displays with current values
+pry display remove 1             # Stop showing display #1
+```
+
+`pry print "expr"` evaluates C expressions, and when `expr` is a call it runs **inside the inferior** (e.g. `pry print 'malloc(0x100)'` to shape the heap; `pry call` is a dedicated verb for the same thing). A watchpoint stop reports the value change as `old -> new` (rendered in the session's output radix — hex by default under pwndbg, e.g. `0x6 -> 0xa`). After the inferior exits, `pry print` reads the static binary image (not live memory) and flags the result with a `note`. `pry disasm` annotates each instruction with its `symbol+offset`.
 
 ## Memory Access
 
@@ -300,6 +324,11 @@ pry memory write 0x7fffffffe000 deadbeef       # Write hex bytes
 ```bash
 pry disasm main                  # Disassemble function
 pry disasm 0x401000 --count 20  # Disassemble 20 instructions from address
+pry disasm --start main --end main+32   # Disassemble an explicit address range
+pry disasm main --source         # Interleave source lines (GDB /s)
+pry examine '$rsp' --spec 8xw    # GDB-style examine (x/8xw): 8 words in hex
+pry examine '$pc' --spec 3i      # Examine as instructions (x/3i)
+pry examine &buf --count 16 --fmt x --size b   # Build the spec from parts
 pry functions                    # List all functions
 pry functions --query main       # Search functions
 pry symbols --query errno        # Search global symbols/variables
