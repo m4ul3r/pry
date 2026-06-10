@@ -388,6 +388,9 @@ def _render_stop_text(value: Any) -> str:
     thread = value.get("thread")
     if thread is not None:
         parts.append(f"thread: {thread}")
+    return_value = value.get("return_value")
+    if return_value is not None:
+        parts.append(f"return value: {return_value}")
     return "\n".join(parts)
 
 

@@ -618,6 +618,12 @@ class GdbBridge:
         self._has_run = False
         self._background_completion: threading.Event | None = None
         self._background_result: dict[str, Any] | None = None
+        # Set by _finish just before running `finish` so the stop handler can
+        # recover the return value: the frame that is finishing (to confirm it
+        # actually returned vs. stopping at an intervening breakpoint) and its
+        # return type (to cast the ABI return register).
+        self._finish_frame = None
+        self._finish_ret_type = None
         gdb.events.stop.connect(self._on_stop)
         if hasattr(gdb.events, "exited"):
             gdb.events.exited.connect(self._on_exited)
@@ -1065,6 +1071,12 @@ class GdbBridge:
                 reason = {"kind": "signal", "signal": event.stop_signal}
             if reason:
                 result["reason"] = reason
+            # For `finish`, recover the function's return value now that the
+            # inferior is genuinely stopped (reading registers mid-run fails).
+            if op == "finish":
+                rv = self._finish_return_value()
+                if rv is not None:
+                    result["return_value"] = rv
             result_box.append(result)
             completion.set()
 
@@ -1648,8 +1660,71 @@ class GdbBridge:
     def _nexti(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._exec_and_stop("nexti")
 
-    def _finish(self, params: dict[str, Any]) -> dict[str, Any]:
+    # Type codes whose return value lives in the integer ABI register and can
+    # be cast straight from it (the common, useful cases).
+    def _int_return_type_codes(self):
+        codes = []
+        for attr in ("TYPE_CODE_INT", "TYPE_CODE_PTR", "TYPE_CODE_ENUM",
+                     "TYPE_CODE_BOOL", "TYPE_CODE_CHAR"):
+            val = getattr(gdb, attr, None)
+            if val is not None:
+                codes.append(val)
+        return tuple(codes)
+
+    def _finish(self, params: dict[str, Any]) -> Any:
+        # Record the finishing frame and its return type so the stop handler
+        # can recover the return value (GDB's "Value returned is $N" text is
+        # swallowed by to_string under some pretty-printers, and registers
+        # can't be read until the inferior actually stops).
+        self._finish_frame = None
+        self._finish_ret_type = None
+        try:
+            frame = gdb.selected_frame()
+            self._finish_frame = frame
+            func = frame.function()
+            if func is not None:
+                self._finish_ret_type = func.type.target()
+        except Exception:
+            self._finish_frame = None
+            self._finish_ret_type = None
         return self._exec_and_stop("finish")
+
+    def _finish_return_value(self) -> str | None:
+        """Recover the value the just-finished function returned.
+
+        Called from the exec stop handler, where the inferior is stopped. Reads
+        the integer ABI return register and casts it to the captured return
+        type. Best-effort and x86-64-only for now; returns None for void,
+        non-integer (float/struct) returns, unknown types, or other arches, or
+        if the frame did not actually return (e.g. we stopped at an intervening
+        breakpoint), so a bogus value is never reported.
+        """
+        frame = self._finish_frame
+        ret_type = self._finish_ret_type
+        self._finish_frame = None
+        self._finish_ret_type = None
+        if frame is None or ret_type is None:
+            return None
+        try:
+            # If the finishing frame is still valid, it didn't actually return
+            # (we stopped earlier) — don't fabricate a return value.
+            if frame.is_valid():
+                return None
+        except Exception:
+            return None
+        try:
+            stripped = ret_type.strip_typedefs()
+            if stripped.code == getattr(gdb, "TYPE_CODE_VOID", object()):
+                return None
+            if stripped.code not in self._int_return_type_codes():
+                return None  # float/struct returns need ABI-specific handling
+            arch = gdb.selected_frame().architecture().name() or ""
+            if "x86-64" not in arch:
+                return None  # integer return register is arch-specific
+            val = gdb.parse_and_eval("$rax").cast(ret_type)
+            return str(val)
+        except Exception:
+            return None
 
     def _until(self, params: dict[str, Any]) -> dict[str, Any]:
         location = params["location"]

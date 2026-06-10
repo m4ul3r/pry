@@ -1343,6 +1343,33 @@ def test_parse_disassemble_output(monkeypatch):
     assert rows[1]["symbol"] == "main+4"
 
 
+def test_finish_return_value_void_and_missing(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    # No finishing frame captured -> nothing to report.
+    bridge._finish_frame = None
+    bridge._finish_ret_type = None
+    assert bridge._finish_return_value() is None
+
+
+def test_finish_return_value_skips_when_frame_still_valid(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    class _Frame:
+        def is_valid(self):
+            return True  # frame didn't actually return (stopped early)
+
+    class _Type:
+        def strip_typedefs(self):
+            return self
+
+    bridge._finish_frame = _Frame()
+    bridge._finish_ret_type = _Type()
+    # Must not fabricate a value when the frame is still on the stack.
+    assert bridge._finish_return_value() is None
+
+
 def test_disasm_fallback_returns_list(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
 
