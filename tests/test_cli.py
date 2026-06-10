@@ -421,7 +421,7 @@ def test_bridge_error_reports_to_stderr(monkeypatch, capsys):
     # step/next/etc. all call send_request which calls choose_instance
     rc = pry.cli.main(["step"])
 
-    assert rc == 0
+    assert rc == 1
     stderr = capsys.readouterr().err
     assert "No running GDB bridge" in stderr
 
@@ -658,7 +658,7 @@ def test_skill_install_custom_dest_reports_error_when_destination_exists(tmp_pat
 
     rc = pry.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)])
 
-    assert rc == 0
+    assert rc == 1
     assert "Destination already exists" in capsys.readouterr().err
 
 
@@ -667,9 +667,38 @@ def test_launch_gdb_not_found(monkeypatch, capsys):
 
     rc = pry.cli.main(["launch"])
 
-    assert rc == 0
+    assert rc == 1
     stderr = capsys.readouterr().err
     assert "gdb not found" in stderr.lower()
+
+
+def test_launch_pry_flag_after_binary_errors(monkeypatch, capsys):
+    # gdb IS present, so we get past the which() check and into arg handling.
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+
+    rc = pry.cli.main(["launch", "./bin", "--format", "json"])
+
+    assert rc == 1
+    stderr = capsys.readouterr().err.lower()
+    assert "--format" in stderr
+    assert "before the binary" in stderr
+
+
+def test_launch_double_dash_passes_gdb_args(monkeypatch, capsys):
+    # A leading `--` means everything after is a genuine GDB arg, not a pry
+    # flag — the leaked-flag guard must not fire.
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+
+    def _boom(*a, **k):
+        raise AssertionError("reached subprocess.Popen — guard wrongly passed")
+
+    # We only care that the guard doesn't raise; stop before actually spawning.
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _boom)
+
+    with pytest.raises(AssertionError, match="reached subprocess.Popen"):
+        pry.cli.main(["launch", "./bin", "--", "--format", "json"])
 
 
 def test_kill_no_session(monkeypatch, capsys):
@@ -677,7 +706,7 @@ def test_kill_no_session(monkeypatch, capsys):
 
     rc = pry.cli.main(["kill"])
 
-    assert rc == 0
+    assert rc == 1
     stderr = capsys.readouterr().err
     assert "no running" in stderr.lower()
 
@@ -718,7 +747,7 @@ def test_kill_ambiguous_instances(monkeypatch, capsys, tmp_path):
 
     rc = pry.cli.main(["kill"])
 
-    assert rc == 0
+    assert rc == 1
     stderr = capsys.readouterr().err
     assert "multiple" in stderr.lower()
     assert "111" in stderr
@@ -948,8 +977,11 @@ def test_py_exec_with_timeout(monkeypatch, capsys):
     rc = pry.cli.main(["py", "exec", "--code", "pass", "--timeout", "60"])
 
     assert rc == 0
+    # The bridge-side timeout is exactly what the user asked for...
     assert captured["params"]["_timeout"] == 60.0
-    assert captured["timeout"] == 60.0
+    # ...but the transport waits longer so the bridge has time to interrupt a
+    # runaway script and return its structured error before the socket gives up.
+    assert captured["timeout"] == 70.0
 
 
 # ---------------------------------------------------------------------------
@@ -1429,7 +1461,7 @@ def test_logs_json_envelope(monkeypatch, capsys, tmp_path):
 def test_logs_no_session(monkeypatch, capsys):
     monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
     rc = pry.cli.main(["logs"])
-    assert rc == 0
+    assert rc == 1
     assert "No running GDB session" in capsys.readouterr().err
 
 
@@ -1522,10 +1554,10 @@ def test_types_show_text_includes_offsets(monkeypatch, capsys):
 # Edge-case hardening (adversarial hunt fixes)
 # ---------------------------------------------------------------------------
 
-def test_out_to_bad_path_exits_zero_with_error(monkeypatch, capsys, tmp_path):
+def test_out_to_bad_path_exits_nonzero_with_error(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
     rc = pry.cli.main(["doctor", "--out", str(tmp_path)])  # tmp_path is a directory
-    assert rc == 0  # always-exit-0 contract holds
+    assert rc == 1  # command failures exit non-zero so agents can gate on $?
     err = capsys.readouterr().err
     assert "cannot write output" in err
 
@@ -1539,3 +1571,35 @@ def test_mappings_filter_no_match_message(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "no mappings match --name libxyz" in out
+
+
+def test_render_backtrace_full_shows_locals():
+    frames = [
+        {
+            "level": 0,
+            "address": "0x401234",
+            "function": "main",
+            "file": "buffer_walk.c",
+            "line": 22,
+            "args": [{"name": "argc", "value": "0x1"}],
+            "locals": [
+                {"name": "argc", "value": "0x1", "is_argument": True},
+                {"name": "i", "value": "0x0", "is_argument": False},
+                {"name": "shared", "value": "0x9", "is_argument": False},
+            ],
+        }
+    ]
+    text = pry.cli._render_backtrace_text(frames)
+    # Arguments stay in the (...) header; non-argument locals render beneath.
+    assert "#0 0x401234 in main at buffer_walk.c:22 (argc=0x1)" in text
+    assert "    i = 0x0" in text
+    assert "    shared = 0x9" in text
+    # argc appears once (as an arg in the header), not duplicated as a local.
+    assert text.count("argc") == 1
+
+
+def test_doctor_instance_not_found_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    rc = pry.cli.main(["--instance", "424242", "doctor"])
+    assert rc == 1
+    assert "424242" in capsys.readouterr().err

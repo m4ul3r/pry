@@ -647,6 +647,15 @@ def _render_backtrace_text(value: Any) -> str:
             if arg_strs:
                 entry += f" ({', '.join(arg_strs)})"
         lines.append(entry)
+        # With --full, each frame carries a "locals" list (which also includes
+        # arguments, flagged is_argument). Render the non-argument locals
+        # indented beneath the frame; arguments already appear in (...) above.
+        locs = frame.get("locals")
+        if locs:
+            for loc in locs:
+                if not isinstance(loc, dict) or loc.get("is_argument"):
+                    continue
+                lines.append(f"    {loc.get('name', '?')} = {loc.get('value', '?')}")
     return "\n".join(lines)
 
 
@@ -998,14 +1007,26 @@ def _doctor(args: argparse.Namespace) -> int:
     source_bridge = source_dir / "bridge.py"
     install_build_id = build_id_for_file(install_bridge)
     source_build_id = build_id_for_file(source_bridge)
+
+    target_pid = getattr(args, "instance", None)
+    discovered = list_instances()
+    if target_pid is not None:
+        discovered = [i for i in discovered if i.pid == target_pid]
+        if not discovered:
+            raise BridgeError(f"No running GDB bridge instance with pid {target_pid}")
+
     instances = []
-    for instance in list_instances():
+    for instance in discovered:
         ping: dict[str, Any]
         try:
+            # Bound the probe so one wedged/unresponsive bridge can't hang the
+            # whole health check (the connect may succeed while the bridge's
+            # GDB thread is stuck and never replies).
             response = _send_request_to_instance(
                 instance,
                 "doctor",
                 params={},
+                timeout=5.0,
             )
             ping = response["result"]
         except Exception as exc:
@@ -1237,8 +1258,26 @@ def _launch(args: argparse.Namespace) -> int:
     gdb_cmd.extend(["-ex", shell_off_ex, "-ex", keepalive_ex, "-ex", bridge_ex])
 
     gdb_extra = args.gdb_args or []
+    explicit_separator = "--" in getattr(args, "_raw_argv", [])
     if gdb_extra and gdb_extra[0] == "--":
-        gdb_extra = gdb_extra[1:]
+        gdb_extra = gdb_extra[1:]  # defensive: a second, literal `--`
+    elif gdb_extra and not explicit_separator:
+        # Without an explicit `--` separator, anything after the binary is
+        # forwarded to GDB. A pry option placed there (e.g.
+        # `pry launch ./bin --format json`) would silently leak to GDB and
+        # break the launch. Catch the common case with an actionable message.
+        _pry_flags = {
+            "--format", "--out", "--instance", "--timeout",
+            "--symbols", "--connect",
+        }
+        first = gdb_extra[0].split("=", 1)[0]
+        if first in _pry_flags:
+            raise BridgeError(
+                f"'{gdb_extra[0]}' is a pry option but appears after the binary, "
+                f"so it would be forwarded to GDB. Put pry options before the "
+                f"binary (e.g. `pry launch {first} ... <binary>`), or separate "
+                f"GDB args with `--` (e.g. `pry launch <binary> -- <gdb-args>`)."
+            )
     gdb_cmd.extend(gdb_extra)
 
     _instances_dir().mkdir(parents=True, exist_ok=True)
@@ -2040,6 +2079,12 @@ def _py_exec(args: argparse.Namespace) -> int:
 
     timeout = getattr(args, "timeout", None)
     params: dict[str, Any] = {"code": source}
+    # Give the transport longer than the bridge-side timeout: on a runaway
+    # script the bridge waits _timeout, then spends up to ~5s injecting an
+    # interrupt and unwinding before it can send its structured error. If the
+    # socket gave up at exactly _timeout the agent would see an opaque
+    # transport timeout instead of the actionable bridge message.
+    transport_timeout = (timeout + 10) if timeout is not None else None
     if timeout is not None:
         params["_timeout"] = timeout
     return _call(
@@ -2048,7 +2093,7 @@ def _py_exec(args: argparse.Namespace) -> int:
         params,
         text_renderer=_render_py_exec_text,
         stem="py_exec",
-        timeout=timeout,
+        timeout=transport_timeout,
     )
 
 
@@ -2542,7 +2587,13 @@ def _emit_error(args: argparse.Namespace, message: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
+    # argparse strips the first `--` separator, so by parse time we can no
+    # longer tell `launch ./bin --format json` (a misplaced pry flag) from
+    # `launch ./bin -- --format json` (a genuine GDB arg). Stash the raw argv
+    # so _launch can check whether a `--` was actually given.
+    args._raw_argv = raw_argv
     # Reconcile the two --instance positions: subcommand-level value wins when
     # set; otherwise fall back to the global one.
     if getattr(args, "instance", None) is None:
@@ -2556,7 +2607,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        handler(args)
+        rc = handler(args)
     except BridgeError as exc:
         _emit_error(args, str(exc))
-    return 0
+        return 1
+    return rc if isinstance(rc, int) else 0

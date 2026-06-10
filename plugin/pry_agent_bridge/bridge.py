@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import base64
 import contextlib
+import ctypes
 import errno
 import json
 import os
@@ -11,6 +12,7 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -360,27 +362,76 @@ def _parse_info_variables(output: str) -> list[dict[str, Any]]:
 # GDB thread safety: post work to GDB's event loop
 # ---------------------------------------------------------------------------
 
+# Identity of the thread that runs GDB's event loop (and thus every posted
+# callback). Captured on first callback so a timed-out runaway can be
+# interrupted by injecting an async exception into that exact thread.
+_gdb_main_thread_ident: int | None = None
+
+
+class _AsyncTimeout(Exception):
+    """Injected into the GDB main thread to break a timed-out runaway.
+
+    A regular Exception (not KeyboardInterrupt) so it is caught by the same
+    ``except Exception`` paths as any other op error and reported cleanly,
+    rather than escaping into the socket server and dropping the connection.
+    """
+
+    def __str__(self) -> str:
+        return (
+            "operation exceeded its timeout and was interrupted "
+            "(a runaway loop in `py exec`?)"
+        )
+
+
+def _async_raise(thread_ident: int | None, exc_type: type) -> bool:
+    """Inject *exc_type* into the thread with *thread_ident* (best-effort).
+
+    Uses CPython's PyThreadState_SetAsyncExc: the interpreter raises the
+    exception in that thread between bytecode instructions. This breaks a
+    runaway *Python* loop (e.g. a `while True` in `py exec`), but cannot
+    preempt a thread blocked in C (e.g. inside a long GDB operation) — the
+    exception is delivered only once control returns to Python bytecode.
+    """
+    if thread_ident is None:
+        return False
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(thread_ident), ctypes.py_object(exc_type)
+    )
+    if res > 1:
+        # More than one thread was affected (shouldn't happen): undo it.
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_ident), None)
+        return False
+    return res == 1
+
+
 def _run_on_gdb_thread(func, *, timeout: float = 120.0):
     """Execute *func* on GDB's main thread via gdb.post_event and wait."""
     holder: dict[str, Any] = {}
     event = threading.Event()
 
     def _callback():
+        global _gdb_main_thread_ident
+        _gdb_main_thread_ident = threading.get_ident()
         try:
             holder["result"] = func()
-        except Exception as exc:
+        except BaseException as exc:  # noqa: BLE001 — also catch injected _AsyncTimeout
             holder["error"] = exc
             holder["traceback"] = traceback.format_exc()
         event.set()
 
     gdb.post_event(_callback)
-    event.wait(timeout=timeout)
+    if not event.wait(timeout=timeout):
+        # The callback is still running on GDB's main thread and would wedge
+        # the bridge indefinitely (e.g. an infinite loop in `py exec`). Try to
+        # break a runaway Python loop, then give it a short grace period to
+        # unwind so the bridge stays responsive for subsequent commands.
+        _async_raise(_gdb_main_thread_ident, _AsyncTimeout)
+        if not event.wait(timeout=5.0):
+            raise RuntimeError(
+                f"Timed out waiting for GDB main thread after {timeout:.0f}s "
+                "(the operation may still be running in GDB)"
+            )
 
-    if not event.is_set():
-        raise RuntimeError(
-            f"Timed out waiting for GDB main thread after {timeout:.0f}s "
-            "(the operation may still be running in GDB)"
-        )
     if "error" in holder:
         raise holder["error"]
     return holder.get("result")
@@ -890,7 +941,17 @@ class GdbBridge:
             )
         if "error" in holder:
             return _json_response(ok=False, error=holder["error"])
-        return _json_response(ok=True, result={"interrupted": True})
+
+        # The "interrupt" command only *requests* a stop; the SIGINT is
+        # delivered and the stop event fires shortly after. Wait briefly for
+        # the stop handler to clear _running so an immediately-following
+        # `status` reflects "stopped" rather than a transient "running".
+        deadline = time.monotonic() + 2.0
+        while self._running and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return _json_response(
+            ok=True, result={"interrupted": True, "stopped": not self._running}
+        )
 
     def _dispatch_status(self) -> dict[str, Any]:
         """Return the inferior's current execution state (lock-free)."""
@@ -2288,6 +2349,13 @@ class GdbBridge:
         try:
             sys.stdout = captured
             exec(code, exec_globals)
+        except Exception as exc:
+            # Surface the full traceback (file/line of the failing user code),
+            # not just "Type: message" — multi-line scripts are otherwise very
+            # hard to debug. format_exc() already ends with the type+message.
+            raise RuntimeError(
+                "py exec failed:\n" + traceback.format_exc().rstrip()
+            ) from exc
         finally:
             sys.stdout = old_stdout
 
