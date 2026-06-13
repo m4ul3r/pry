@@ -439,6 +439,20 @@ def test_print_fmt_invalid_rejected(capsys):
     assert "q" in capsys.readouterr().err
 
 
+def test_py_exec_missing_script_clean_error(monkeypatch, capsys, tmp_path):
+    sent = {"called": False}
+
+    def fake(op, **kw):
+        sent["called"] = True
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake)
+    rc = pry.cli.main(["py", "exec", "--script", str(tmp_path / "nope.py")])
+    assert rc == 1
+    assert "cannot read --script" in capsys.readouterr().err.lower()
+    assert sent["called"] is False  # never reached the bridge
+
+
 def test_py_exec_sends_code(monkeypatch, capsys):
     captured = {}
 
