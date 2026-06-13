@@ -2249,8 +2249,22 @@ class GdbBridge:
 
     def _print(self, params: dict[str, Any]) -> dict[str, Any]:
         expression = params["expression"]
+        fmt = params.get("format")
+        # Accept GDB muscle-memory `print /x expr` (format embedded in the
+        # expression) in addition to the explicit `--fmt` param.
+        if not fmt:
+            m = re.match(r"\s*/([a-zA-Z])\b\s*(.+)", expression)
+            if m:
+                fmt, expression = m.group(1), m.group(2)
         val = gdb.parse_and_eval(expression)
-        result: dict[str, Any] = {"value": str(val)}
+        if fmt:
+            try:
+                rendered = val.format_string(format=fmt)
+            except Exception:
+                rendered = str(val)
+        else:
+            rendered = str(val)
+        result: dict[str, Any] = {"value": rendered}
         try:
             result["type"] = str(val.type)
         except Exception:

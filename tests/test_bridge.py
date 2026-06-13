@@ -451,6 +451,39 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_print_format_letter(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    seen = {}
+
+    class _V:
+        type = "int"
+
+        def __str__(self):
+            return "255"
+
+        def format_string(self, format=None):
+            seen["fmt"] = format
+            return {"x": "0xff", "t": "11111111"}.get(format, "?")
+
+    def _eval(expr):
+        seen["expr"] = expr
+        return _V()
+
+    monkeypatch.setattr(fake_gdb, "parse_and_eval", _eval)
+
+    # Explicit --fmt param.
+    r = bridge._print({"expression": "v", "format": "x"})
+    assert r["value"] == "0xff"
+    assert seen["fmt"] == "x"
+
+    # GDB muscle-memory `print /t expr`: format extracted, expression stripped.
+    r2 = bridge._print({"expression": "/t v"})
+    assert r2["value"] == "11111111"
+    assert seen["expr"] == "v"
+    assert seen["fmt"] == "t"
+
+
 def test_memory_write_bad_hex_is_actionable(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
