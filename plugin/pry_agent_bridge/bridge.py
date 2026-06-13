@@ -1823,6 +1823,21 @@ class GdbBridge:
     def _connect(self, params: dict[str, Any]) -> dict[str, Any]:
         target = params["target"]
         timeout = int(params.get("connect_timeout", 15))
+        # `target remote` discards the current inferior *before* it tries the
+        # new connection, so connecting while already debugging a program
+        # destroys that session even if the connect then fails. Refuse if an
+        # inferior is already live (the remote workflow connects from a bare
+        # `pry launch`, which has none).
+        if self._inferior_is_live():
+            try:
+                cur = gdb.selected_inferior().pid
+            except Exception:
+                cur = "?"
+            raise RuntimeError(
+                f"already debugging an inferior (pid {cur}); connecting would "
+                f"discard it. Use a separate `pry launch` session for {target}, "
+                f"or `pry kill` / let the current inferior exit first."
+            )
         self._last_stop_reason = None
         gdb.execute(f"set tcp connect-timeout {timeout}", to_string=True)
         gdb.execute(f"target remote {target}", to_string=True)
