@@ -451,6 +451,18 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_truncate_value(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    t = bridge_mod._truncate_value
+    assert t("short") == "short"
+    assert t("x" * 2048) == "x" * 2048  # exactly at the cap: untouched
+    big = "x" * 10000
+    out = t(big)
+    assert len(out) < len(big)
+    assert out.startswith("x" * 2048)
+    assert "truncated" in out and "10000" in out
+
+
 def test_print_format_letter(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()

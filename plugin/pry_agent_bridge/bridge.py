@@ -631,6 +631,22 @@ def _breakpoint_to_dict(bp) -> dict[str, Any]:
     return result
 
 
+# In a *bulk* listing (locals/args/backtrace --full) each value should be a
+# preview, not a full dump. GDB's STL pretty-printers will render hundreds of
+# junk elements for an *uninitialized* container (e.g. a std::vector at function
+# entry reporting a bogus length, ~3KB+ of garbage pointers) — one such value
+# shouldn't dominate the listing. The cap is generous enough for a real struct/
+# container; `pry print <name>` (token-spilled when huge) gives the full value.
+_MAX_VALUE_CHARS = 2048
+
+
+def _truncate_value(s: str) -> str:
+    if len(s) > _MAX_VALUE_CHARS:
+        return (s[:_MAX_VALUE_CHARS]
+                + f"… <value truncated, {len(s)} chars; use `pry print` for the full value>")
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
@@ -2106,7 +2122,7 @@ class GdbBridge:
                         for sym in block:
                             if sym.is_variable or sym.is_argument:
                                 try:
-                                    val = str(frame.read_var(sym))
+                                    val = _truncate_value(str(frame.read_var(sym)))
                                 except Exception:
                                     val = "<unavailable>"
                                 local_vars.append({
@@ -2129,7 +2145,7 @@ class GdbBridge:
                     for sym in block:
                         if sym.is_argument:
                             try:
-                                val = str(frame.read_var(sym))
+                                val = _truncate_value(str(frame.read_var(sym)))
                             except Exception:
                                 val = "<unavailable>"
                             arg_list.append({"name": sym.name, "value": val})
@@ -2187,7 +2203,7 @@ class GdbBridge:
                 for sym in block:
                     if sym.is_variable and not sym.is_argument:
                         try:
-                            val = str(frame.read_var(sym))
+                            val = _truncate_value(str(frame.read_var(sym)))
                         except Exception:
                             val = "<unavailable>"
                         entry: dict[str, Any] = {
@@ -2215,7 +2231,7 @@ class GdbBridge:
                 for sym in block:
                     if sym.is_argument:
                         try:
-                            val = str(frame.read_var(sym))
+                            val = _truncate_value(str(frame.read_var(sym)))
                         except Exception:
                             val = "<unavailable>"
                         entry: dict[str, Any] = {
