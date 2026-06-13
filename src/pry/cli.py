@@ -2168,9 +2168,20 @@ def _disasm(args: argparse.Namespace) -> int:
     )
 
 
+_EXAMINE_SPEC_LETTERS = set("xduotacfsizbhwg")  # GDB x/ format + size letters
+
+
 def _examine(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"address": args.address}
     if getattr(args, "spec", None):
+        # Catch a malformed --spec before GDB does — its raw error ("Undefined
+        # output format 'e'" for `--spec garbage`) is baffling.
+        letters = [c for c in args.spec.strip() if not c.isdigit()]
+        if len(letters) > 2 or any(c not in _EXAMINE_SPEC_LETTERS for c in letters):
+            raise BridgeError(
+                f"invalid examine spec {args.spec!r} — expected [count][format][size] "
+                f"like '8xw' or '3i' (format: x d u o t a c f s i z; size: b h w g)"
+            )
         params["spec"] = args.spec
     else:
         if getattr(args, "count", None) is not None:
@@ -2860,6 +2871,7 @@ def build_parser() -> argparse.ArgumentParser:
     examine.add_argument("--spec", help="Raw GDB format spec, e.g. '8xw', '3i', 's'")
     examine.add_argument("--count", type=int, help="Number of units")
     examine.add_argument("--fmt", dest="x_format", metavar="F",
+                         choices=("x", "d", "u", "o", "t", "a", "c", "f", "s", "i", "z"),
                          help="GDB format letter (x,d,u,o,t,a,c,f,s,i,z)")
     examine.add_argument("--size", choices=("b", "h", "w", "g"), help="Unit size")
     examine.set_defaults(handler=_examine)

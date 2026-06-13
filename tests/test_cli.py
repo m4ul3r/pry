@@ -1708,6 +1708,25 @@ def test_examine_builds_spec_from_parts(monkeypatch, capsys):
     assert cap["params"] == {"address": "$rsp", "count": 8, "format": "x", "size": "w"}
 
 
+def test_examine_invalid_spec_rejected(monkeypatch, capsys):
+    rc = pry.cli.main(["examine", "$pc", "--spec", "garbage"])
+    assert rc == 1
+    assert "invalid examine spec" in capsys.readouterr().err.lower()
+
+
+def test_examine_valid_spec_accepted(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"text": "", "lines": []})
+    rc = pry.cli.main(["examine", "$pc", "--spec", "8xw"])
+    assert rc == 0
+    assert cap["params"]["spec"] == "8xw"
+
+
+def test_examine_invalid_fmt_rejected(capsys):
+    with pytest.raises(SystemExit):
+        pry.cli.main(["examine", "$pc", "--fmt", "q"])
+    assert "q" in capsys.readouterr().err
+
+
 def test_examine_raw_spec(monkeypatch, capsys):
     cap = _capture_send(monkeypatch, result={"text": "", "lines": []})
     pry.cli.main(["examine", "0x1000", "--spec", "3i"])

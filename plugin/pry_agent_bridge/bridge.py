@@ -2460,7 +2460,19 @@ class GdbBridge:
         else:
             addr_int = int(address)
 
-        data = bytes.fromhex(value)
+        cleaned = value.strip()
+        if cleaned[:2].lower() == "0x":
+            cleaned = cleaned[2:]
+        try:
+            data = bytes.fromhex(cleaned)
+        except ValueError:
+            # bytes.fromhex raises an opaque "non-hexadecimal number found ...
+            # at position N" for both bad characters and odd length. Replace it
+            # with something an agent can act on.
+            raise ValueError(
+                f"invalid hex bytes: {value!r} — provide an even number of hex "
+                f"digits (e.g. 'deadbeef' or 'de ad be ef'), no '0x' needed"
+            )
         inf = gdb.selected_inferior()
         inf.write_memory(addr_int, data)
         return {"written": len(data), "address": hex(addr_int)}
