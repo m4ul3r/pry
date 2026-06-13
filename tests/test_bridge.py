@@ -922,6 +922,8 @@ def test_looks_like_function_name(monkeypatch):
 def test_connect_executes_target_remote(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
+    # The remote workflow connects from a bare session (no live inferior).
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
 
     result = bridge._dispatch_op("connect", {"target": "localhost:1234"})
     assert result["connected"] == "localhost:1234"
@@ -933,15 +935,30 @@ def test_connect_executes_target_remote(monkeypatch):
 def test_connect_custom_timeout(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
 
     result = bridge._dispatch_op("connect", {"target": "localhost:1234", "connect_timeout": 5})
     assert result["connected"] == "localhost:1234"
     assert "set tcp connect-timeout 5" in fake_gdb._execute_log
 
 
+def test_connect_refuses_when_inferior_live(monkeypatch):
+    # `target remote` discards the current inferior before connecting, so a
+    # connect while debugging would destroy that session — refuse instead.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=4321)
+    executed = []
+    fake_gdb.execute = lambda cmd, to_string=False: executed.append(cmd)
+    with pytest.raises(RuntimeError, match="already debugging"):
+        bridge._connect({"target": "localhost:1234"})
+    assert not any("target remote" in c for c in executed)
+
+
 def test_connect_clears_stop_reason(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)  # bare session
 
     # Set a stale stop reason
     fake_gdb.events.stop.fire(fake_gdb._FakeSignalEvent("SIGINT"))
