@@ -1467,10 +1467,15 @@ class GdbBridge:
         if tid is None:
             return self._run_op(op, params)
         prev = None
+        prev_frame = None
         try:
             prev = gdb.selected_thread()
+            # Switching threads resets the selected frame to 0, so capture the
+            # caller's frame too — otherwise a `--thread` inspection silently
+            # clobbers a prior `pry frame select`.
+            prev_frame = gdb.selected_frame()
         except Exception:
-            prev = None
+            pass
         gdb.execute(f"thread {int(tid)}", to_string=True)
         try:
             return self._run_op(op, params)
@@ -1478,6 +1483,8 @@ class GdbBridge:
             if prev is not None:
                 with contextlib.suppress(Exception):
                     prev.switch()
+                    if prev_frame is not None:
+                        prev_frame.select()
 
     def _run_op(self, op: str, params: dict[str, Any]) -> Any:
         if op == "doctor":
