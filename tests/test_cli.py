@@ -566,6 +566,34 @@ def test_memory_read_plain_does_not_change_json_payload(monkeypatch, capsys):
     assert payload["data"] == "41424344"
 
 
+def test_install_tree_idempotent_symlink(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "marker").write_text("x")
+    dest = tmp_path / "dest"
+
+    created = pry.cli._install_tree(source, dest, mode="symlink", force=False)
+    assert created is True
+    assert dest.is_symlink()
+
+    # Re-installing the exact same symlink is a no-op, not an error.
+    again = pry.cli._install_tree(source, dest, mode="symlink", force=False)
+    assert again is False
+    assert dest.is_symlink()
+
+
+def test_install_tree_conflicting_dest_errors(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    dest = tmp_path / "dest"
+    dest.symlink_to(other)  # already points somewhere else
+
+    with pytest.raises(pry.cli.BridgeError, match="already exists"):
+        pry.cli._install_tree(source, dest, mode="symlink", force=False)
+
+
 def test_skill_install_copy_mode(tmp_path):
     destination = tmp_path / "skill-copy"
 

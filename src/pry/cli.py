@@ -1219,15 +1219,24 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0
 
 
-def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
+def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> bool:
+    """Install *source* at *dest*. Returns True if it created the install, or
+    False when the exact symlink already existed (an idempotent no-op)."""
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists() or dest.is_symlink():
+        # Idempotent: re-installing the exact symlink we'd create is a no-op,
+        # not an error — so `pry plugin install` can be re-run safely.
+        if (mode == "symlink" and dest.is_symlink()
+                and os.path.realpath(dest) == os.path.realpath(source)):
+            return False
         if not force:
-            raise BridgeError(f"Destination already exists: {dest}")
+            raise BridgeError(
+                f"Destination already exists: {dest}. Pass --force to replace it."
+            )
         if dest.is_symlink() or dest.is_file():
             dest.unlink()
         else:
@@ -1237,6 +1246,7 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         shutil.copytree(source, dest)
     else:
         os.symlink(source, dest, target_is_directory=True)
+    return True
 
 
 def _check_install_destination(dest: Path, *, force: bool) -> None:
@@ -1249,7 +1259,7 @@ def _check_install_destination(dest: Path, *, force: bool) -> None:
 def _plugin_install(args: argparse.Namespace) -> int:
     source = plugin_source_dir()
     dest = args.dest or plugin_install_dir()
-    _install_tree(source, dest, mode=args.mode, force=args.force)
+    created = _install_tree(source, dest, mode=args.mode, force=args.force)
 
     gdbinit_snippet = (
         "python\n"
@@ -1261,6 +1271,7 @@ def _plugin_install(args: argparse.Namespace) -> int:
 
     result: dict[str, Any] = {
         "installed": True,
+        "already_present": not created,
         "mode": args.mode,
         "source": str(source),
         "destination": str(dest),

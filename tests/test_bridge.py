@@ -780,6 +780,20 @@ def test_dispatch_exec_no_stop_event(monkeypatch):
     assert response["ok"] is True
     result = response["result"]
     assert result["status"] == "stopped"
+    # A plain step/next/until/finish completion reports reason: step in its own
+    # result, consistent with the permanent handler and `status`/`wait`.
+    assert result["reason"] == {"kind": "step"}
+
+
+def test_looks_like_function_name(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    f = bridge_mod.GdbBridge._looks_like_function_name
+    assert f("main") is True
+    assert f("sum_ids") is True
+    assert f("file.c:42") is False   # file:line
+    assert f("*0x401000") is False   # address
+    assert f("42") is False          # bare line number
+    assert f("") is False
 
 
 def test_connect_executes_target_remote(monkeypatch):
