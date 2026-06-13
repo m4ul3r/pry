@@ -921,6 +921,24 @@ class GdbBridge:
         except Exception as exc:
             return _json_response(ok=False, error=self._augment_error(exc))
 
+    @staticmethod
+    def _ptrace_hint() -> str:
+        """Actionable hint for the most common `pry attach` failure."""
+        scope = None
+        try:
+            with open("/proc/sys/kernel/yama/ptrace_scope") as fh:
+                scope = fh.read().strip()
+        except Exception:
+            pass
+        msg = ("ptrace not permitted — the target must be a child of this "
+               "process or you need CAP_SYS_PTRACE")
+        if scope and scope != "0":
+            msg += (f"; kernel.yama.ptrace_scope is {scope}, relax it with "
+                    f"`sudo sysctl kernel.yama.ptrace_scope=0` or run GDB as root")
+        else:
+            msg += "; try running GDB as root"
+        return msg
+
     def _augment_error(self, exc: Exception) -> str:
         """Turn a raw GDB/Python error into an agent-actionable message.
 
@@ -960,6 +978,8 @@ class GdbBridge:
             )
         elif low.startswith("cannot access memory at address"):
             hint = "address not mapped — check `pry mappings` for valid ranges"
+        elif "ptrace" in low and "not permitted" in low:
+            hint = self._ptrace_hint()
         if hint:
             return f"{base} ({hint})"
         return base
@@ -1961,6 +1981,10 @@ class GdbBridge:
         condition = params.get("condition")
         if condition:
             bp.condition = condition
+
+        ignore = params.get("ignore")
+        if ignore is not None:
+            bp.ignore_count = int(ignore)
 
         result = _breakpoint_to_dict(bp)
         if rebased_meta:

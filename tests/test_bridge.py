@@ -451,6 +451,21 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_augment_error_ptrace_hint(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    out = bridge._augment_error(Exception("ptrace: Operation not permitted."))
+    assert "ptrace not permitted" in out
+    assert "CAP_SYS_PTRACE" in out
+
+
+def test_break_set_ignore_count(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    result = bridge._dispatch_op("break_set", {"location": "main", "ignore": 3})
+    assert result["ignore"] == 3
+
+
 def test_breakpoint_dict_includes_resolved_location(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     loc = types.SimpleNamespace(

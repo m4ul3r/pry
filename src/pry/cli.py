@@ -690,6 +690,9 @@ def _render_breakpoint_set_text(value: Any) -> str:
     cond = value.get("condition")
     if cond:
         parts.append(f"if {cond}")
+    ignore = value.get("ignore")
+    if ignore:
+        parts.append(f"(ignore {ignore})")
     rebased = value.get("rebased")
     if isinstance(rebased, dict):
         parts.append(f"(rebased from {rebased.get('offset', '?')} in {rebased.get('module', '?')})")
@@ -1922,6 +1925,8 @@ def _break_set(args: argparse.Namespace) -> int:
         params["temporary"] = True
     if args.hardware:
         params["hardware"] = True
+    if getattr(args, "ignore", None) is not None:
+        params["ignore"] = args.ignore
     rebase = getattr(args, "rebase", None)
     if rebase:
         params["rebase_module"] = rebase
@@ -2685,6 +2690,7 @@ def build_parser() -> argparse.ArgumentParser:
     brk_set.add_argument("--condition", help="Conditional expression")
     brk_set.add_argument("--temporary", action="store_true", help="Temporary breakpoint (deleted on hit)")
     brk_set.add_argument("--hardware", action="store_true", help="Hardware breakpoint")
+    brk_set.add_argument("--ignore", type=int, metavar="N", help="Skip the next N hits before stopping")
     brk_set.add_argument("--rebase", metavar="MODULE", help="Treat location as offset from MODULE's load base (PIE/ASLR rebasing)")
     brk_set.add_argument("--image-base", type=lambda x: int(x, 0), default=0, metavar="ADDR",
                           help="Static image base to subtract (default: 0x0)")

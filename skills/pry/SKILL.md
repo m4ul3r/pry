@@ -220,6 +220,7 @@ pry break set *0x401000                     # Break at address
 pry break set *0x1234 --rebase myprog       # PIE: offset from module load base (see PIE/ASLR rebasing)
 pry break set main --condition "argc > 1"   # Conditional breakpoint
 pry break set main --temporary              # One-shot breakpoint
+pry break set main --ignore 5               # Skip the next 5 hits before stopping
 pry break set *0x401000 --hardware          # Hardware breakpoint (read-only/remote/kernel memory)
 pry break list                              # List all breakpoints (shows thread/ignore/condition; catchpoints show their "what")
 pry break delete 1                          # Delete breakpoint #1

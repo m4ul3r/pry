@@ -1802,6 +1802,17 @@ def test_render_display_list_text():
     assert pry.cli._render_display_list_text([]) == "no displays"
 
 
+def test_break_set_ignore_plumbed_and_rendered(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={
+        "number": 1, "kind": "breakpoint", "location": "main",
+        "enabled": True, "ignore": 3,
+    })
+    rc = pry.cli.main(["break", "set", "main", "--ignore", "3"])
+    assert rc == 0
+    assert cap["params"]["ignore"] == 3
+    assert "(ignore 3)" in capsys.readouterr().out
+
+
 def test_render_breakpoint_set_shows_resolved_location():
     value = {
         "number": 1, "kind": "breakpoint", "location": "main", "enabled": True,
