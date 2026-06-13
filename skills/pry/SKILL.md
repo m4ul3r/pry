@@ -288,6 +288,8 @@ pry args                         # Function arguments
 pry locals --thread 3            # Any of these can target a specific thread
 pry print argc                   # Evaluate expression
 pry print "sizeof(struct foo)"   # Evaluate C expression
+pry print argc --fmt x           # Format the value (GDB print/F): x d u o t a c f s z
+pry print "/x flags"             # GDB muscle-memory `print /x expr` also works
 pry call 'fn(1, "x")'            # Call an inferior function, return its value
 pry registers                    # General-purpose registers
 pry registers --all              # All registers (including FP/SIMD)

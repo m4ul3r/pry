@@ -2037,10 +2037,13 @@ def _args(args: argparse.Namespace) -> int:
 
 
 def _print_expr(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"expression": args.expression}
+    if getattr(args, "p_format", None):
+        params["format"] = args.p_format
     return _call(
         args,
         "print",
-        {"expression": args.expression},
+        params,
         text_renderer=_render_print_text,
         stem="print",
     )
@@ -2802,6 +2805,9 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(print_cmd)
     _add_thread_arg(print_cmd)
     print_cmd.add_argument("expression", help="Expression to evaluate")
+    print_cmd.add_argument("--fmt", dest="p_format", metavar="F",
+                           choices=("x", "d", "u", "o", "t", "a", "c", "f", "s", "z"),
+                           help="GDB print format letter (x,d,u,o,t,a,c,f,s,z), like print/F")
     print_cmd.set_defaults(handler=_print_expr)
 
     # --- call ---

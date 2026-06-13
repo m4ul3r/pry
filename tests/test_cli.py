@@ -426,6 +426,19 @@ def test_bridge_error_reports_to_stderr(monkeypatch, capsys):
     assert "No running GDB bridge" in stderr
 
 
+def test_print_fmt_plumbed(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"value": "0xff", "type": "int"})
+    rc = pry.cli.main(["print", "argc", "--fmt", "x"])
+    assert rc == 0
+    assert cap["params"]["format"] == "x"
+
+
+def test_print_fmt_invalid_rejected(capsys):
+    with pytest.raises(SystemExit):
+        pry.cli.main(["print", "argc", "--fmt", "q"])
+    assert "q" in capsys.readouterr().err
+
+
 def test_py_exec_sends_code(monkeypatch, capsys):
     captured = {}
 
