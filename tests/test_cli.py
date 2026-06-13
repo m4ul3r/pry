@@ -544,6 +544,24 @@ def test_memory_read_text_includes_address_by_default(monkeypatch, capsys):
     assert capsys.readouterr().out == "0x401000: 41424344\n"
 
 
+def test_memory_read_nonpositive_count_rejected(monkeypatch, capsys):
+    # Must fail fast before reaching GDB (which leaks a raw OverflowError on a
+    # negative length and an opaque message on zero).
+    sent = {"called": False}
+
+    def fake_send_request(op, **kwargs):
+        sent["called"] = True
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    for bad in ("0", "-4"):
+        rc = pry.cli.main(["memory", "read", "0x1000", bad])
+        assert rc == 1
+        assert "positive integer" in capsys.readouterr().err.lower()
+    assert sent["called"] is False
+
+
 def test_memory_read_plain_text_prints_data_only(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         assert op == "memory_read"
