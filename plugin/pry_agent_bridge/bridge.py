@@ -1831,6 +1831,21 @@ class GdbBridge:
         return info
 
     def _disconnect(self, params: dict[str, Any]) -> dict[str, Any]:
+        # `disconnect` is for remote targets. On a local (native) inferior GDB
+        # detaches/kills the process — silently destroying the session while
+        # reporting success. Refuse unless we're actually on a remote target.
+        conn_type = None
+        try:
+            conn = gdb.selected_inferior().connection
+            conn_type = getattr(conn, "type", None)
+        except Exception:
+            conn_type = None
+        if conn_type is not None and conn_type not in ("remote", "extended-remote"):
+            raise RuntimeError(
+                f"not connected to a remote target (current connection: "
+                f"{conn_type}); `disconnect` is for remote/gdbserver targets — "
+                f"use `pry kill` to end a local session"
+            )
         gdb.execute("disconnect", to_string=True)
         return {"disconnected": True}
 
