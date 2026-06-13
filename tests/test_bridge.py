@@ -961,6 +961,32 @@ def test_disconnect_executes_disconnect_command(monkeypatch):
     assert "disconnect" in fake_gdb._execute_log
 
 
+def test_disconnect_refuses_on_local_target(monkeypatch):
+    # `disconnect` on a native (local) inferior would detach/kill it, silently
+    # destroying the session. It must refuse without issuing the command.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    native = types.SimpleNamespace(type="native")
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(connection=native)
+    executed = []
+    fake_gdb.execute = lambda cmd, to_string=False: executed.append(cmd)
+    with pytest.raises(RuntimeError, match="not connected to a remote target"):
+        bridge._disconnect({})
+    assert "disconnect" not in executed
+
+
+def test_disconnect_allowed_on_remote_target(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    remote = types.SimpleNamespace(type="remote")
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(connection=remote)
+    executed = []
+    fake_gdb.execute = lambda cmd, to_string=False: executed.append(cmd)
+    res = bridge._disconnect({})
+    assert res["disconnected"] is True
+    assert "disconnect" in executed
+
+
 def test_target_info_returns_raw_output(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
