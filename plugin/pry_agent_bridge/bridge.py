@@ -2678,7 +2678,10 @@ class GdbBridge:
     def _display_add(self, params: dict[str, Any]) -> dict[str, Any]:
         expr = params["expression"]
         self._display_counter += 1
-        entry = {"number": self._display_counter, "expr": expr}
+        entry: dict[str, Any] = {"number": self._display_counter, "expr": expr}
+        fmt = params.get("format")
+        if fmt:
+            entry["format"] = fmt
         self._displays.append(entry)
         return dict(entry)
 
@@ -2698,8 +2701,10 @@ class GdbBridge:
         out: list[dict[str, Any]] = []
         for d in self._displays:
             entry: dict[str, Any] = {"number": d["number"], "expr": d["expr"]}
+            fmt = d.get("format")
             try:
-                entry["value"] = str(gdb.parse_and_eval(d["expr"]))
+                val = gdb.parse_and_eval(d["expr"])
+                entry["value"] = val.format_string(format=fmt) if fmt else str(val)
             except Exception as exc:
                 # Surface *why* it couldn't be evaluated (typically out of scope
                 # in the current frame) instead of a bare "<error>", so an agent

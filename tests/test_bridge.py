@@ -1579,6 +1579,28 @@ def test_display_add_list_remove(monkeypatch):
         bridge._display_remove({"number": 99})
 
 
+def test_display_add_with_format(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    entry = bridge._display_add({"expression": "head", "format": "x"})
+    assert entry["format"] == "x"
+
+    seen = {}
+
+    class _V:
+        def format_string(self, format=None):
+            seen["fmt"] = format
+            return "0x2a"
+
+        def __str__(self):
+            return "42"
+
+    monkeypatch.setattr(fake_gdb, "parse_and_eval", lambda e: _V())
+    listed = bridge._display_list({})
+    assert listed[0]["value"] == "0x2a"
+    assert seen["fmt"] == "x"
+
+
 def test_display_eval_error_shows_reason(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
