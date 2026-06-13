@@ -768,14 +768,19 @@ def test_launch_double_dash_passes_gdb_args(monkeypatch, capsys, tmp_path):
     binary = tmp_path / "bin"  # real file so binary validation passes
     binary.write_text("")
 
-    def _boom(*a, **k):
-        raise AssertionError("reached subprocess.Popen — guard wrongly passed")
+    reached = {"popen": False}
 
-    # We only care that the guard doesn't raise; stop before actually spawning.
-    monkeypatch.setattr(pry.cli.subprocess, "Popen", _boom)
+    def _record(*a, **k):
+        reached["popen"] = True
+        raise RuntimeError("stop before real spawn")
 
-    with pytest.raises(AssertionError, match="reached subprocess.Popen"):
-        pry.cli.main(["launch", str(binary), "--", "--format", "json"])
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _record)
+
+    rc = pry.cli.main(["launch", str(binary), "--", "--format", "json"])
+    # The guard did NOT fire (a BridgeError before Popen), so execution reached
+    # Popen; the RuntimeError there is rendered cleanly by main's backstop.
+    assert reached["popen"] is True
+    assert rc == 1
 
 
 def test_launch_missing_binary_errors(monkeypatch, capsys, tmp_path):
@@ -1958,6 +1963,20 @@ def test_version_flag(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "pry" in out and pry.cli.VERSION in out
+
+
+def test_main_renders_unexpected_handler_error(monkeypatch, capsys):
+    # A handler raising a non-BridgeError must be rendered cleanly (rc 1), never
+    # dumped as a raw Python traceback.
+    def _boom(args):
+        raise ValueError("kaboom")
+
+    monkeypatch.setattr(pry.cli, "_doctor", _boom)
+    rc = pry.cli.main(["doctor"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "kaboom" in err
+    assert "Traceback" not in err
 
 
 def test_break_delete_multiple(monkeypatch, capsys):
