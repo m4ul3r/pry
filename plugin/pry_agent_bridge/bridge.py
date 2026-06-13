@@ -1765,8 +1765,36 @@ class GdbBridge:
             result["base"] = hex(self._parse_addr(base))
         return result
 
+    @staticmethod
+    def _pid_exists(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists, just not ours
+        return True
+
     def _attach(self, params: dict[str, Any]) -> dict[str, Any]:
         pid = int(params["pid"])
+        # Attaching is destructive: GDB detaches/kills the current inferior
+        # *before* it tries the new attach, so a typo'd or dead PID would
+        # silently nuke a live session. Guard both: refuse if already debugging,
+        # and verify the target exists first — neither touches current state.
+        if self._inferior_is_live():
+            try:
+                cur = gdb.selected_inferior().pid
+            except Exception:
+                cur = "?"
+            raise RuntimeError(
+                f"already debugging an inferior (pid {cur}); attaching would "
+                f"discard it. Use a separate `pry launch` session for pid {pid}, "
+                f"or `pry kill` / let the current inferior exit first."
+            )
+        if not self._pid_exists(pid):
+            raise RuntimeError(f"no such process: pid {pid} is not running")
         self._last_stop_reason = None
         gdb.execute(f"attach {pid}", to_string=True)
         info = self._stop_info()
