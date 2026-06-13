@@ -185,6 +185,13 @@ def _nonneg_int(s: str) -> int:
     return v
 
 
+def _positive_float(s: str) -> float:
+    v = float(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds, got {v}")
+    return v
+
+
 def _add_paged_args(parser: argparse.ArgumentParser) -> None:
     # Non-positive values used to flow straight into Python slicing: `--limit
     # -1` became result[:-1] (dumped all-but-last → a huge spill) and `--limit
@@ -2490,7 +2497,7 @@ def _trace(args: argparse.Namespace) -> int:
 def _add_timeout_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=_positive_float,
         default=None,
         help="Override transport timeout in seconds (default: 30)",
     )
@@ -2987,13 +2994,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_timeout_arg(trace_cmd)
     trace_cmd.add_argument("--watch", required=True, metavar="ADDR",
                            help="Memory address to watch (hex)")
-    trace_cmd.add_argument("--watch-size", type=int, default=4, metavar="N",
+    trace_cmd.add_argument("--watch-size", type=_positive_int, default=4, metavar="N",
                            help="Number of bytes to watch (default: 4)")
     trace_cmd.add_argument("--range", required=True, metavar="START-END",
                            help="Code address range (e.g., 0x404610-0x405e30)")
     trace_cmd.add_argument("--type", choices=("write", "read", "access"), default="access",
                            dest="watch_type", help="Watch type (default: access)")
-    trace_cmd.add_argument("--max-hits", type=int, default=10000, metavar="N",
+    trace_cmd.add_argument("--max-hits", type=_positive_int, default=10000, metavar="N",
                            help="Maximum number of hits to record (default: 10000)")
     trace_cmd.set_defaults(handler=_trace)
 
