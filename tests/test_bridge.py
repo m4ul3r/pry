@@ -451,6 +451,57 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_breakpoint_dict_includes_resolved_location(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    loc = types.SimpleNamespace(
+        address=0x401445, source=("workshop.c", 75), function="main"
+    )
+    base = dict(
+        number=1, enabled=True, location="main", expression=None, condition=None,
+        hit_count=0, temporary=False, pending=False, thread=None, ignore_count=0,
+        locations=[loc],
+    )
+    bp = types.SimpleNamespace(type=fake_gdb.BP_BREAKPOINT, **base)
+    d = bridge_mod._breakpoint_to_dict(bp)
+    assert d["address"] == "0x401445"
+    assert d["file"] == "workshop.c"
+    assert d["line"] == 75
+    assert d["function"] == "main"
+
+    # Watchpoints are not code locations — the resolved fields must be omitted
+    # even if a location object is present.
+    wp = types.SimpleNamespace(type=fake_gdb.BP_WATCHPOINT, **base)
+    dw = bridge_mod._breakpoint_to_dict(wp)
+    assert "address" not in dw
+
+
+def test_break_delete_multiple(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    a = bridge._dispatch_op("break_set", {"location": "main"})["number"]
+    b = bridge._dispatch_op("break_set", {"location": "foo"})["number"]
+
+    result = bridge._dispatch_op("break_delete", {"numbers": [a, b]})
+    assert result["deleted"] == [a, b]
+    assert {it["number"] for it in result["items"]} == {a, b}
+
+    bp_list = bridge._dispatch_op("break_list", {})
+    assert not any(bp["number"] in (a, b) for bp in bp_list)
+
+
+def test_break_delete_missing_number_reports_it(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    a = bridge._dispatch_op("break_set", {"location": "main"})["number"]
+    with pytest.raises(ValueError, match="#999"):
+        bridge._dispatch_op("break_delete", {"numbers": [a, 999]})
+    # The valid breakpoint must survive a batch that names a missing one.
+    bp_list = bridge._dispatch_op("break_list", {})
+    assert any(bp["number"] == a for bp in bp_list)
+
+
 def test_break_enable_disable(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
@@ -1444,6 +1495,22 @@ def test_status_not_started_vs_exited(monkeypatch):
     bridge._has_run = True  # simulate a run that has since exited
     resp2 = bridge.dispatch({"op": "status", "params": {}})
     assert resp2["result"]["state"] == "exited"
+
+
+def test_status_reports_exit_code(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    fake_gdb.selected_thread = lambda: None
+    bridge = bridge_mod.GdbBridge()
+    bridge._has_run = True
+
+    # The exited event records the code on the bridge.
+    fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(42))
+
+    result = bridge.dispatch({"op": "status", "params": {}})["result"]
+    assert result["state"] == "exited"
+    assert result["exit_code"] == 42
+    assert result["reason"] == {"kind": "exited", "code": 42}
 
 
 def test_register_write_while_running_says_interrupt(monkeypatch):

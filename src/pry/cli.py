@@ -429,6 +429,9 @@ def _format_stop_reason(reason: Any) -> str | None:
     if kind == "signal":
         sig = reason.get("signal", "unknown")
         return f"signal {sig}"
+    if kind == "exited":
+        code = reason.get("code")
+        return f"exited (code {code})" if code is not None else "exited"
     return kind or None
 
 
@@ -502,6 +505,11 @@ def _render_status_text(value: Any) -> str:
         thread = value.get("thread")
         if thread is not None:
             parts.append(f"thread: {thread}")
+        displays = value.get("displays")
+        if isinstance(displays, list) and displays:
+            for d in displays:
+                if isinstance(d, dict):
+                    parts.append(f"  display #{d.get('number')}: {d.get('expr')} = {d.get('value')}")
     return "\n".join(parts)
 
 
@@ -667,6 +675,14 @@ def _render_breakpoint_set_text(value: Any) -> str:
     noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
     enabled = "enabled" if value.get("enabled") else "disabled"
     parts = [f"{noun} #{num} set {prep} {target} [{enabled}]"]
+    addr = value.get("address")
+    if addr:
+        where = f"@ {addr}"
+        f = value.get("file")
+        line = value.get("line")
+        if f and line is not None:
+            where += f" {f}:{line}"
+        parts.append(where)
     if value.get("pending"):
         parts.append("(pending — location not yet resolved)")
     if value.get("temporary"):
@@ -683,10 +699,18 @@ def _render_breakpoint_set_text(value: Any) -> str:
 def _render_breakpoint_delete_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    num = value.get("deleted", "?")
-    # break/watch share a number space; name the deleted object correctly.
-    noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
-    return f"{noun} #{num} deleted"
+
+    def _noun(kind: Any) -> str:
+        # break/watch share a number space; name the deleted object correctly.
+        return "watchpoint" if "watchpoint" in (kind or "") else "breakpoint"
+
+    items = value.get("items")
+    if isinstance(items, list) and items:
+        return "\n".join(
+            f"{_noun(it.get('kind'))} #{it.get('number')} deleted"
+            for it in items if isinstance(it, dict)
+        )
+    return f"{_noun(value.get('kind'))} #{value.get('deleted', '?')} deleted"
 
 
 def _render_breakpoint_state_text(value: Any) -> str:
@@ -1363,8 +1387,26 @@ def _launch(args: argparse.Namespace) -> int:
     plugin_parent = _resolve_plugin_path()
 
     gdb_cmd: list[str] = ["gdb", "-q"]
+    resolved_binary: str | None = None
     if args.binary:
-        gdb_cmd.append(str(Path(args.binary).expanduser().resolve()))
+        binary_path = Path(args.binary).expanduser().resolve()
+        # Validate before spawning: GDB happily starts with a missing/invalid
+        # binary and lazily complains ("No executable file specified") only when
+        # you try to run, so the bridge would come up and `launch` would report
+        # success for a session that is actually dead. Fail fast instead.
+        if not binary_path.exists():
+            raise BridgeError(
+                f"Binary not found: {args.binary} (resolved to {binary_path}). "
+                f"The path is relative to the current directory ({Path.cwd()}); "
+                f"pass an absolute path or check the spelling."
+            )
+        if not binary_path.is_file():
+            raise BridgeError(
+                f"Not a file: {args.binary} (resolved to {binary_path}). "
+                f"Pass a path to an executable file, not a directory."
+            )
+        resolved_binary = str(binary_path)
+        gdb_cmd.append(resolved_binary)
 
     # Self-pipe: GDB holds its own stdin writer open so it never sees EOF
     read_fd, write_fd = os.pipe()
@@ -1470,8 +1512,8 @@ def _launch(args: argparse.Namespace) -> int:
         "socket_path": str(socket_path),
         "log_path": str(log_path),
     }
-    if args.binary:
-        result["binary"] = str(Path(args.binary).expanduser().resolve())
+    if resolved_binary is not None:
+        result["binary"] = resolved_binary
 
     # Post-launch: load symbols and/or connect to remote target
     from .transport import BridgeInstance
@@ -1888,7 +1930,11 @@ def _break_list(args: argparse.Namespace) -> int:
 
 
 def _break_delete(args: argparse.Namespace) -> int:
-    return _call(args, "break_delete", {"number": args.number}, text_renderer=_render_breakpoint_delete_text, stem="break_delete")
+    numbers = args.number if isinstance(args.number, list) else [args.number]
+    # Keep the single-delete wire shape ({"number": N}) for backward
+    # compatibility; only switch to the batch shape when more than one is given.
+    params = {"number": numbers[0]} if len(numbers) == 1 else {"numbers": numbers}
+    return _call(args, "break_delete", params, text_renderer=_render_breakpoint_delete_text, stem="break_delete")
 
 
 def _break_enable(args: argparse.Namespace) -> int:
@@ -2387,6 +2433,10 @@ def _add_timeout_arg(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = PryArgumentParser(prog="pry", description="Agent-friendly GDB CLI")
     parser.set_defaults(handler=None)
+    parser.add_argument(
+        "--version", action="version", version=f"pry {_package_version()}",
+        help="Print the pry version and exit",
+    )
     # Global --instance: accepted before the subcommand so `pry --instance PID
     # <cmd>` matches the form shown throughout the README/SKILL docs. The
     # subcommand-level --instance is still accepted and wins when both are set.
@@ -2633,9 +2683,9 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(brk_list)
     brk_list.set_defaults(handler=_break_list)
 
-    brk_delete = brk_sub.add_parser("delete", help="Delete a breakpoint")
+    brk_delete = brk_sub.add_parser("delete", help="Delete one or more breakpoints")
     _common_io_options(brk_delete)
-    brk_delete.add_argument("number", type=int, help="Breakpoint number")
+    brk_delete.add_argument("number", type=int, nargs="+", help="Breakpoint number(s)")
     brk_delete.set_defaults(handler=_break_delete)
 
     brk_enable = brk_sub.add_parser("enable", help="Enable a breakpoint")
@@ -2661,9 +2711,9 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(watch_list)
     watch_list.set_defaults(handler=_break_list)
 
-    watch_delete = watch_sub.add_parser("delete", help="Delete a watchpoint")
+    watch_delete = watch_sub.add_parser("delete", help="Delete one or more watchpoints")
     _common_io_options(watch_delete)
-    watch_delete.add_argument("number", type=int, help="Watchpoint number")
+    watch_delete.add_argument("number", type=int, nargs="+", help="Watchpoint number(s)")
     watch_delete.set_defaults(handler=_break_delete)
 
     watch_enable = watch_sub.add_parser("enable", help="Enable a watchpoint")

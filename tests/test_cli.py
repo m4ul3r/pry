@@ -672,12 +672,14 @@ def test_launch_gdb_not_found(monkeypatch, capsys):
     assert "gdb not found" in stderr.lower()
 
 
-def test_launch_pry_flag_after_binary_errors(monkeypatch, capsys):
+def test_launch_pry_flag_after_binary_errors(monkeypatch, capsys, tmp_path):
     # gdb IS present, so we get past the which() check and into arg handling.
     monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
     monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+    binary = tmp_path / "bin"  # real file so binary validation passes
+    binary.write_text("")
 
-    rc = pry.cli.main(["launch", "./bin", "--format", "json"])
+    rc = pry.cli.main(["launch", str(binary), "--format", "json"])
 
     assert rc == 1
     stderr = capsys.readouterr().err.lower()
@@ -685,11 +687,13 @@ def test_launch_pry_flag_after_binary_errors(monkeypatch, capsys):
     assert "before the binary" in stderr
 
 
-def test_launch_double_dash_passes_gdb_args(monkeypatch, capsys):
+def test_launch_double_dash_passes_gdb_args(monkeypatch, capsys, tmp_path):
     # A leading `--` means everything after is a genuine GDB arg, not a pry
     # flag — the leaked-flag guard must not fire.
     monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
     monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+    binary = tmp_path / "bin"  # real file so binary validation passes
+    binary.write_text("")
 
     def _boom(*a, **k):
         raise AssertionError("reached subprocess.Popen — guard wrongly passed")
@@ -698,7 +702,39 @@ def test_launch_double_dash_passes_gdb_args(monkeypatch, capsys):
     monkeypatch.setattr(pry.cli.subprocess, "Popen", _boom)
 
     with pytest.raises(AssertionError, match="reached subprocess.Popen"):
-        pry.cli.main(["launch", "./bin", "--", "--format", "json"])
+        pry.cli.main(["launch", str(binary), "--", "--format", "json"])
+
+
+def test_launch_missing_binary_errors(monkeypatch, capsys, tmp_path):
+    # A non-existent binary must fail fast (before spawning GDB), not come up as
+    # a dead session that reports success.
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+
+    def _boom(*a, **k):
+        raise AssertionError("should not spawn GDB for a missing binary")
+
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _boom)
+
+    rc = pry.cli.main(["launch", str(tmp_path / "does_not_exist")])
+
+    assert rc == 1
+    assert "not found" in capsys.readouterr().err.lower()
+
+
+def test_launch_binary_is_directory_errors(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+
+    def _boom(*a, **k):
+        raise AssertionError("should not spawn GDB for a directory")
+
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _boom)
+
+    rc = pry.cli.main(["launch", str(tmp_path)])  # a directory, not a file
+
+    assert rc == 1
+    assert "not a file" in capsys.readouterr().err.lower()
 
 
 def test_kill_no_session(monkeypatch, capsys):
@@ -1736,3 +1772,78 @@ def test_render_display_list_text():
     )
     assert "#2: argc = 0x1" in text
     assert pry.cli._render_display_list_text([]) == "no displays"
+
+
+def test_render_breakpoint_set_shows_resolved_location():
+    value = {
+        "number": 1, "kind": "breakpoint", "location": "main", "enabled": True,
+        "address": "0x401445", "file": "workshop.c", "line": 75,
+    }
+    text = pry.cli._render_breakpoint_set_text(value)
+    assert "@ 0x401445 workshop.c:75" in text
+
+
+def test_render_breakpoint_set_without_resolved_location():
+    # No address (e.g. older GDB or a pending bp) → no trailing "@ ...".
+    value = {"number": 1, "kind": "breakpoint", "location": "main", "enabled": True}
+    text = pry.cli._render_breakpoint_set_text(value)
+    assert "@" not in text
+
+
+def test_render_status_text_shows_displays():
+    # Displays are attached to the status payload while stopped; the text
+    # renderer must surface them too (not just JSON / the stop renderer).
+    value = {
+        "state": "stopped",
+        "frame": {"function": "main"},
+        "displays": [{"number": 1, "expr": "head->id", "value": "3"}],
+    }
+    text = pry.cli._render_status_text(value)
+    assert "display #1: head->id = 3" in text
+
+
+def test_format_stop_reason_exited_with_code():
+    assert pry.cli._format_stop_reason({"kind": "exited", "code": 0}) == "exited (code 0)"
+    assert pry.cli._format_stop_reason({"kind": "exited", "code": 42}) == "exited (code 42)"
+    # exited via signal carries no code
+    assert pry.cli._format_stop_reason({"kind": "exited"}) == "exited"
+
+
+def test_render_status_text_shows_exit_code():
+    value = {"state": "exited", "reason": {"kind": "exited", "code": 3}, "exit_code": 3}
+    text = pry.cli._render_status_text(value)
+    assert "state: exited" in text
+    assert "exited (code 3)" in text
+
+
+def test_version_flag(capsys):
+    with pytest.raises(SystemExit) as exc:
+        pry.cli.main(["--version"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "pry" in out and pry.cli.VERSION in out
+
+
+def test_break_delete_multiple(monkeypatch, capsys):
+    cap = _capture_send(
+        monkeypatch,
+        result={"deleted": [3, 4], "items": [
+            {"number": 3, "kind": "breakpoint"},
+            {"number": 4, "kind": "hw-watchpoint"},
+        ]},
+    )
+    rc = pry.cli.main(["break", "delete", "3", "4"])
+    assert rc == 0
+    assert cap["op"] == "break_delete"
+    assert cap["params"]["numbers"] == [3, 4]
+    out = capsys.readouterr().out
+    assert "breakpoint #3 deleted" in out
+    assert "watchpoint #4 deleted" in out
+
+
+def test_break_delete_single_keeps_legacy_shape(monkeypatch, capsys):
+    # A single id must still send {"number": N} (not a list) for backward compat.
+    cap = _capture_send(monkeypatch, result={"deleted": 3})
+    pry.cli.main(["break", "delete", "3"])
+    assert cap["params"] == {"number": 3}
+    assert "numbers" not in cap["params"]
