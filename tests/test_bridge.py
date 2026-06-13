@@ -518,6 +518,33 @@ def test_augment_error_ptrace_hint(monkeypatch):
     assert "CAP_SYS_PTRACE" in out
 
 
+def test_attach_refuses_when_inferior_live(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=4321)  # live
+    executed = []
+    fake_gdb.execute = lambda cmd, to_string=False: executed.append(cmd)
+    with pytest.raises(RuntimeError, match="already debugging"):
+        bridge._attach({"pid": 999999})
+    assert not executed  # never issued the destructive `attach`
+
+
+def test_attach_rejects_dead_pid(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)  # no live inferior
+
+    def _no_proc(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(bridge_mod.os, "kill", _no_proc)
+    executed = []
+    fake_gdb.execute = lambda cmd, to_string=False: executed.append(cmd)
+    with pytest.raises(RuntimeError, match="no such process"):
+        bridge._attach({"pid": 12345})
+    assert not executed
+
+
 def test_break_set_ignore_count(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
