@@ -451,6 +451,33 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_break_delete_multiple(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    a = bridge._dispatch_op("break_set", {"location": "main"})["number"]
+    b = bridge._dispatch_op("break_set", {"location": "foo"})["number"]
+
+    result = bridge._dispatch_op("break_delete", {"numbers": [a, b]})
+    assert result["deleted"] == [a, b]
+    assert {it["number"] for it in result["items"]} == {a, b}
+
+    bp_list = bridge._dispatch_op("break_list", {})
+    assert not any(bp["number"] in (a, b) for bp in bp_list)
+
+
+def test_break_delete_missing_number_reports_it(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    a = bridge._dispatch_op("break_set", {"location": "main"})["number"]
+    with pytest.raises(ValueError, match="#999"):
+        bridge._dispatch_op("break_delete", {"numbers": [a, 999]})
+    # The valid breakpoint must survive a batch that names a missing one.
+    bp_list = bridge._dispatch_op("break_list", {})
+    assert any(bp["number"] == a for bp in bp_list)
+
+
 def test_break_enable_disable(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()

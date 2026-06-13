@@ -1945,16 +1945,33 @@ class GdbBridge:
         return whats
 
     def _break_delete(self, params: dict[str, Any]) -> dict[str, Any]:
-        number = int(params["number"])
-        for bp in (gdb.breakpoints() or []):
-            if bp.number == number:
-                # Capture the kind before deleting so the response can name a
-                # watchpoint a "watchpoint" (break/watch share a number space).
-                kind = _bp_kind(bp.type)
-                bp.delete()
-                self._watchpoint_values.pop(number, None)
-                return {"deleted": number, "kind": kind}
-        raise ValueError(f"No breakpoint #{number}")
+        # Batch form: {"numbers": [...]}. Single form {"number": N} is kept for
+        # backward compatibility and returns the flat {"deleted": N} shape.
+        if "numbers" in params:
+            numbers = [int(n) for n in params["numbers"]]
+        else:
+            numbers = [int(params["number"])]
+
+        by_number = {bp.number: bp for bp in (gdb.breakpoints() or [])}
+        missing = [n for n in numbers if n not in by_number]
+        if missing:
+            raise ValueError(
+                "No breakpoint " + ", ".join(f"#{n}" for n in missing)
+            )
+
+        items = []
+        for n in numbers:
+            bp = by_number[n]
+            # Capture the kind before deleting so the response can name a
+            # watchpoint a "watchpoint" (break/watch share a number space).
+            kind = _bp_kind(bp.type)
+            bp.delete()
+            self._watchpoint_values.pop(n, None)
+            items.append({"number": n, "kind": kind})
+
+        if "numbers" not in params:
+            return {"deleted": items[0]["number"], "kind": items[0]["kind"]}
+        return {"deleted": [it["number"] for it in items], "items": items}
 
     def _break_enable(self, params: dict[str, Any]) -> dict[str, Any]:
         number = int(params["number"])
