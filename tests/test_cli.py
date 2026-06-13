@@ -1786,6 +1786,20 @@ def test_render_status_text_shows_displays():
     assert "display #1: head->id = 3" in text
 
 
+def test_format_stop_reason_exited_with_code():
+    assert pry.cli._format_stop_reason({"kind": "exited", "code": 0}) == "exited (code 0)"
+    assert pry.cli._format_stop_reason({"kind": "exited", "code": 42}) == "exited (code 42)"
+    # exited via signal carries no code
+    assert pry.cli._format_stop_reason({"kind": "exited"}) == "exited"
+
+
+def test_render_status_text_shows_exit_code():
+    value = {"state": "exited", "reason": {"kind": "exited", "code": 3}, "exit_code": 3}
+    text = pry.cli._render_status_text(value)
+    assert "state: exited" in text
+    assert "exited (code 3)" in text
+
+
 def test_version_flag(capsys):
     with pytest.raises(SystemExit) as exc:
         pry.cli.main(["--version"])

@@ -429,6 +429,9 @@ def _format_stop_reason(reason: Any) -> str | None:
     if kind == "signal":
         sig = reason.get("signal", "unknown")
         return f"signal {sig}"
+    if kind == "exited":
+        code = reason.get("code")
+        return f"exited (code {code})" if code is not None else "exited"
     return kind or None
 
 

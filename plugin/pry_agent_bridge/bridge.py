@@ -631,6 +631,10 @@ class GdbBridge:
         # Whether the inferior has ever started (run/attach/connect). Lets
         # status distinguish "not-started" from "exited" — both have pid 0.
         self._has_run = False
+        # Exit code of the most recent inferior exit (None if exited via signal
+        # or never exited). Surfaced by `status` so agents can read the code
+        # after the process is gone.
+        self._last_exit_code: int | None = None
         self._background_completion: threading.Event | None = None
         self._background_result: dict[str, Any] | None = None
         # Set by _finish just before running `finish` so the stop handler can
@@ -776,9 +780,10 @@ class GdbBridge:
         self._last_stop_reason = reason or {"kind": "step"}
 
     def _on_exited(self, event):
-        """GDB exited-event callback — clears stale stop reason."""
+        """GDB exited-event callback — clears stale stop reason, records code."""
         self._running = False
         self._last_stop_reason = None
+        self._last_exit_code = getattr(event, "exit_code", None)
 
     def _exec_and_stop(self, cmd: str) -> None:
         """Execute *cmd* on the GDB thread.
@@ -1004,6 +1009,12 @@ class GdbBridge:
             result.update(info)
             if self._last_stop_reason:
                 result["reason"] = self._last_stop_reason
+            if result["state"] == "exited":
+                # The process is gone; surface the exit code so agents can read
+                # it after the fact (None when it exited via a signal).
+                result["reason"] = {"kind": "exited", "code": self._last_exit_code}
+                if self._last_exit_code is not None:
+                    result["exit_code"] = self._last_exit_code
             if self._displays and result["state"] == "stopped":
                 result["displays"] = self._eval_displays()
         if self._background_result is not None:
@@ -1077,8 +1088,10 @@ class GdbBridge:
             )
 
         # The inferior is about to run; mark it so `status` can tell a later
-        # pid-0 state apart as "exited" rather than "not-started".
+        # pid-0 state apart as "exited" rather than "not-started". Clear any
+        # prior exit code so a new run doesn't report a stale one.
         self._has_run = True
+        self._last_exit_code = None
 
         completion = threading.Event()
         result_box: list[dict[str, Any]] = []

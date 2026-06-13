@@ -1473,6 +1473,22 @@ def test_status_not_started_vs_exited(monkeypatch):
     assert resp2["result"]["state"] == "exited"
 
 
+def test_status_reports_exit_code(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    fake_gdb.selected_thread = lambda: None
+    bridge = bridge_mod.GdbBridge()
+    bridge._has_run = True
+
+    # The exited event records the code on the bridge.
+    fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(42))
+
+    result = bridge.dispatch({"op": "status", "params": {}})["result"]
+    assert result["state"] == "exited"
+    assert result["exit_code"] == 42
+    assert result["reason"] == {"kind": "exited", "code": 42}
+
+
 def test_register_write_while_running_says_interrupt(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
 
