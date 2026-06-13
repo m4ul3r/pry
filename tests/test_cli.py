@@ -849,6 +849,39 @@ def test_kill_ambiguous_instances(monkeypatch, capsys, tmp_path):
     assert "222" in stderr
 
 
+def test_kill_nonexistent_instance_errors(monkeypatch, capsys, tmp_path):
+    from pry.transport import BridgeInstance
+
+    # A real instance exists, but the user names a different (dead) pid.
+    instance = BridgeInstance(pid=111, socket_path=tmp_path / "a.sock", registry_path=tmp_path / "a.json",
+                              plugin_name="pry_agent_bridge", plugin_version="0.1.0", started_at=None, meta={})
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [instance])
+    killed = []
+    monkeypatch.setattr(pry.cli, "_kill_instance", lambda pid: killed.append(pid))
+
+    rc = pry.cli.main(["kill", "--instance", "888888"])
+
+    assert rc == 1
+    assert "no running gdb bridge instance with pid 888888" in capsys.readouterr().err.lower()
+    assert killed == []  # must NOT falsely claim a kill
+
+
+def test_kill_valid_explicit_instance(monkeypatch, capsys, tmp_path):
+    from pry.transport import BridgeInstance
+
+    instance = BridgeInstance(pid=4321, socket_path=tmp_path / "a.sock", registry_path=tmp_path / "a.json",
+                              plugin_name="pry_agent_bridge", plugin_version="0.1.0", started_at=None, meta={})
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [instance])
+    killed = []
+    monkeypatch.setattr(pry.cli, "_kill_instance", lambda pid: killed.append(pid))
+
+    rc = pry.cli.main(["kill", "--instance", "4321"])
+
+    assert rc == 0
+    assert killed == [4321]
+    assert "4321" in capsys.readouterr().out
+
+
 def test_connect_sends_correct_op(monkeypatch, capsys):
     captured = {}
 

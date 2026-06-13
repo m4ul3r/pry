@@ -1597,6 +1597,12 @@ def _kill(args: argparse.Namespace) -> int:
                 f"Use --instance <pid> to select one, or 'pry kill --all'."
             )
         target_pid = instances[0].pid
+    else:
+        # Validate an explicit --instance so we don't falsely report "Killed"
+        # for a pid that was never a pry instance (os.kill silently no-ops a
+        # dead pid). Matches how every other command resolves --instance.
+        if not any(i.pid == target_pid for i in list_instances()):
+            raise BridgeError(f"No running GDB bridge instance with pid {target_pid}")
 
     _kill_instance(target_pid)
 
