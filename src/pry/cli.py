@@ -2224,10 +2224,13 @@ def _thread_select(args: argparse.Namespace) -> int:
 
 
 def _display_add(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"expression": args.expression}
+    if getattr(args, "p_format", None):
+        params["format"] = args.p_format
     return _call(
         args,
         "display_add",
-        {"expression": args.expression},
+        params,
         text_renderer=_render_display_add_text,
         stem="display_add",
     )
@@ -2616,6 +2619,9 @@ def build_parser() -> argparse.ArgumentParser:
     display_add = display_sub.add_parser("add", help="Register an expression to show on every stop")
     _common_io_options(display_add)
     display_add.add_argument("expression", help="Expression to auto-display")
+    display_add.add_argument("--fmt", dest="p_format", metavar="F",
+                             choices=("x", "d", "u", "o", "t", "a", "c", "f", "s", "z"),
+                             help="GDB format letter (x,d,u,o,t,a,c,f,s,z), like print/F")
     display_add.set_defaults(handler=_display_add)
     display_list = display_sub.add_parser("list", help="List (and evaluate) registered displays")
     _common_io_options(display_list)

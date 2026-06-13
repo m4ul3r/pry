@@ -1854,6 +1854,13 @@ def test_display_add_list_remove_ops(monkeypatch, capsys):
     assert cap["op"] == "display_add"
     assert cap["params"]["expression"] == "head"
 
+
+def test_display_add_fmt_plumbed(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"number": 1, "expr": "head", "format": "x"})
+    rc = pry.cli.main(["display", "add", "head", "--fmt", "x"])
+    assert rc == 0
+    assert cap["params"]["format"] == "x"
+
     cap = _capture_send(monkeypatch, result=[])
     pry.cli.main(["display", "list"])
     assert cap["op"] == "display_list"

@@ -303,6 +303,7 @@ pry mappings --name libc         # Mappings whose objfile matches a substring
 
 ```bash
 pry display add "head->id"       # Show this on every stop
+pry display add "head->id" --fmt x  # ...formatted (GDB print/F): x d u o t a c f s z
 pry display list                 # List displays with current values
 pry display remove 1             # Stop showing display #1
 ```
