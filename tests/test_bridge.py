@@ -518,6 +518,14 @@ def test_augment_error_ptrace_hint(monkeypatch):
     assert "CAP_SYS_PTRACE" in out
 
 
+def test_augment_error_command_aborted_hint(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    out = bridge._augment_error(Exception("Command aborted."))
+    assert "hardware watchpoints" in out
+    assert "debug registers" in out
+
+
 def test_attach_refuses_when_inferior_live(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()

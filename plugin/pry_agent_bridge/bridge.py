@@ -996,6 +996,18 @@ class GdbBridge:
             hint = "address not mapped — check `pry mappings` for valid ranges"
         elif "ptrace" in low and "not permitted" in low:
             hint = self._ptrace_hint()
+        elif low == "command aborted.":
+            # GDB swallows the real reason (e.g. "Could not insert hardware
+            # watchpoints") under to_string capture, leaving only this. The
+            # usual cause is too many hardware watchpoints/breakpoints — note
+            # they're allocated at continue, not at `watch set`, which is why a
+            # set that "succeeded" makes a later continue abort.
+            hint = (
+                "GDB couldn't run the command — most often too many hardware "
+                "watchpoints/breakpoints to insert (x86 has 4 debug registers, "
+                "allocated at continue, not at `watch set`). Delete some with "
+                "`pry watch delete N` / `pry break delete N`"
+            )
         if hint:
             return f"{base} ({hint})"
         return base
