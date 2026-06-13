@@ -1472,6 +1472,20 @@ def test_display_add_list_remove(monkeypatch):
         bridge._display_remove({"number": 99})
 
 
+def test_display_eval_error_shows_reason(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    bridge._display_add({"expression": "argc"})
+
+    def _boom(expr):
+        raise Exception('No symbol "argc" in current context.')
+    monkeypatch.setattr(fake_gdb, "parse_and_eval", _boom)
+
+    value = bridge._display_list({})[0]["value"]
+    assert value.startswith("<error:")
+    assert "No symbol" in value
+
+
 def test_examine_builds_command(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
