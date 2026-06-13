@@ -3015,4 +3015,10 @@ def main(argv: list[str] | None = None) -> int:
     except BridgeError as exc:
         _emit_error(args, str(exc))
         return 1
+    except Exception as exc:
+        # Backstop: a handler raised something other than BridgeError (e.g. an
+        # OSError from file IO, a ValueError from parsing). An agent-facing CLI
+        # must never dump a raw Python traceback — render it cleanly instead.
+        _emit_error(args, f"{type(exc).__name__}: {exc}")
+        return 1
     return rc if isinstance(rc, int) else 0
