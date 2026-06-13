@@ -451,6 +451,20 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_memory_write_bad_hex_is_actionable(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    with pytest.raises(ValueError, match="invalid hex bytes"):
+        bridge._memory_write({"address": 0x1000, "value": "nothex"})
+
+
+def test_memory_write_strips_0x_prefix(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    res = bridge._memory_write({"address": 0x1000, "value": "0xdeadbeef"})
+    assert res["written"] == 4
+
+
 def test_augment_error_ptrace_hint(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
