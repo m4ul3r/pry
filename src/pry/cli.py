@@ -675,6 +675,14 @@ def _render_breakpoint_set_text(value: Any) -> str:
     noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
     enabled = "enabled" if value.get("enabled") else "disabled"
     parts = [f"{noun} #{num} set {prep} {target} [{enabled}]"]
+    addr = value.get("address")
+    if addr:
+        where = f"@ {addr}"
+        f = value.get("file")
+        line = value.get("line")
+        if f and line is not None:
+            where += f" {f}:{line}"
+        parts.append(where)
     if value.get("pending"):
         parts.append("(pending — location not yet resolved)")
     if value.get("temporary"):

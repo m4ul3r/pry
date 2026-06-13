@@ -451,6 +451,30 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_breakpoint_dict_includes_resolved_location(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    loc = types.SimpleNamespace(
+        address=0x401445, source=("workshop.c", 75), function="main"
+    )
+    base = dict(
+        number=1, enabled=True, location="main", expression=None, condition=None,
+        hit_count=0, temporary=False, pending=False, thread=None, ignore_count=0,
+        locations=[loc],
+    )
+    bp = types.SimpleNamespace(type=fake_gdb.BP_BREAKPOINT, **base)
+    d = bridge_mod._breakpoint_to_dict(bp)
+    assert d["address"] == "0x401445"
+    assert d["file"] == "workshop.c"
+    assert d["line"] == 75
+    assert d["function"] == "main"
+
+    # Watchpoints are not code locations — the resolved fields must be omitted
+    # even if a location object is present.
+    wp = types.SimpleNamespace(type=fake_gdb.BP_WATCHPOINT, **base)
+    dw = bridge_mod._breakpoint_to_dict(wp)
+    assert "address" not in dw
+
+
 def test_break_delete_multiple(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()

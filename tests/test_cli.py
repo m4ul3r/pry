@@ -1774,6 +1774,22 @@ def test_render_display_list_text():
     assert pry.cli._render_display_list_text([]) == "no displays"
 
 
+def test_render_breakpoint_set_shows_resolved_location():
+    value = {
+        "number": 1, "kind": "breakpoint", "location": "main", "enabled": True,
+        "address": "0x401445", "file": "workshop.c", "line": 75,
+    }
+    text = pry.cli._render_breakpoint_set_text(value)
+    assert "@ 0x401445 workshop.c:75" in text
+
+
+def test_render_breakpoint_set_without_resolved_location():
+    # No address (e.g. older GDB or a pending bp) → no trailing "@ ...".
+    value = {"number": 1, "kind": "breakpoint", "location": "main", "enabled": True}
+    text = pry.cli._render_breakpoint_set_text(value)
+    assert "@" not in text
+
+
 def test_render_status_text_shows_displays():
     # Displays are attached to the status payload while stopped; the text
     # renderer must surface them too (not just JSON / the stop renderer).

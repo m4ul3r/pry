@@ -606,6 +606,28 @@ def _breakpoint_to_dict(bp) -> dict[str, Any]:
         "thread": getattr(bp, "thread", None),
         "ignore": getattr(bp, "ignore_count", 0),
     }
+    # Resolved placement (GDB 13+): the actual address and source line a
+    # symbolic / file:line breakpoint landed on, so agents can confirm where it
+    # went (e.g. `break main` lands past the prologue) without having to run.
+    # Watchpoints/catchpoints have no meaningful code location, and older GDB
+    # lacks `.locations` or leaves a pending breakpoint with none — stay
+    # defensive and just omit the fields when unavailable.
+    if result["kind"] in ("breakpoint", "hw-breakpoint"):
+        try:
+            locs = getattr(bp, "locations", None) or []
+            if locs:
+                loc = locs[0]
+                addr = getattr(loc, "address", None)
+                if addr is not None:
+                    result["address"] = hex(addr)
+                src = getattr(loc, "source", None)
+                if src:
+                    result["file"], result["line"] = src[0], src[1]
+                fn = getattr(loc, "function", None)
+                if fn:
+                    result["function"] = fn
+        except Exception:
+            pass
     return result
 
 
