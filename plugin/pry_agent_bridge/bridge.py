@@ -2008,8 +2008,23 @@ class GdbBridge:
         if rebase_module:
             offset_str = location.lstrip("*").strip()
             offset = int(offset_str, 0)
+            # A wrong --image-base silently produced a wrapped negative address
+            # (e.g. offset 0x100 - image_base 0x401000) and a breakpoint at
+            # garbage. The offset must be an address *within* the image.
+            if image_base and offset < image_base:
+                raise ValueError(
+                    f"--image-base {hex(image_base)} exceeds the offset "
+                    f"{hex(offset)}; the offset must be an address within the "
+                    f"image (>= image base)"
+                )
             module_base = self._resolve_module_base(rebase_module)
             runtime_addr = offset - image_base + module_base
+            if runtime_addr <= 0:
+                raise ValueError(
+                    f"rebase produced an invalid address {hex(runtime_addr)} "
+                    f"(offset {hex(offset)} - image_base {hex(image_base)} + "
+                    f"module_base {hex(module_base)}) — check the offset/--image-base"
+                )
             location = f"*{hex(runtime_addr)}"
             rebased_meta = {
                 "module": rebase_module,

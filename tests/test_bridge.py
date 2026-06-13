@@ -1146,6 +1146,19 @@ def test_break_set_with_rebase(monkeypatch):
     assert result["rebased"]["resolved"] == hex(0x555555554000 + 0x1234)
 
 
+def test_break_set_rebase_image_base_exceeds_offset(monkeypatch):
+    # A wrong --image-base larger than the offset used to silently produce a
+    # wrapped negative address and a breakpoint at garbage.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    with pytest.raises(ValueError, match="exceeds the offset"):
+        bridge._break_set({
+            "location": "*0x100",
+            "rebase_module": "workshop",
+            "image_base": 0x401000,
+        })
+
+
 def test_break_set_rebase_with_image_base(monkeypatch):
     """break_set with rebase_module and image_base subtracts static base."""
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
