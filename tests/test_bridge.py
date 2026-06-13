@@ -118,6 +118,10 @@ def _load_bridge(monkeypatch):
         def architecture(self):
             return _FakeArchitecture()
 
+        def select(self):
+            nonlocal _current_frame
+            _current_frame = self
+
     class _FakeArchitecture:
         def disassemble(self, addr, count=20):
             return [
@@ -644,6 +648,16 @@ def test_frame_info(monkeypatch):
     result = bridge._dispatch_op("frame_info", {})
     assert result["function"] == "main"
     assert result["address"] == "0x401000"
+
+
+def test_thread_override_restores_selected_frame(monkeypatch):
+    # `--thread N` switches threads (which resets the frame to 0) and back; the
+    # caller's previously-selected frame must be restored, not clobbered.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    original = fake_gdb.selected_frame()
+    bridge._dispatch_op("args", {"thread": 2})
+    assert fake_gdb.selected_frame() is original
 
 
 def test_locals_and_args(monkeypatch):
