@@ -375,6 +375,22 @@ def test_locals_text_rendering(monkeypatch, capsys):
     assert 'char * buf = "hello"' in output
 
 
+def test_functions_nonpositive_limit_rejected(capsys):
+    # A negative limit used to become Python's result[:-1] (dumped all-but-last,
+    # a huge spill); zero produced a contradictory empty-but-"truncated" result.
+    for bad in ("0", "-1"):
+        with pytest.raises(SystemExit):
+            pry.cli.main(["functions", "--limit", bad])
+    err = capsys.readouterr().err.lower()
+    assert "positive integer" in err
+
+
+def test_functions_negative_offset_rejected(capsys):
+    with pytest.raises(SystemExit):
+        pry.cli.main(["functions", "--offset", "-5"])
+    assert ">= 0" in capsys.readouterr().err
+
+
 def test_functions_pagination(monkeypatch, capsys):
     captured = {}
 

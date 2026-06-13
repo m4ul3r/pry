@@ -171,13 +171,30 @@ def _add_output_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _positive_int(s: str) -> int:
+    v = int(s)
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {v}")
+    return v
+
+
+def _nonneg_int(s: str) -> int:
+    v = int(s)
+    if v < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {v}")
+    return v
+
+
 def _add_paged_args(parser: argparse.ArgumentParser) -> None:
+    # Non-positive values used to flow straight into Python slicing: `--limit
+    # -1` became result[:-1] (dumped all-but-last → a huge spill) and `--limit
+    # 0` produced a contradictory empty-but-"truncated" result. Reject them.
     parser.add_argument(
-        "--offset", type=int, default=0,
+        "--offset", type=_nonneg_int, default=0,
         help="Skip this many results (for paging; default: 0)",
     )
     parser.add_argument(
-        "--limit", type=int, default=100,
+        "--limit", type=_positive_int, default=100,
         help="Max results to return; on truncation a stderr note shows the next --offset (default: 100)",
     )
 
