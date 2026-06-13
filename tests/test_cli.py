@@ -385,6 +385,16 @@ def test_functions_nonpositive_limit_rejected(capsys):
     assert "positive integer" in err
 
 
+def test_timeout_and_trace_reject_nonpositive(capsys):
+    # A negative --timeout used to instantly fake-"time out"; a non-positive
+    # trace --max-hits stopped immediately with a false "hit limit reached".
+    for cmd in (["continue", "--timeout", "-5"], ["continue", "--timeout", "0"],
+                ["trace", "--watch", "0x1", "--range", "0x1-0x2", "--watch-size", "0"],
+                ["trace", "--watch", "0x1", "--range", "0x1-0x2", "--max-hits", "-5"]):
+        with pytest.raises(SystemExit):
+            pry.cli.main(cmd)
+
+
 def test_count_limit_args_reject_nonpositive(capsys):
     # Output-bounding counts/limits must be positive, like functions/symbols
     # paging — a negative one used to give weird/empty output instead of error.
