@@ -2601,8 +2601,14 @@ class GdbBridge:
         out: list[dict[str, Any]] = []
         for d in self._displays:
             entry: dict[str, Any] = {"number": d["number"], "expr": d["expr"]}
-            value = self._safe_eval_str(d["expr"])
-            entry["value"] = value if value is not None else "<error>"
+            try:
+                entry["value"] = str(gdb.parse_and_eval(d["expr"]))
+            except Exception as exc:
+                # Surface *why* it couldn't be evaluated (typically out of scope
+                # in the current frame) instead of a bare "<error>", so an agent
+                # can tell an out-of-frame display from a typo.
+                msg = " ".join(str(exc).split())[:80] or "evaluation failed"
+                entry["value"] = f"<error: {msg}>"
             out.append(entry)
         return out
 
