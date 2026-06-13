@@ -690,6 +690,9 @@ def _render_breakpoint_set_text(value: Any) -> str:
     cond = value.get("condition")
     if cond:
         parts.append(f"if {cond}")
+    ignore = value.get("ignore")
+    if ignore:
+        parts.append(f"(ignore {ignore})")
     rebased = value.get("rebased")
     if isinstance(rebased, dict):
         parts.append(f"(rebased from {rebased.get('offset', '?')} in {rebased.get('module', '?')})")
@@ -1219,15 +1222,24 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0
 
 
-def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
+def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> bool:
+    """Install *source* at *dest*. Returns True if it created the install, or
+    False when the exact symlink already existed (an idempotent no-op)."""
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists() or dest.is_symlink():
+        # Idempotent: re-installing the exact symlink we'd create is a no-op,
+        # not an error — so `pry plugin install` can be re-run safely.
+        if (mode == "symlink" and dest.is_symlink()
+                and os.path.realpath(dest) == os.path.realpath(source)):
+            return False
         if not force:
-            raise BridgeError(f"Destination already exists: {dest}")
+            raise BridgeError(
+                f"Destination already exists: {dest}. Pass --force to replace it."
+            )
         if dest.is_symlink() or dest.is_file():
             dest.unlink()
         else:
@@ -1237,6 +1249,7 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         shutil.copytree(source, dest)
     else:
         os.symlink(source, dest, target_is_directory=True)
+    return True
 
 
 def _check_install_destination(dest: Path, *, force: bool) -> None:
@@ -1249,7 +1262,7 @@ def _check_install_destination(dest: Path, *, force: bool) -> None:
 def _plugin_install(args: argparse.Namespace) -> int:
     source = plugin_source_dir()
     dest = args.dest or plugin_install_dir()
-    _install_tree(source, dest, mode=args.mode, force=args.force)
+    created = _install_tree(source, dest, mode=args.mode, force=args.force)
 
     gdbinit_snippet = (
         "python\n"
@@ -1261,6 +1274,7 @@ def _plugin_install(args: argparse.Namespace) -> int:
 
     result: dict[str, Any] = {
         "installed": True,
+        "already_present": not created,
         "mode": args.mode,
         "source": str(source),
         "destination": str(dest),
@@ -1911,6 +1925,8 @@ def _break_set(args: argparse.Namespace) -> int:
         params["temporary"] = True
     if args.hardware:
         params["hardware"] = True
+    if getattr(args, "ignore", None) is not None:
+        params["ignore"] = args.ignore
     rebase = getattr(args, "rebase", None)
     if rebase:
         params["rebase_module"] = rebase
@@ -2674,6 +2690,7 @@ def build_parser() -> argparse.ArgumentParser:
     brk_set.add_argument("--condition", help="Conditional expression")
     brk_set.add_argument("--temporary", action="store_true", help="Temporary breakpoint (deleted on hit)")
     brk_set.add_argument("--hardware", action="store_true", help="Hardware breakpoint")
+    brk_set.add_argument("--ignore", type=int, metavar="N", help="Skip the next N hits before stopping")
     brk_set.add_argument("--rebase", metavar="MODULE", help="Treat location as offset from MODULE's load base (PIE/ASLR rebasing)")
     brk_set.add_argument("--image-base", type=lambda x: int(x, 0), default=0, metavar="ADDR",
                           help="Static image base to subtract (default: 0x0)")

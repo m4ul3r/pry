@@ -921,6 +921,24 @@ class GdbBridge:
         except Exception as exc:
             return _json_response(ok=False, error=self._augment_error(exc))
 
+    @staticmethod
+    def _ptrace_hint() -> str:
+        """Actionable hint for the most common `pry attach` failure."""
+        scope = None
+        try:
+            with open("/proc/sys/kernel/yama/ptrace_scope") as fh:
+                scope = fh.read().strip()
+        except Exception:
+            pass
+        msg = ("ptrace not permitted — the target must be a child of this "
+               "process or you need CAP_SYS_PTRACE")
+        if scope and scope != "0":
+            msg += (f"; kernel.yama.ptrace_scope is {scope}, relax it with "
+                    f"`sudo sysctl kernel.yama.ptrace_scope=0` or run GDB as root")
+        else:
+            msg += "; try running GDB as root"
+        return msg
+
     def _augment_error(self, exc: Exception) -> str:
         """Turn a raw GDB/Python error into an agent-actionable message.
 
@@ -960,6 +978,8 @@ class GdbBridge:
             )
         elif low.startswith("cannot access memory at address"):
             hint = "address not mapped — check `pry mappings` for valid ranges"
+        elif "ptrace" in low and "not permitted" in low:
+            hint = self._ptrace_hint()
         if hint:
             return f"{base} ({hint})"
         return base
@@ -1128,8 +1148,10 @@ class GdbBridge:
                     reason = self._bp_reason(bps[0])
             elif hasattr(gdb, "SignalEvent") and isinstance(event, gdb.SignalEvent):
                 reason = {"kind": "signal", "signal": event.stop_signal}
-            if reason:
-                result["reason"] = reason
+            # A plain stop with no breakpoint/signal is a completed
+            # step/next/finish/until — report it as `step`, consistent with the
+            # permanent handler and what `status`/`wait` return.
+            result["reason"] = reason or {"kind": "step"}
             # For `finish`, recover the function's return value now that the
             # inferior is genuinely stopped (reading registers mid-run fails).
             if op == "finish":
@@ -1370,9 +1392,22 @@ class GdbBridge:
                     gdb.events.exited.disconnect(_on_trace_exited)
                 # Clean up internal breakpoints.
                 def _cleanup():
+                    boundary_nums = set()
                     for bp in cleanup_bps:
                         with contextlib.suppress(Exception):
+                            boundary_nums.add(bp.number)
+                        with contextlib.suppress(Exception):
                             bp.delete()
+                    # The permanent stop handler may have recorded one of these
+                    # now-deleted internal objects (a boundary breakpoint or the
+                    # trace watchpoint) as the last stop reason. Clear it so a
+                    # later `status` doesn't report a "breakpoint/watchpoint #N
+                    # hit" for something that no longer exists.
+                    lsr = self._last_stop_reason
+                    if (isinstance(lsr, dict)
+                            and lsr.get("number") is not None
+                            and lsr.get("number") in boundary_nums):
+                        self._last_stop_reason = None
                 gdb.post_event(_cleanup)
 
         if error_box:
@@ -1946,6 +1981,10 @@ class GdbBridge:
         condition = params.get("condition")
         if condition:
             bp.condition = condition
+
+        ignore = params.get("ignore")
+        if ignore is not None:
+            bp.ignore_count = int(ignore)
 
         result = _breakpoint_to_dict(bp)
         if rebased_meta:
@@ -2645,13 +2684,60 @@ class GdbBridge:
         output = gdb.execute("info files", to_string=True)
         return {"raw": output}
 
+    @staticmethod
+    def _looks_like_function_name(loc: str) -> bool:
+        loc = loc.strip()
+        if not loc or ":" in loc or loc.startswith("*"):
+            return False
+        # A bare line number or +/-offset is not a function name.
+        return not loc.lstrip("+-").isdigit()
+
+    def _function_line_range(self, name: str):
+        """Resolve a function name to (filename, start_line, end_line), or None.
+
+        Lets `source list <fn>` show the *whole* function instead of GDB's
+        centered window (which clips the function's tail). Fully defensive so a
+        non-function, missing debug info, or an older GDB just falls back.
+        """
+        try:
+            sym = gdb.lookup_global_symbol(name)
+            if sym is None:
+                lookup_static = getattr(gdb, "lookup_static_symbol", None)
+                if lookup_static is not None:
+                    sym = lookup_static(name)
+            if sym is None or not sym.is_function:
+                return None
+            addr = sym.value().address
+            if addr is None:
+                return None
+            blk = gdb.block_for_pc(int(addr))
+            while blk is not None and blk.function is None and blk.superblock:
+                blk = blk.superblock
+            if blk is None:
+                return None
+            start = gdb.find_pc_line(blk.start)
+            end = gdb.find_pc_line(blk.end - 1)
+            if start.symtab is None or not start.line or not end.line:
+                return None
+            if end.line < start.line:
+                return None
+            return (start.symtab.filename, start.line, end.line)
+        except Exception:
+            return None
+
     def _source_list(self, params: dict[str, Any]) -> dict[str, Any]:
         location = params.get("location")
         count = params.get("count")
-        if location:
-            cmd = f"list {location}"
-        else:
-            cmd = "list"
+        cmd = None
+        # For a bare function name with no explicit count, list the whole
+        # function rather than GDB's centered window (which clips the tail).
+        if location and count is None and self._looks_like_function_name(location):
+            rng = self._function_line_range(location)
+            if rng is not None:
+                filename, start, end = rng
+                cmd = f"list {filename}:{start},{filename}:{end}"
+        if cmd is None:
+            cmd = f"list {location}" if location else "list"
         if count:
             gdb.execute(f"set listsize {count}", to_string=True)
         output = gdb.execute(cmd, to_string=True)

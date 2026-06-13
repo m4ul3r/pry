@@ -566,6 +566,34 @@ def test_memory_read_plain_does_not_change_json_payload(monkeypatch, capsys):
     assert payload["data"] == "41424344"
 
 
+def test_install_tree_idempotent_symlink(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "marker").write_text("x")
+    dest = tmp_path / "dest"
+
+    created = pry.cli._install_tree(source, dest, mode="symlink", force=False)
+    assert created is True
+    assert dest.is_symlink()
+
+    # Re-installing the exact same symlink is a no-op, not an error.
+    again = pry.cli._install_tree(source, dest, mode="symlink", force=False)
+    assert again is False
+    assert dest.is_symlink()
+
+
+def test_install_tree_conflicting_dest_errors(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    dest = tmp_path / "dest"
+    dest.symlink_to(other)  # already points somewhere else
+
+    with pytest.raises(pry.cli.BridgeError, match="already exists"):
+        pry.cli._install_tree(source, dest, mode="symlink", force=False)
+
+
 def test_skill_install_copy_mode(tmp_path):
     destination = tmp_path / "skill-copy"
 
@@ -1772,6 +1800,17 @@ def test_render_display_list_text():
     )
     assert "#2: argc = 0x1" in text
     assert pry.cli._render_display_list_text([]) == "no displays"
+
+
+def test_break_set_ignore_plumbed_and_rendered(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={
+        "number": 1, "kind": "breakpoint", "location": "main",
+        "enabled": True, "ignore": 3,
+    })
+    rc = pry.cli.main(["break", "set", "main", "--ignore", "3"])
+    assert rc == 0
+    assert cap["params"]["ignore"] == 3
+    assert "(ignore 3)" in capsys.readouterr().out
 
 
 def test_render_breakpoint_set_shows_resolved_location():

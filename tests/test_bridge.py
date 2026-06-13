@@ -451,6 +451,21 @@ def test_break_delete(monkeypatch):
     assert not any(b["number"] == number for b in bp_list)
 
 
+def test_augment_error_ptrace_hint(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    out = bridge._augment_error(Exception("ptrace: Operation not permitted."))
+    assert "ptrace not permitted" in out
+    assert "CAP_SYS_PTRACE" in out
+
+
+def test_break_set_ignore_count(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    result = bridge._dispatch_op("break_set", {"location": "main", "ignore": 3})
+    assert result["ignore"] == 3
+
+
 def test_breakpoint_dict_includes_resolved_location(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     loc = types.SimpleNamespace(
@@ -780,6 +795,20 @@ def test_dispatch_exec_no_stop_event(monkeypatch):
     assert response["ok"] is True
     result = response["result"]
     assert result["status"] == "stopped"
+    # A plain step/next/until/finish completion reports reason: step in its own
+    # result, consistent with the permanent handler and `status`/`wait`.
+    assert result["reason"] == {"kind": "step"}
+
+
+def test_looks_like_function_name(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    f = bridge_mod.GdbBridge._looks_like_function_name
+    assert f("main") is True
+    assert f("sum_ids") is True
+    assert f("file.c:42") is False   # file:line
+    assert f("*0x401000") is False   # address
+    assert f("42") is False          # bare line number
+    assert f("") is False
 
 
 def test_connect_executes_target_remote(monkeypatch):
