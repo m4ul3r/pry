@@ -2801,7 +2801,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(bt)
     _add_thread_arg(bt)
     bt.add_argument("--full", action="store_true", help="Show local variables in each frame")
-    bt.add_argument("--limit", type=int, help="Maximum number of frames")
+    bt.add_argument("--limit", type=_positive_int, help="Maximum number of frames")
     bt.set_defaults(handler=_backtrace)
 
     # --- frame ---
@@ -2902,7 +2902,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(disasm)
     _add_thread_arg(disasm)
     disasm.add_argument("location", nargs="?", help="Function name, address, or omit for current PC")
-    disasm.add_argument("--count", type=int, help="Number of instructions")
+    disasm.add_argument("--count", type=_positive_int, help="Number of instructions")
     disasm.add_argument("--start", help="Range start address (use with --end)")
     disasm.add_argument("--end", help="Range end address (exclusive; use with --start)")
     disasm.add_argument("--source", action="store_true", help="Interleave source lines (GDB /s)")
@@ -2914,7 +2914,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_thread_arg(examine)
     examine.add_argument("address", help="Address or expression to examine")
     examine.add_argument("--spec", help="Raw GDB format spec, e.g. '8xw', '3i', 's'")
-    examine.add_argument("--count", type=int, help="Number of units")
+    examine.add_argument("--count", type=_positive_int, help="Number of units")
     examine.add_argument("--fmt", dest="x_format", metavar="F",
                          choices=("x", "d", "u", "o", "t", "a", "c", "f", "s", "i", "z"),
                          help="GDB format letter (x,d,u,o,t,a,c,f,s,i,z)")
@@ -2959,7 +2959,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_list = source_sub.add_parser("list", help="Show source code")
     _common_io_options(source_list)
     source_list.add_argument("location", nargs="?", help="Function name or file:line")
-    source_list.add_argument("--count", type=int, help="Number of lines")
+    source_list.add_argument("--count", type=_positive_int, help="Number of lines")
     source_list.set_defaults(handler=_source_list)
 
     # --- py ---

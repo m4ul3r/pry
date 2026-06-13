@@ -385,6 +385,16 @@ def test_functions_nonpositive_limit_rejected(capsys):
     assert "positive integer" in err
 
 
+def test_count_limit_args_reject_nonpositive(capsys):
+    # Output-bounding counts/limits must be positive, like functions/symbols
+    # paging — a negative one used to give weird/empty output instead of error.
+    for cmd in (["backtrace", "--limit", "-1"], ["backtrace", "--limit", "0"],
+                ["disasm", "main", "--count", "-1"], ["examine", "$pc", "--count", "0"],
+                ["source", "list", "main", "--count", "-2"]):
+        with pytest.raises(SystemExit):
+            pry.cli.main(cmd)
+
+
 def test_functions_negative_offset_rejected(capsys):
     with pytest.raises(SystemExit):
         pry.cli.main(["functions", "--offset", "-5"])
