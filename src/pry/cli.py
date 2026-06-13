@@ -2110,6 +2110,11 @@ def _mappings(args: argparse.Namespace) -> int:
 
 
 def _memory_read(args: argparse.Namespace) -> int:
+    # Guard non-positive counts here: GDB's read leaks a raw
+    # "OverflowError: can't convert negative int to unsigned" for a negative
+    # length and an opaque message for 0.
+    if args.length <= 0:
+        raise BridgeError(f"byte count must be a positive integer, got {args.length}")
     mem_fmt = getattr(args, "mem_format", "hex")
     plain = bool(getattr(args, "plain", False))
     params: dict[str, Any] = {
