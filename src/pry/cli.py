@@ -2380,7 +2380,12 @@ def _py_exec(args: argparse.Namespace) -> int:
     if code:
         source = code
     elif script:
-        source = Path(script).expanduser().read_text(encoding="utf-8")
+        try:
+            source = Path(script).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            # Without this a missing/unreadable --script dumps a raw Python
+            # traceback (FileNotFoundError) instead of a clean CLI error.
+            raise BridgeError(f"cannot read --script {script}: {exc.strerror or exc}")
     elif use_stdin:
         source = sys.stdin.read()
     else:
