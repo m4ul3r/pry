@@ -181,13 +181,72 @@ def _extract_variable_name(decl: str) -> str | None:
     return idents[-1] if idents else None
 
 
-def _lookup_function_address(name: str) -> str | None:
-    """Resolve a function's runtime address via GDB. Best-effort."""
-    try:
-        val = gdb.parse_and_eval(f"&{name}")
-        return f"0x{int(val):x}"
-    except Exception:
+def _function_qualified_name(signature: str) -> str | None:
+    """The (possibly C++-qualified) function name from an `info functions`
+    signature: the whitespace-delimited token just before the parameter list,
+    with any leading pointer/ref punctuation stripped. Keeps the `Class::`
+    / `ns::` prefix that `_extract_function_name` drops.
+
+    e.g. "static int add(int, int)" -> "add",
+         "int Animal::speak() const" -> "Animal::speak",
+         "static char *greeting(const char *)" -> "greeting".
+    """
+    paren = signature.find("(")
+    head = signature[:paren] if paren != -1 else signature
+    tokens = head.split()
+    if not tokens:
         return None
+    qn = tokens[-1].lstrip("*&")
+    return qn or None
+
+
+def _function_designator(signature: str) -> str | None:
+    """A GDB-resolvable function designator (qualified name + parameter list,
+    plus any cv-qualifiers), used to disambiguate C++ overloads that share a
+    base name. e.g. "static int add(int, int)" -> "add(int, int)",
+    "int Animal::speak() const" -> "Animal::speak() const". None if there's no
+    parameter list to anchor on.
+    """
+    paren = signature.find("(")
+    if paren == -1:
+        return None
+    qn = _function_qualified_name(signature)
+    if not qn:
+        return None
+    return qn + signature[paren:].strip()
+
+
+def _lookup_function_address(name: str, signature: str | None = None) -> str | None:
+    """Resolve a function's runtime address via GDB. Best-effort.
+
+    Tries the most specific form first so C++ overloads that share a base name
+    resolve to their *own* address (`&'add(int, int)'` vs
+    `&'add(double, double)'`) and qualified members resolve at all
+    (`&'Animal::speak'`), instead of every same-named function collapsing onto
+    whichever single symbol the bare name happens to bind to (or, for an
+    unqualified member name like `speak`, failing to resolve entirely).
+
+    The signature-derived candidates are C++-only symbol names (mangled with
+    parameter types); for C functions they simply don't resolve and the bare
+    name carries it, so this is safe for both languages.
+    """
+    candidates: list[str] = []
+    if signature:
+        designator = _function_designator(signature)
+        if designator:
+            candidates.append(designator)
+        qual = _function_qualified_name(signature)
+        if qual and qual not in candidates:
+            candidates.append(qual)
+    if name and name not in candidates:
+        candidates.append(name)
+    for expr in candidates:
+        try:
+            val = gdb.parse_and_eval(f"&'{expr}'")
+            return f"0x{int(val):x}"
+        except Exception:
+            continue
+    return None
 
 
 def _resolve_to_address(expr: str) -> int | None:
@@ -319,7 +378,7 @@ def _parse_info_functions(output: str) -> list[dict[str, Any]]:
         entry = {"name": name, "signature": signature, "line": line_num}
         if current_file:
             entry["file"] = current_file
-        address = _lookup_function_address(name)
+        address = _lookup_function_address(name, signature)
         if address:
             entry["address"] = address
         result.append(entry)
