@@ -1706,6 +1706,72 @@ def test_parse_disassemble_output(monkeypatch):
     assert rows[1]["symbol"] == "main+4"
 
 
+def test_function_designator_and_qualified_name(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    des = bridge_mod._function_designator
+    qn = bridge_mod._function_qualified_name
+    assert des("static int add(int, int)") == "add(int, int)"
+    assert des("static double add(double, double)") == "add(double, double)"
+    assert des("int Animal::speak() const") == "Animal::speak() const"
+    assert des("int main(int, char **)") == "main(int, char **)"
+    assert qn("static int add(int, int)") == "add"
+    assert qn("int Animal::speak() const") == "Animal::speak"
+    assert qn("static char *greeting(const char *)") == "greeting"
+    assert des("int data") is None  # no parameter list
+
+
+def test_parse_info_functions_resolves_cpp_overloads(monkeypatch):
+    """Each C++ overload resolves to its OWN address via the full signature,
+    and a qualified member name resolves at all — instead of every same-named
+    function collapsing onto the single address the bare name binds to."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+
+    # Distinct address per resolvable designator. The bare overloaded name
+    # binds to one overload (the double one here); the *unqualified* member
+    # name `speak` does not resolve at all (mirrors real GDB).
+    addrs = {
+        "&'add(int, int)'": 0x23E9,
+        "&'add(double, double)'": 0x2401,
+        "&'add'": 0x2401,
+        "&'Animal::speak() const'": 0x2380,
+        "&'Animal::speak'": 0x2380,
+        "&'Dog::speak() const'": 0x2440,
+        "&'Dog::speak'": 0x2440,
+        "&'main(int, char **)'": 0x24C8,
+        "&'main'": 0x24C8,
+    }
+
+    class _V:
+        def __init__(self, n):
+            self._n = n
+
+        def __int__(self):
+            return self._n
+
+    def _eval(expr):
+        if expr in addrs:
+            return _V(addrs[expr])
+        raise fake_gdb.error(f"No symbol {expr!r} in current context.")
+
+    fake_gdb.parse_and_eval = _eval
+
+    output = (
+        "All defined functions:\n\n"
+        "File zoo.cpp:\n"
+        "17:\tstatic int add(int, int);\n"
+        "18:\tstatic double add(double, double);\n"
+        "9:\tint Animal::speak() const;\n"
+        "14:\tint Dog::speak() const;\n"
+        "20:\tint main(int, char **);\n"
+    )
+    by_sig = {r["signature"]: r for r in bridge_mod._parse_info_functions(output)}
+    assert by_sig["static int add(int, int)"]["address"] == "0x23e9"
+    assert by_sig["static double add(double, double)"]["address"] == "0x2401"
+    assert by_sig["int Animal::speak() const"]["address"] == "0x2380"
+    assert by_sig["int Dog::speak() const"]["address"] == "0x2440"
+    assert by_sig["int main(int, char **)"]["address"] == "0x24c8"
+
+
 def test_finish_return_value_void_and_missing(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
