@@ -1469,6 +1469,48 @@ def test_disasm_annotates_symbol(monkeypatch):
     assert insns[0]["symbol"] == "main+4"
 
 
+def test_disasm_bare_function_name_is_bounded_to_function(monkeypatch):
+    """A bare function name with no --count disassembles the whole function via
+    GDB's `disassemble <fn>` (which stops at the real end), not a fixed 20-instr
+    count that bleeds past `ret` into the following function."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("disasm", {"location": "main"})
+    # The fake `disassemble` returns a single bounded instruction; the fixed
+    # count architecture path would have returned 20 "nop"s instead.
+    assert [e["asm"] for e in result] == ["push   %rbp"]
+    assert all(e["asm"] != "nop" for e in result)
+
+
+def test_disasm_explicit_count_is_not_clamped(monkeypatch):
+    """An explicit --count is honored verbatim via the architecture path even
+    for a function name — the function-boundary clamp only applies when no
+    count is given."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    result = bridge._dispatch_op("disasm", {"location": "main", "count": 5})
+    assert len(result) == 5
+    assert all(e["asm"] == "nop" for e in result)  # the arch fast path, not disassemble
+
+
+def test_is_bare_symbol_name(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    f = bridge_mod.GdbBridge._is_bare_symbol_name
+    assert f("main") is True
+    assert f("crash_path") is True
+    assert f("_start") is True
+    assert f("0x401000") is False      # address
+    assert f("$pc") is False           # register
+    assert f("*0x401000") is False     # deref expression
+    assert f("main,+8") is False       # start,+len range
+    assert f("a.c:42") is False        # file:line
+    assert f("Animal::speak") is False # qualified name (falls back to count path)
+    assert f("42") is False            # bare line number
+    assert f("") is False
+
+
 @pytest.mark.parametrize("gdb_msg", ["No registers.", "No stack."])
 def test_backtrace_no_inferior_is_actionable(monkeypatch, gdb_msg):
     # GDB 17.2 raises "No registers." (not "No stack.") from newest_frame()
