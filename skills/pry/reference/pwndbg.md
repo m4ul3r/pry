@@ -1,6 +1,6 @@
 # pwndbg Command Reference (on-demand)
 
-pwndbg is a GDB plugin loaded alongside the pry bridge. All pwndbg commands are available via `pry gdb`. This reference covers the most useful ones — run `pry gdb "pwndbg --all"` for the full list.
+pwndbg is a GDB plugin loaded alongside the pry bridge. All pwndbg commands are available via `pry gdb`. This reference covers the most useful ones — run `pry gdb "pwndbg"` for the full list (or `pry gdb "pwndbg --list-categories"` for the category names).
 
 ### KASLR / Kernel Symbols
 

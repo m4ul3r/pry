@@ -376,7 +376,7 @@ This is the escape hatch for any GDB/pwndbg command not covered by pry's built-i
 pwndbg is loaded alongside the bridge, so **any** pwndbg command runs verbatim through `pry gdb "..."`. The full catalogue (KASLR/`kbase`, glibc heap, SLUB, ROP, GOT/PLT, memory search, context) lives in [reference/pwndbg.md](reference/pwndbg.md) — read it on demand for kernel/heap/exploit work. It is kept out of this always-loaded skill to save context.
 
 ```bash
-pry gdb "pwndbg --all"                # Full list of available pwndbg commands
+pry gdb "pwndbg"                      # Full list of pwndbg commands (--list-categories for groups)
 pry gdb kbase                         # Kernel virtual base (KASLR) — then `pry load vmlinux --base <kbase>`
 pry gdb checksec                      # Binary security (NX, PIE, RELRO, canary)
 pry gdb vmmap                         # Virtual memory map
