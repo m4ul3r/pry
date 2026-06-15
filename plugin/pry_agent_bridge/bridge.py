@@ -1167,6 +1167,17 @@ class GdbBridge:
         result_box: list[dict[str, Any]] = []
         error_box: list[Exception] = []
 
+        # A `run` that restarts a still-live inferior makes GDB kill the old
+        # process first, which fires a spurious `exited` event (carrying no
+        # exit_code) *before* the fresh run reaches its breakpoint/stop. If we
+        # let that event win the completion race we'd report the teardown of
+        # the previous inferior ("status: exited") instead of the new run's
+        # real outcome. Arm a one-shot swallow for exactly that event. Only a
+        # `run` over a live inferior triggers the kill — a first run, or a
+        # re-run after the inferior already exited (pid 0), produces no such
+        # event, so nothing is swallowed in those cases.
+        swallow_restart_exit = [op == "run" and self._inferior_is_live()]
+
         def _on_exec_stop(event):
             result = _stop_info()
             reason: dict[str, Any] = {}
@@ -1192,8 +1203,14 @@ class GdbBridge:
             completion.set()
 
         def _on_exec_exited(event):
-            result: dict[str, Any] = {"status": "exited", "frame": None, "thread": None}
             code = getattr(event, "exit_code", None)
+            if code is None and swallow_restart_exit[0]:
+                # GDB killing the previous inferior to restart it — not the
+                # new run's outcome. Ignore it (once) and keep waiting for the
+                # real stop/exit event.
+                swallow_restart_exit[0] = False
+                return
+            result: dict[str, Any] = {"status": "exited", "frame": None, "thread": None}
             if code is not None:
                 result["reason"] = {"kind": "exited", "code": code}
             result_box.append(result)
