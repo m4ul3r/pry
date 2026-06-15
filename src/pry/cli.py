@@ -1151,6 +1151,15 @@ def _render_gdb_exec_text(value: Any) -> str:
     return output.rstrip()
 
 
+def _render_plugin_install_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    mode = value.get("mode", "unknown")
+    dest = value.get("destination", "<unknown>")
+    verb = "already installed" if value.get("already_present") else "installed"
+    return f"Plugin {verb} ({mode}): {dest}\n"
+
+
 def _render_skill_install_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1304,7 +1313,10 @@ def _plugin_install(args: argparse.Namespace) -> int:
         "destination": str(dest),
         "gdbinit_snippet": gdbinit_snippet,
     }
-    _render_result(result, fmt=args.format, out_path=args.out, stem="plugin-install")
+    rendered: Any = result
+    if args.format == "text":
+        rendered = _render_plugin_install_text(result)
+    _render_result(rendered, fmt=args.format, out_path=args.out, stem="plugin-install")
     if args.format == "text":
         print(
             f"\nAdd the following to your ~/.gdbinit:\n\n{gdbinit_snippet}",
@@ -2532,7 +2544,7 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_install.add_argument("--dest", type=Path, help="Custom install destination")
     plugin_install.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
     plugin_install.add_argument("--force", action="store_true")
-    _common_io_options(plugin_install, default_format="json")
+    _common_io_options(plugin_install)
     plugin_install.set_defaults(handler=_plugin_install)
 
     # --- skill install ---
@@ -2578,7 +2590,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- load ---
     load = subparsers.add_parser("load", help="Load a binary into GDB")
-    _common_io_options(load, default_format="json")
+    _common_io_options(load)
     load.add_argument("path", help="Path to binary")
     load.add_argument(
         "--base", metavar="ADDR",
@@ -2596,7 +2608,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- attach ---
     attach = subparsers.add_parser("attach", help="Attach to a running process")
-    _common_io_options(attach, default_format="json")
+    _common_io_options(attach)
     attach.add_argument("pid", type=int, help="Process ID to attach to")
     attach.set_defaults(handler=_attach)
 
@@ -2612,7 +2624,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- disconnect ---
     disconnect = subparsers.add_parser("disconnect", help="Disconnect from remote target")
-    _common_io_options(disconnect, default_format="json")
+    _common_io_options(disconnect)
     disconnect.set_defaults(handler=_disconnect)
 
     # --- inferior ---
@@ -2871,7 +2883,7 @@ def build_parser() -> argparse.ArgumentParser:
     regs.set_defaults(handler=_registers)
     regs_sub = regs.add_subparsers(dest="registers_command")
     regs_write = regs_sub.add_parser("write", help="Write a register value (e.g. registers write rip 0x401234)")
-    _common_io_options(regs_write, default_format="json")
+    _common_io_options(regs_write)
     regs_write.add_argument("name", help="Register name (rip, rax, pc, ...; leading $ optional)")
     regs_write.add_argument("value", help="Value to set (hex, decimal, or a GDB expression)")
     regs_write.set_defaults(handler=_register_write)
@@ -2892,7 +2904,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_read.set_defaults(handler=_memory_read)
 
     mem_write = mem_sub.add_parser("write", help="Write memory")
-    _common_io_options(mem_write, default_format="json")
+    _common_io_options(mem_write)
     mem_write.add_argument("address", help="Start address (hex or expression)")
     mem_write.add_argument("value", help="Value to write (hex string)")
     mem_write.set_defaults(handler=_memory_write)
