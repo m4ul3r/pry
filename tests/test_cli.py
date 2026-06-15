@@ -1712,6 +1712,69 @@ def test_memory_write_text_rendering(monkeypatch, capsys):
     assert "wrote 4 bytes to 0x401000" in capsys.readouterr().out
 
 
+# --- text-default contract for mutation/lifecycle commands -----------------
+# These used to default to --format json, so in default mode they emitted a
+# JSON envelope (both on success and for errors), violating the documented
+# "most commands default to text / text-mode errors are a plain line" contract
+# and diverging from sibling commands (memory read, connect, skill install).
+
+_TEXT_DEFAULT_ERROR_CASES = [
+    (["memory", "write", "0x401000", "41"], "MemoryError: cannot access memory at 0x401000"),
+    (["registers", "write", "rip", "0x1"], "ValueError: unknown register 'rip'"),
+    (["disconnect"], "RuntimeError: not connected to a remote target (current connection: native)"),
+    (["load", "/bin/ls"], "RuntimeError: could not load /bin/ls"),
+    (["attach", "1234"], "RuntimeError: ptrace attach denied"),
+]
+
+
+@pytest.mark.parametrize("argv,message", _TEXT_DEFAULT_ERROR_CASES)
+def test_mutation_command_error_is_plain_text_by_default(monkeypatch, capsys, argv, message):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        raise pry.cli.BridgeError(message)
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(argv)  # no --format: default must be text
+    assert rc == 1
+    err = capsys.readouterr().err.strip()
+    assert not err.startswith("{")  # not a JSON envelope
+    assert err == message           # plain line (no double "error:" prefix)
+
+
+@pytest.mark.parametrize("argv,message", _TEXT_DEFAULT_ERROR_CASES)
+def test_mutation_command_error_json_is_opt_in(monkeypatch, capsys, argv, message):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        raise pry.cli.BridgeError(message)
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(argv + ["--format", "json"])  # opt in to the envelope
+    assert rc == 1
+    assert json.loads(capsys.readouterr().err) == {"ok": False, "error": message}
+
+
+def test_memory_write_success_defaults_to_text(monkeypatch, capsys):
+    _capture_send(monkeypatch, result={"written": 4, "address": "0x401000"})
+    rc = pry.cli.main(["memory", "write", "0x401000", "deadbeef"])  # no --format
+    assert rc == 0
+    assert "wrote 4 bytes to 0x401000" in capsys.readouterr().out
+
+
+def test_registers_write_success_defaults_to_text(monkeypatch, capsys):
+    _capture_send(monkeypatch, result={"register": "r12", "readback": "0xdead"})
+    rc = pry.cli.main(["registers", "write", "r12", "0xdead"])  # no --format
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert not out.lstrip().startswith("{")
+    assert "$r12 = 0xdead" in out
+
+
+def test_plugin_install_defaults_to_text(capsys, tmp_path):
+    rc = pry.cli.main(["plugin", "install", "--dest", str(tmp_path / "p"), "--mode", "copy"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert not out.lstrip().startswith("{")  # was an indented JSON dict before
+    assert out.startswith("Plugin installed (copy):")
+
+
 def test_types_show_text_includes_offsets(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         return {"ok": True, "result": {
