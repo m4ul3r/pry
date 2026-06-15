@@ -1772,6 +1772,43 @@ def test_parse_info_functions_resolves_cpp_overloads(monkeypatch):
     assert by_sig["int main(int, char **)"]["address"] == "0x24c8"
 
 
+def test_trace_arms_when_pc_already_in_range(monkeypatch):
+    """If the inferior is already stopped inside the code range when the trace
+    starts, the watchpoint arms immediately — so a trace begun mid-run (e.g.
+    after `pry interrupt`) isn't a silent no-op when range_start is a one-shot
+    address that won't be hit again."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    # Fake selected frame PC is 0x401000; this range brackets it.
+    fake_gdb._pending_stop_event = fake_gdb._FakeStopEvent()  # `continue` stops
+    resp = bridge.dispatch({"op": "trace", "params": {
+        "watch_addr": "0x404020", "range_start": "0x400000", "range_end": "0x402000",
+    }})
+    assert resp["ok"] is True
+    result = resp["result"]
+    assert result["armed"] is True
+    assert "note" not in result  # armed -> no false-negative warning
+
+
+def test_trace_reports_never_armed_when_range_not_entered(monkeypatch):
+    """When execution never enters the range (range_start not on the path and
+    the PC isn't already inside), the result is armed=False with an explanatory
+    note instead of a silent, misleading '0 hits'."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    # Fake PC 0x401000 is outside this range, and the range_start breakpoint is
+    # never hit, so the watchpoint stays disarmed.
+    fake_gdb._pending_stop_event = fake_gdb._FakeStopEvent()
+    resp = bridge.dispatch({"op": "trace", "params": {
+        "watch_addr": "0x404020", "range_start": "0x500000", "range_end": "0x501000",
+    }})
+    assert resp["ok"] is True
+    result = resp["result"]
+    assert result["armed"] is False
+    assert result["hit_count"] == 0
+    assert "never armed" in result.get("note", "")
+
+
 def test_finish_return_value_void_and_missing(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()

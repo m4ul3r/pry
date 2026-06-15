@@ -1370,11 +1370,14 @@ class GdbBridge:
     def _dispatch_trace(self, params: dict[str, Any]) -> dict[str, Any]:
         """Trace memory accesses within a code range using hardware watchpoints.
 
-        Sets up a hardware watchpoint (initially disabled) and boundary
-        breakpoints.  The watchpoint is enabled when range_start is hit and
-        disabled when range_end is reached.  Each watchpoint hit records the
-        PC and instruction.  All automation runs inside GDB via
-        ``Breakpoint.stop()`` callbacks at native speed.
+        Sets up a hardware watchpoint that is active only while execution is
+        within [range_start, range_end): range_start enables it, range_end
+        disables it (without stopping), and it is also enabled up front if the
+        inferior is already stopped inside the range. The watchpoint stays
+        armed/disarmed across repeated passes, so hits accumulate over multiple
+        loop iterations up to max_hits. Each watchpoint hit records the PC and
+        instruction. All automation runs inside GDB via ``Breakpoint.stop()``
+        callbacks at native speed.
         """
         watch_addr = self._parse_addr(params["watch_addr"])
         watch_size = int(params.get("watch_size", 4))
@@ -1395,6 +1398,11 @@ class GdbBridge:
         # A mutable holder lets the start-BP reference the watchpoint that
         # is created after it.
         wp_holder: list[Any] = []
+        # Tracks whether the watchpoint was ever enabled during the trace. A
+        # `0 hits` result with armed=False means the trace window never opened
+        # (range_start never reached and execution never started inside the
+        # range) — a false negative, distinct from "armed but no accesses".
+        armed_holder: list[bool] = [False]
 
         def _setup_and_continue():
             try:
@@ -1410,13 +1418,20 @@ class GdbBridge:
                     def stop(self_bp):  # noqa: N805
                         if wp_holder:
                             wp_holder[0].enabled = True
+                            armed_holder[0] = True
                         return False  # auto-continue
 
                 class _RangeEndBP(gdb.Breakpoint):
                     def stop(self_bp):  # noqa: N805
+                        # Disarm on the way out of the range, but keep running:
+                        # range_start re-arms on the next pass, so the trace
+                        # accumulates across loop iterations up to max_hits.
+                        # (Previously this returned True and stopped the whole
+                        # trace at the first range_end, capping it at one pass
+                        # and making max_hits unreachable.)
                         if wp_holder:
                             wp_holder[0].enabled = False
-                        return True  # stop execution
+                        return False  # auto-continue
 
                 class _TraceWatchBP(gdb.Breakpoint):
                     def stop(self_bp):  # noqa: N805
@@ -1451,6 +1466,19 @@ class GdbBridge:
                 trace_wp.enabled = False
                 cleanup_bps.append(trace_wp)
                 wp_holder.append(trace_wp)
+
+                # If the inferior is already stopped inside the range, arm the
+                # watchpoint now. Otherwise a trace started mid-range (e.g.
+                # after `pry interrupt`) would silently record nothing whenever
+                # range_start is a one-shot address (like a function entry) that
+                # won't be reached again.
+                try:
+                    cur_pc = int(gdb.selected_frame().pc())
+                    if range_start <= cur_pc < range_end:
+                        trace_wp.enabled = True
+                        armed_holder[0] = True
+                except Exception:
+                    pass
 
                 gdb.execute("continue", to_string=True)
             except Exception as exc:
@@ -1521,11 +1549,23 @@ class GdbBridge:
             "hits": hits,
             "hit_count": len(hits),
             "truncated": len(hits) >= max_hits,
+            "armed": armed_holder[0],
             "watch_addr": hex(watch_addr),
             "watch_size": watch_size,
             "range_start": hex(range_start),
             "range_end": hex(range_end),
         }
+        if not hits and not armed_holder[0]:
+            # Distinguish a false negative (window never opened) from a genuine
+            # "no accesses occurred in range" so an agent doesn't read 0 hits as
+            # proof the address is untouched.
+            trace_result["note"] = (
+                f"watchpoint never armed: execution never entered the code range "
+                f"[{hex(range_start)}, {hex(range_end)}) during the trace, so no "
+                f"accesses could be recorded. Pick a range_start that lies on the "
+                f"execution path (e.g. inside the loop body), or start the trace "
+                f"with the inferior already stopped inside the range."
+            )
         if result_box:
             trace_result["stop_info"] = result_box[0]
 

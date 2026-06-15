@@ -1333,6 +1333,24 @@ def test_trace_sends_correct_params(monkeypatch, capsys):
     assert "mov eax" in output
 
 
+def test_trace_text_surfaces_never_armed_note(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {
+            "hits": [], "hit_count": 0, "armed": False,
+            "watch_addr": "0x404020", "watch_size": 8,
+            "range_start": "0x401136", "range_end": "0x40115d",
+            "note": "watchpoint never armed: execution never entered the code range "
+                    "[0x401136, 0x40115d) during the trace, so no accesses could be recorded.",
+        }}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["trace", "--watch", "0x404020", "--range", "0x401136-0x40115d"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "0 hits" in out
+    assert "never armed" in out  # the false-negative is no longer silent
+
+
 def test_trace_text_truncated_warning(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         return {
