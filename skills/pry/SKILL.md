@@ -261,16 +261,18 @@ pry trace --watch 0x7fffffffd5d4 --range 0x404610-0x405e30
 pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type access --timeout 60 --max-hits 1000
 ```
 
-Uses hardware watchpoints gated by range boundary breakpoints. All automation runs inside GDB at native speed via `Breakpoint.stop()` callbacks — no socket round-trips for intermediate hits.
+Uses a hardware watchpoint gated by the code range: it's armed while the PC is in `[START, END)` and disarmed outside it, and hits **accumulate across repeated passes** (e.g. every loop iteration) up to `--max-hits`. All automation runs inside GDB at native speed via `Breakpoint.stop()` callbacks — no socket round-trips for intermediate hits.
+
+**Pick `START` so it lies on the execution path** (typically the loop body), or start the trace with the inferior already stopped inside the range. If execution never enters the range during the trace, nothing is recorded and the result reports `armed: false` with an explanatory `note` — that is a "the window never opened" false negative, **not** proof the address was untouched. A plain `0 hits` with `armed: true` does mean no accesses occurred in range.
 
 If `--timeout` fires before `--max-hits`, the bridge auto-interrupts and returns the partial hits collected so far — the bridge stays usable, no relaunch needed.
 
 Options:
 - `--watch ADDR` — memory address to watch (required)
 - `--watch-size N` — bytes to watch (default: 4)
-- `--range START-END` — code address range (required)
+- `--range START-END` — code range that gates recording (required)
 - `--type write|read|access` — watch type (default: access)
-- `--max-hits N` — safety limit (default: 10000)
+- `--max-hits N` — stop after this many hits, accumulated across passes (default: 10000)
 - `--timeout N` — max seconds (default: 120)
 
 ## Inspection Commands

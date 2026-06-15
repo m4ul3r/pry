@@ -2461,6 +2461,9 @@ def _render_trace_text(value: Any) -> str:
     lines = [f"trace: {hit_count} hits on {watch} in range {rng}"]
     if value.get("truncated"):
         lines.append("warning: hit limit reached, trace may be incomplete")
+    note = value.get("note")
+    if note:
+        lines.append(f"warning: {note}")
     for h in value.get("hits", []):
         pc = h.get("pc", "?")
         asm = h.get("asm", "?")
@@ -3009,11 +3012,16 @@ def build_parser() -> argparse.ArgumentParser:
     trace_cmd.add_argument("--watch-size", type=_positive_int, default=4, metavar="N",
                            help="Number of bytes to watch (default: 4)")
     trace_cmd.add_argument("--range", required=True, metavar="START-END",
-                           help="Code address range (e.g., 0x404610-0x405e30)")
+                           help="Code range that gates recording (e.g., 0x404610-0x405e30): "
+                                "the watch is active only while the PC is in [START, END). START "
+                                "must lie on the execution path (e.g. inside the loop body) — or "
+                                "the inferior must already be stopped inside the range — or nothing "
+                                "is recorded (the result reports armed=false)")
     trace_cmd.add_argument("--type", choices=("write", "read", "access"), default="access",
                            dest="watch_type", help="Watch type (default: access)")
     trace_cmd.add_argument("--max-hits", type=_positive_int, default=10000, metavar="N",
-                           help="Maximum number of hits to record (default: 10000)")
+                           help="Stop after recording this many hits (default: 10000). Hits "
+                                "accumulate across repeated passes through the range")
     trace_cmd.set_defaults(handler=_trace)
 
     return parser
