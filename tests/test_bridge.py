@@ -908,6 +908,83 @@ def test_dispatch_exec_no_stop_event(monkeypatch):
     assert result["reason"] == {"kind": "step"}
 
 
+def test_dispatch_exec_rerun_ignores_restart_kill_exit(monkeypatch):
+    """A `run` that restarts a live inferior must report the new run's stop,
+    not the spurious code-less `exited` event GDB fires when it kills the
+    previous process. Regression for the re-run race (run reported `exited`
+    while the program was actually stopped at a breakpoint)."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    bp = bridge._dispatch_op("break_set", {"location": "main"})
+    bp_obj = fake_gdb.breakpoints()[0]
+    # The default fake inferior has a nonzero pid, so this `run` is a restart
+    # of a live inferior and the swallow is armed.
+    assert bridge._inferior_is_live() is True
+
+    def _restart_execute(cmd, to_string=False):
+        fake_gdb._execute_log.append(cmd)
+        if (cmd.split()[0] if cmd else "") == "run":
+            # GDB kills the prior inferior first: a code-less exited event...
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+            # ...then the fresh run reaches its breakpoint.
+            fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([bp_obj]))
+        return ""
+
+    fake_gdb.execute = _restart_execute
+
+    response = bridge.dispatch({"op": "run", "params": {}})
+    assert response["ok"] is True
+    result = response["result"]
+    assert result["status"] == "stopped"
+    assert result["reason"]["kind"] == "breakpoint-hit"
+    assert result["reason"]["number"] == bp["number"]
+
+
+def test_dispatch_exec_restart_still_reports_real_exit(monkeypatch):
+    """The restart-kill swallow is one-shot and code-less only: the new run's
+    genuine exit (which carries an exit_code) must still be reported."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    assert bridge._inferior_is_live() is True  # restart scenario
+
+    def _restart_execute(cmd, to_string=False):
+        fake_gdb._execute_log.append(cmd)
+        if (cmd.split()[0] if cmd else "") == "run":
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))  # kill
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(0))     # real exit
+        return ""
+
+    fake_gdb.execute = _restart_execute
+
+    response = bridge.dispatch({"op": "run", "params": {}})
+    assert response["ok"] is True
+    result = response["result"]
+    assert result["status"] == "exited"
+    assert result["reason"] == {"kind": "exited", "code": 0}
+
+
+def test_dispatch_exec_first_run_reports_codeless_exit(monkeypatch):
+    """When no inferior is live (first run / pid 0) the swallow stays disarmed,
+    so a code-less exit is a genuine outcome and is reported, not eaten."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)  # not live
+    assert bridge._inferior_is_live() is False
+
+    def _execute(cmd, to_string=False):
+        fake_gdb._execute_log.append(cmd)
+        if (cmd.split()[0] if cmd else "") == "run":
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+        return ""
+
+    fake_gdb.execute = _execute
+
+    response = bridge.dispatch({"op": "run", "params": {}})
+    assert response["ok"] is True
+    assert response["result"]["status"] == "exited"
+
+
 def test_looks_like_function_name(monkeypatch):
     bridge_mod, _ = _load_bridge(monkeypatch)
     f = bridge_mod.GdbBridge._looks_like_function_name
