@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import tiktoken
@@ -44,8 +43,7 @@ def test_write_output_spills_large_payload(tmp_path, monkeypatch):
 
     assert result.spilled
     envelope = json.loads(result.rendered)
-    artifact_root = tempfile.gettempdir()
-    assert envelope["artifact_path"].startswith(artifact_root)
+    assert envelope["artifact_path"].startswith(str(tmp_path / "spills"))
     artifact_text = Path(envelope["artifact_path"]).read_text()
     assert envelope["tokenizer"] == TOKENIZER
     assert envelope["tokens"] == _token_count(artifact_text)

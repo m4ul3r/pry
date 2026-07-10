@@ -199,7 +199,7 @@ pry --instance 12345 break set handle_request
 
 ## Output spilling
 
-When output exceeds 10,000 tokens (measured with the `o200k_base` tokenizer), pry automatically spills to `/tmp/pry-spills/` and prints an artifact envelope to stderr with the path, byte count, token count, and SHA-256. This prevents blowing agent context windows. Use `--out <path>` to always write to a file.
+When output exceeds 10,000 tokens (measured with the `o200k_base` tokenizer), pry automatically spills under the pry cache (`~/.cache/pry/spills/` by default, or `$PRY_CACHE_DIR/spills`) and prints an artifact envelope to stderr with the path, byte count, token count, and SHA-256. This prevents blowing agent context windows. Use `--out <path>` to always write to a file.
 
 ## Wire protocol
 

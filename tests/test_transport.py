@@ -70,6 +70,7 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+        socket_path.unlink(missing_ok=True)
 
 
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
@@ -78,30 +79,33 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     stale_socket_path = Path("/tmp") / f"pry-stale-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
-    stale_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stale_server.bind(str(stale_socket_path))
-    stale_server.listen(1)
-    stale_server.close()
+    try:
+        stale_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale_server.bind(str(stale_socket_path))
+        stale_server.listen(1)
+        stale_server.close()
 
-    registry_path.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "socket_path": str(stale_socket_path),
-                "plugin_name": "pry_agent_bridge",
-                "plugin_version": "0.1.0",
-            }
-        ),
-        encoding="utf-8",
-    )
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "socket_path": str(stale_socket_path),
+                    "plugin_name": "pry_agent_bridge",
+                    "plugin_version": "0.1.0",
+                }
+            ),
+            encoding="utf-8",
+        )
 
-    assert stale_socket_path.exists()
+        assert stale_socket_path.exists()
 
-    instances = list_instances()
+        instances = list_instances()
 
-    assert instances == []
-    assert not registry_path.exists()
-    assert stale_socket_path.exists()
+        assert instances == []
+        assert not registry_path.exists()
+        assert stale_socket_path.exists()
+    finally:
+        stale_socket_path.unlink(missing_ok=True)
 
 
 def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
@@ -246,3 +250,4 @@ def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeyp
     finally:
         server.shutdown()
         server.server_close()
+        socket_path.unlink(missing_ok=True)
