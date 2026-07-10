@@ -235,6 +235,8 @@ pry watch disable 2                         # Disable watchpoint #2
 pry watch list                              # List all (same as break list)
 ```
 
+**Multi-location breakpoints:** GDB can resolve one symbolic breakpoint to several sites (common with inlined callees — e.g. `free_msg` may also land inside `load_msg`). `pry break set` / `pry break list` report `location_count` and a full `locations[]` of `{address,file,line,function}` (text lists every site). Do not assume the top-level `address`/`function` is the only hit site; inspect `locations` when `location_count > 1`.
+
 ### PIE/ASLR rebasing
 
 For PIE binaries, use `--rebase MODULE` to set breakpoints by static analysis offset — pry resolves the runtime address automatically:
