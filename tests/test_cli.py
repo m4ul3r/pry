@@ -334,6 +334,42 @@ def test_run_text_rendering_signal(monkeypatch, capsys):
     assert "reason: signal SIGSEGV" in output
 
 
+def test_run_stdin_file_sends_absolute_path(monkeypatch, tmp_path, capsys):
+    payload = tmp_path / "p.bin"
+    payload.write_bytes(b"\x00\x11payload")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "status": "stopped",
+                "reason": {"kind": "exited", "code": 0},
+                "frame": None,
+                "thread": None,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["run", "--stdin-file", str(payload), "arg1", "arg2"])
+
+    assert rc == 0
+    assert captured["op"] == "run"
+    assert captured["params"]["stdin_file"] == str(payload.resolve())
+    assert captured["params"]["args"] == ["arg1", "arg2"]
+
+
+def test_run_stdin_file_missing_errors(tmp_path, capsys):
+    missing = tmp_path / "missing.bin"
+    rc = pry.cli.main(["run", "--stdin-file", str(missing)])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "stdin file not found" in err
+
+
 def test_registers_text_rendering(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         return {

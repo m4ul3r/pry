@@ -2025,7 +2025,54 @@ class GdbBridge:
             else:
                 arg_str = str(args)
             gdb.execute(f"set args {arg_str}", to_string=True)
+
+        stdin_file = params.get("stdin_file")
+        if stdin_file:
+            return self._run_with_stdin_file(str(stdin_file))
         return self._exec_and_stop("run")
+
+    def _run_with_stdin_file(self, stdin_file: str) -> Any:
+        """Run the inferior with *stdin_file* as its real stdin (fd 0).
+
+        Opens the file and temporarily dup2's it onto GDB's stdin so the
+        inferior inherits a direct file descriptor at fork/exec. This keeps
+        ``startup-with-shell off`` (byte-precise argv), feeds raw bytes
+        without a PTY (no cooked-mode XON/XOFF footguns), and restores GDB's
+        original stdin afterwards (the keepalive pipe under ``pry launch``).
+
+        Shell-style ``run < file`` remains unsupported under pry because
+        launch disables startup-with-shell; use ``pry run --stdin-file``.
+        """
+        path = Path(stdin_file).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"stdin file not found: {stdin_file}"
+            ) from exc
+        if not path.is_file():
+            raise RuntimeError(f"stdin file is not a regular file: {path}")
+
+        payload_fd = os.open(path, os.O_RDONLY)
+        saved_stdin = -1
+        try:
+            saved_stdin = os.dup(0)
+            os.dup2(payload_fd, 0)
+            os.close(payload_fd)
+            payload_fd = -1
+            return self._exec_and_stop("run")
+        finally:
+            # Always put GDB's stdin back — under pry launch fd 0 is the
+            # keepalive pipe; leaving it on a drained payload file would make
+            # GDB see EOF and may tear the session down.
+            if saved_stdin >= 0:
+                with contextlib.suppress(OSError):
+                    os.dup2(saved_stdin, 0)
+                with contextlib.suppress(OSError):
+                    os.close(saved_stdin)
+            if payload_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(payload_fd)
 
     def _continue(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._exec_and_stop("continue")

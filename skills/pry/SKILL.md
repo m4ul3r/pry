@@ -141,6 +141,7 @@ Outputs above 10,000 `o200k_base` tokens auto-spill to disk. When that happens, 
 
 ```bash
 pry run [args...]            # Run the program (blocks until stop/exit)
+pry run --stdin-file /path/to/payload [args...]  # Feed raw stdin from a file (CTF/exploit)
 pry continue                 # Continue from current stop
 pry step [count]             # Step into (source-level)
 pry next [count]             # Step over (source-level)
@@ -161,6 +162,8 @@ pry thread select 3          # Make thread 3 the persistently selected one
 `pry finish` reports the function's return value as `return value: ...` (x86-64 integer/pointer returns; void/float/struct are omitted). Most inspection commands accept `--thread N` to run against a specific thread without persistently switching (the prior selection is restored); use `pry thread select N` to switch persistently.
 
 Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
+
+**Stdin for the inferior:** use `pry run --stdin-file PATH` to open `PATH` as the inferior's real stdin (fd 0). Bytes are delivered raw — no PTY, so cooked-mode XON/XOFF cannot eat payload bytes (e.g. `0x11` in addresses). Program args stay separate (`pry run --stdin-file payload.bin arg1 arg2`). Shell-style redirection via `pry gdb 'run < file'` is **not** supported: `pry launch` sets `startup-with-shell off` for byte-precise argv, so `<` and the path become argv tokens. Prefer `--stdin-file`.
 
 `pry status` reports one of: `running`, `stopped`, `exited`, or `not-started`.
 
@@ -403,6 +406,7 @@ pry info target                  # Show target connection info
 
 ## Known Quirks
 
+- **No shell stdin redirect via `pry gdb 'run < file'`**: launch disables `startup-with-shell`, so `<` and the path become argv. Use `pry run --stdin-file PATH` for true file-as-stdin (raw bytes, no PTY).
 - **Multiple sessions require `--instance`**: commands auto-select the bridge only when exactly one `pry launch` session is alive. The moment a second one exists, every command needs `pry --instance <pid> ...` or it hard-errors — copying a bare example will fail. Run `pry doctor` to list live PIDs.
 - **Socket timeout vs bridge timeout**: without `--timeout`, the CLI socket gives up at 30s while the bridge only auto-interrupts at 120s — so a plain `pry continue` on a program that runs >30s returns a transport error even though the inferior is still running. For long runs pass `--timeout N` (the bridge honors it and auto-interrupts) or use `--background` + `pry wait`.
 - **Execution commands block**: `pry run`, `pry continue`, `pry finish` block until the inferior stops. Use `--timeout` for auto-interrupt recovery, or `--background` to return immediately and poll with `pry status`/`pry wait`.
