@@ -2030,12 +2030,17 @@ def test_load_with_gdb_scripts_sources_and_safe_path(monkeypatch):
     assert result["gdb_scripts"] == scripts
     assert result["src"] == "/home/user/linux"
     log = fake_gdb._execute_log
-    assert any(c == "add-auto-load-safe-path /home/user/linux/scripts/gdb" for c in log)
-    assert any(c == "add-auto-load-safe-path /home/user/linux/scripts" for c in log)
-    assert any(c == f"source {scripts}" for c in log)
-    assert any(c == "directory /home/user/linux" for c in log)
+    assert "add-auto-load-safe-path /home/user/linux/scripts/gdb" in log
+    assert "add-auto-load-safe-path /home/user/linux/scripts" in log
+    assert f"source {scripts}" in log
+    assert "directory /home/user/linux" in log
+    # add-auto-load-safe-path MUST precede `source`, or GDB refuses to auto-load
+    # the script. This ordering is the whole point of the feature — pin it.
+    assert log.index("add-auto-load-safe-path /home/user/linux/scripts/gdb") < log.index(
+        f"source {scripts}"
+    )
     # Relocated load still happens first.
-    assert any(c == "add-symbol-file /x/vmlinux -o 0x1000" for c in log)
+    assert "add-symbol-file /x/vmlinux -o 0x1000" in log
 
 
 def test_load_gdb_scripts_source_failure_raises(monkeypatch):
