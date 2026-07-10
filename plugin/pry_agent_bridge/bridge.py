@@ -1878,13 +1878,45 @@ class GdbBridge:
             pass
         return False
 
+    def _apply_src_and_scripts(
+        self, result: dict[str, Any], params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """After loading symbols, optionally map source paths and load lx scripts."""
+        src = params.get("src")
+        if src:
+            gdb.execute(f"directory {src}", to_string=True)
+            # Docker/kbuild images often compile with absolute paths under /src.
+            with contextlib.suppress(gdb.error):
+                gdb.execute(f"set substitute-path /src {src}", to_string=True)
+            result["src"] = src
+
+        gdb_scripts = params.get("gdb_scripts")
+        if gdb_scripts:
+            scripts_dir = os.path.dirname(gdb_scripts) or "."
+            # Linux scripts check auto-load-safe-path against the scripts tree
+            # (and often the kernel root above scripts/gdb/).
+            with contextlib.suppress(gdb.error):
+                gdb.execute(f"add-auto-load-safe-path {scripts_dir}", to_string=True)
+            parent = os.path.dirname(scripts_dir)
+            if parent and parent != scripts_dir:
+                with contextlib.suppress(gdb.error):
+                    gdb.execute(f"add-auto-load-safe-path {parent}", to_string=True)
+            try:
+                gdb.execute(f"source {gdb_scripts}", to_string=True)
+            except gdb.error as exc:
+                raise RuntimeError(
+                    f"failed to source GDB scripts {gdb_scripts}: {exc}"
+                ) from exc
+            result["gdb_scripts"] = gdb_scripts
+        return result
+
     def _load(self, params: dict[str, Any]) -> dict[str, Any]:
         path = params["path"]
         base = params.get("base")
         slide = params.get("slide")
         if base is None and slide is None:
             gdb.execute(f"file {path}", to_string=True)
-            return {"loaded": path}
+            return self._apply_src_and_scripts({"loaded": path}, params)
         if base is not None and slide is not None:
             raise ValueError("pass either --base or --slide, not both")
         # Load symbols at a runtime base (relocated/PIE/KASLR module). Two
@@ -1922,7 +1954,7 @@ class GdbBridge:
         result: dict[str, Any] = {"loaded": path, "slide": hex(slide_int)}
         if base is not None:
             result["base"] = hex(self._parse_addr(base))
-        return result
+        return self._apply_src_and_scripts(result, params)
 
     @staticmethod
     def _pid_exists(pid: int) -> bool:

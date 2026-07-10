@@ -87,6 +87,18 @@ pry continue                        # Continue execution
 > ```
 > Do **not** use `kbase -r` for this — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
 
+> **Kernel source + lx scripts:** DWARF often has relative paths (`kernel/sys.c`) or absolute Docker kbuild paths (`/src/...`), so `pry source list` fails until GDB knows where the tree is. Linux also ships `scripts/gdb/vmlinux-gdb.py` (`lx-ps`, `$lx_current()`, …) that is **not** auto-loaded from a cached vmlinux alone:
+> ```bash
+> # After connect + kbase (see KASLR above):
+> pry load $VMLINUX --base $KBASE --src /path/to/linux-src --gdb-scripts
+> # --src         → `directory DIR` + `set substitute-path /src DIR`
+> # --gdb-scripts → auto-find DIR/scripts/gdb/vmlinux-gdb.py (or sibling of vmlinux)
+> #                 then add-auto-load-safe-path + source it
+> # Or pass an explicit script: --gdb-scripts /path/to/vmlinux-gdb.py
+> pry source list __x64_sys_newuname
+> pry gdb 'p $lx_current()->pid'
+> ```
+
 ### Connection management
 
 ```bash

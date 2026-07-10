@@ -1791,6 +1791,62 @@ def _kill_instance(pid: int) -> None:
 
 # --- Session management ---
 
+def resolve_gdb_scripts_path(
+    binary_path: Path,
+    *,
+    src: Path | None = None,
+    scripts: str | Path | None = None,
+) -> Path:
+    """Resolve the path to Linux's ``vmlinux-gdb.py`` helper.
+
+    *scripts*:
+      - a concrete path → expand/resolve and require the file to exist
+      - ``\"auto\"`` / ``None`` → search well-known locations relative to
+        *src* and *binary_path* (the vmlinux / symbol file)
+
+    Search order for auto mode:
+      1. ``{src}/scripts/gdb/vmlinux-gdb.py`` when *src* is set
+      2. ``{dirname(binary)}/vmlinux-gdb.py`` (sibling of vmlinux)
+      3. ``{dirname(binary)}/scripts/gdb/vmlinux-gdb.py``
+
+    Raises ``FileNotFoundError`` with a clear message when nothing matches.
+    """
+    if scripts is not None and str(scripts) not in ("", "auto"):
+        path = Path(scripts).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"GDB scripts file not found: {path}"
+            )
+        return path
+
+    candidates: list[Path] = []
+    if src is not None:
+        candidates.append(src / "scripts" / "gdb" / "vmlinux-gdb.py")
+    parent = binary_path.parent
+    candidates.append(parent / "vmlinux-gdb.py")
+    candidates.append(parent / "scripts" / "gdb" / "vmlinux-gdb.py")
+
+    seen: set[Path] = set()
+    for cand in candidates:
+        try:
+            resolved = cand.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+
+    tried = ", ".join(str(c) for c in candidates) or "(none)"
+    hint = ""
+    if src is None:
+        hint = " Pass --src <kernel-tree> or --gdb-scripts <path>."
+    raise FileNotFoundError(
+        f"could not auto-detect vmlinux-gdb.py (tried: {tried}).{hint}"
+    )
+
+
 def _render_load_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1798,20 +1854,51 @@ def _render_load_text(value: Any) -> str:
     base = value.get("base")
     slide = value.get("slide")
     if base:
-        return f"loaded {path} @ {base} (slide {slide})"
-    if slide:
-        return f"loaded {path} (slide {slide})"
-    return f"loaded {path}"
+        line = f"loaded {path} @ {base} (slide {slide})"
+    elif slide:
+        line = f"loaded {path} (slide {slide})"
+    else:
+        line = f"loaded {path}"
+    extras: list[str] = []
+    src = value.get("src")
+    if src:
+        extras.append(f"src {src}")
+    gdb_scripts = value.get("gdb_scripts")
+    if gdb_scripts:
+        extras.append(f"scripts {gdb_scripts}")
+    if extras:
+        line = f"{line}; " + "; ".join(extras)
+    return line
 
 
 def _load(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {"path": str(Path(args.path).expanduser().resolve())}
+    binary = Path(args.path).expanduser().resolve()
+    params: dict[str, Any] = {"path": str(binary)}
     base = getattr(args, "base", None)
     slide = getattr(args, "slide", None)
     if base:
         params["base"] = base
     if slide:
         params["slide"] = slide
+
+    src_arg = getattr(args, "src", None)
+    src_path: Path | None = None
+    if src_arg:
+        src_path = Path(src_arg).expanduser().resolve()
+        if not src_path.is_dir():
+            raise BridgeError(f"--src directory not found: {src_path}")
+        params["src"] = str(src_path)
+
+    gdb_scripts_arg = getattr(args, "gdb_scripts", None)
+    if gdb_scripts_arg is not None:
+        try:
+            scripts_path = resolve_gdb_scripts_path(
+                binary, src=src_path, scripts=gdb_scripts_arg
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(str(exc)) from exc
+        params["gdb_scripts"] = str(scripts_path)
+
     return _call(
         args,
         "load",
@@ -2730,6 +2817,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--slide", metavar="OFFSET",
         help="Offset added to every section (alternative to --base when the file's "
              ".text address can't be read).",
+    )
+    load.add_argument(
+        "--src", metavar="DIR",
+        help="Kernel (or project) source root: run GDB `directory DIR` so relative "
+             "DWARF paths resolve, and `set substitute-path /src DIR` for Docker "
+             "kbuild artifacts that embed absolute /src/... paths.",
+    )
+    load.add_argument(
+        "--gdb-scripts",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="PATH",
+        help="Source Linux vmlinux-gdb.py (lx-* helpers, $lx_current()). "
+             "With PATH, source that file; with the flag alone, auto-detect under "
+             "--src/scripts/gdb/ or next to the binary. Adds the scripts dir to "
+             "auto-load-safe-path first.",
     )
     load.set_defaults(handler=_load)
 

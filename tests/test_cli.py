@@ -1731,6 +1731,146 @@ def test_load_slide_sends_param(monkeypatch, capsys):
     assert "loaded /x/vmlinux (slide 0x7000000)" in out
 
 
+def test_resolve_gdb_scripts_path_explicit(tmp_path):
+    scripts = tmp_path / "custom" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, scripts=scripts)
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_explicit_missing(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    with pytest.raises(FileNotFoundError, match="not found"):
+        pry.cli.resolve_gdb_scripts_path(vmlinux, scripts=tmp_path / "nope.py")
+
+
+def test_resolve_gdb_scripts_path_auto_from_src(tmp_path):
+    src = tmp_path / "linux"
+    scripts = src / "scripts" / "gdb" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "artifacts" / "vmlinux"
+    vmlinux.parent.mkdir()
+    vmlinux.write_text("x")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, src=src, scripts="auto")
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_auto_sibling(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    scripts = tmp_path / "vmlinux-gdb.py"
+    scripts.write_text("# fake\n")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, scripts="auto")
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_auto_under_binary_scripts(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    scripts = tmp_path / "scripts" / "gdb" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, scripts=None)
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_auto_missing(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    with pytest.raises(FileNotFoundError, match="could not auto-detect"):
+        pry.cli.resolve_gdb_scripts_path(vmlinux, scripts="auto")
+
+
+def test_load_src_and_gdb_scripts_sends_params(monkeypatch, capsys, tmp_path):
+    src = tmp_path / "linux"
+    scripts = src / "scripts" / "gdb" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "loaded": params["path"],
+                "base": params.get("base"),
+                "slide": "0x1",
+                "src": params.get("src"),
+                "gdb_scripts": params.get("gdb_scripts"),
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main([
+        "load", str(vmlinux),
+        "--base", "0xffffffff84400000",
+        "--src", str(src),
+        "--gdb-scripts",
+        "--format", "text",
+    ])
+    assert rc == 0
+    assert captured["op"] == "load"
+    assert captured["params"]["src"] == str(src.resolve())
+    assert captured["params"]["gdb_scripts"] == str(scripts.resolve())
+    out = capsys.readouterr().out
+    assert f"src {src.resolve()}" in out
+    assert f"scripts {scripts.resolve()}" in out
+
+
+def test_load_gdb_scripts_explicit_path(monkeypatch, tmp_path):
+    scripts = tmp_path / "my-vmlinux-gdb.py"
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["params"] = params
+        return {"ok": True, "result": {"loaded": params["path"], "gdb_scripts": params["gdb_scripts"]}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["load", str(vmlinux), "--gdb-scripts", str(scripts)])
+    assert rc == 0
+    assert captured["params"]["gdb_scripts"] == str(scripts.resolve())
+
+
+def test_load_gdb_scripts_auto_missing_errors(monkeypatch, capsys, tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    monkeypatch.setattr(
+        pry.cli,
+        "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not send")),
+    )
+    rc = pry.cli.main(["load", str(vmlinux), "--gdb-scripts"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "could not auto-detect" in err or "vmlinux-gdb.py" in err
+
+
+def test_load_src_missing_dir_errors(monkeypatch, capsys, tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    monkeypatch.setattr(
+        pry.cli,
+        "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not send")),
+    )
+    rc = pry.cli.main(["load", str(vmlinux), "--src", str(tmp_path / "no-such-src")])
+    assert rc == 1
+    assert "not found" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Agent-ease review fixes: kill --all, logs
 # ---------------------------------------------------------------------------

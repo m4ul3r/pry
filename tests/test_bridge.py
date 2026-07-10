@@ -2119,6 +2119,74 @@ def test_load_rejects_base_and_slide_together(monkeypatch):
     assert "both" in resp["error"]
 
 
+def test_load_with_src_sets_directory_and_substitute_path(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    src = "/home/user/linux-src"
+    result = bridge._dispatch_op(
+        "load", {"path": "/x/vmlinux", "src": src}
+    )
+    assert result["loaded"] == "/x/vmlinux"
+    assert result["src"] == src
+    log = fake_gdb._execute_log
+    assert any(c == f"directory {src}" for c in log)
+    assert any(c == f"set substitute-path /src {src}" for c in log)
+
+
+def test_load_with_gdb_scripts_sources_and_safe_path(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    scripts = "/home/user/linux/scripts/gdb/vmlinux-gdb.py"
+    result = bridge._dispatch_op(
+        "load",
+        {
+            "path": "/x/vmlinux",
+            "slide": "0x1000",
+            "src": "/home/user/linux",
+            "gdb_scripts": scripts,
+        },
+    )
+    assert result["gdb_scripts"] == scripts
+    assert result["src"] == "/home/user/linux"
+    log = fake_gdb._execute_log
+    assert "add-auto-load-safe-path /home/user/linux/scripts/gdb" in log
+    assert "add-auto-load-safe-path /home/user/linux/scripts" in log
+    assert f"source {scripts}" in log
+    assert "directory /home/user/linux" in log
+    # add-auto-load-safe-path MUST precede `source`, or GDB refuses to auto-load
+    # the script. This ordering is the whole point of the feature — pin it.
+    assert log.index("add-auto-load-safe-path /home/user/linux/scripts/gdb") < log.index(
+        f"source {scripts}"
+    )
+    # Relocated load still happens first.
+    assert "add-symbol-file /x/vmlinux -o 0x1000" in log
+
+
+def test_load_gdb_scripts_source_failure_raises(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    orig = fake_gdb.execute
+
+    def _execute(cmd, to_string=False):
+        if cmd.startswith("source "):
+            raise fake_gdb.error("No such file or directory")
+        return orig(cmd, to_string=to_string)
+
+    fake_gdb.execute = _execute
+    resp = bridge.dispatch(
+        {
+            "op": "load",
+            "params": {
+                "path": "/x/vmlinux",
+                "gdb_scripts": "/missing/vmlinux-gdb.py",
+            },
+        }
+    )
+    assert resp["ok"] is False
+    assert "failed to source" in resp["error"]
+    assert "/missing/vmlinux-gdb.py" in resp["error"]
+
+
 def test_disasm_count_zero_or_negative_returns_empty_list(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
