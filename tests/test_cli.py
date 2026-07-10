@@ -1096,6 +1096,78 @@ def test_gdb_exec_empty_output(monkeypatch, capsys):
     assert "(no output)" in output
 
 
+@pytest.mark.parametrize(
+    "command,output",
+    [
+        ("kbase", "Unable to locate the kernel base\n"),
+        ("kbase -r", "kernel memory mappings are missing\n"),
+        ("klookup commit_creds", "kbase does not work when kernel-vmmap is set to none\n"),
+        ("klookup", "\x1b[31mUnable to locate the kernel base\x1b[0m\n"),
+    ],
+)
+def test_gdb_exec_kernel_helper_soft_failure_exits_nonzero(monkeypatch, capsys, command, output):
+    """pwndbg kbase/klookup print soft errors as output; agents need exit ≠ 0."""
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"output": output}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", command])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Unable to locate the kernel base" in captured.err or "kernel memory" in captured.err or "kernel-vmmap" in captured.err
+
+
+def test_gdb_exec_kernel_helper_soft_failure_json_error_shape(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"output": "Unable to locate the kernel base\n"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "--format", "json", "kbase"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload == {"ok": False, "error": "Unable to locate the kernel base"}
+
+
+def test_gdb_exec_success_kbase_still_exits_zero(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {"output": "Found virtual text base address: 0xffffffff81000000\n"},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "kbase"])
+
+    assert rc == 0
+    assert "0xffffffff81000000" in capsys.readouterr().out
+
+
+def test_gdb_exec_unrelated_command_with_failure_phrase_still_exits_zero(monkeypatch, capsys):
+    """Do not hard-fail general passthrough just because output mentions a phrase."""
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {"output": "note: Unable to locate the kernel base is a kbase error\n"},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "echo note"])
+
+    assert rc == 0
+    assert "Unable to locate the kernel base" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # Feature 1: Timeout propagation to bridge
 # ---------------------------------------------------------------------------

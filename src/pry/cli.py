@@ -2375,6 +2375,19 @@ def _source_list(args: argparse.Namespace) -> int:
 
 # --- Raw GDB command passthrough ---
 
+# pwndbg kernel helpers often print a failure string via gdb.execute(...,
+# to_string=True) without raising, so the bridge returns ok:true with the
+# error text as "output". Agents then treat exit 0 as a successful KASLR
+# probe. Special-case the well-known helpers + phrases only — leave general
+# `pry gdb` passthrough alone.
+_KERNEL_HELPER_COMMANDS = frozenset({"kbase", "klookup"})
+_KERNEL_HELPER_FAILURE_PHRASES = (
+    "unable to locate the kernel base",
+    "kernel memory mappings are missing",
+    "kbase does not work when kernel-vmmap is set to none",
+)
+
+
 def _strip_gdb_exec_ansi(result: Any) -> Any:
     """Strip ANSI escapes from gdb passthrough output for non-TTY consumers.
 
@@ -2392,6 +2405,43 @@ def _strip_gdb_exec_ansi(result: Any) -> Any:
     return result
 
 
+def _gdb_command_basename(command: str) -> str:
+    """First whitespace-delimited token of a GDB command string."""
+    parts = command.strip().split(None, 1)
+    return parts[0] if parts else ""
+
+
+def _kernel_helper_failure_message(command: str, output: str) -> str | None:
+    """Return a user-facing error if a known pwndbg kernel helper soft-failed.
+
+    Matches only ``kbase`` / ``klookup`` (with optional args) against clear
+    failure phrases from pwndbg. Returns None for everything else so ordinary
+    GDB output keeps exiting 0.
+    """
+    base = _gdb_command_basename(command).lower()
+    if base not in _KERNEL_HELPER_COMMANDS:
+        return None
+    cleaned = _ANSI_ESCAPE_RE.sub("", output or "")
+    lowered = cleaned.lower()
+    if not any(phrase in lowered for phrase in _KERNEL_HELPER_FAILURE_PHRASES):
+        return None
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return cleaned.strip() or "kernel helper failed"
+
+
+def _map_gdb_exec_result(command: str, result: Any) -> Any:
+    """Strip ANSI, then hard-fail known kbase/klookup soft errors."""
+    result = _strip_gdb_exec_ansi(result)
+    if isinstance(result, dict):
+        msg = _kernel_helper_failure_message(command, str(result.get("output") or ""))
+        if msg is not None:
+            raise BridgeError(msg)
+    return result
+
+
 def _gdb_exec(args: argparse.Namespace) -> int:
     command = args.command
     timeout = getattr(args, "timeout", None)
@@ -2403,7 +2453,7 @@ def _gdb_exec(args: argparse.Namespace) -> int:
         "gdb_exec",
         params,
         text_renderer=_render_gdb_exec_text,
-        map_result=_strip_gdb_exec_ansi,
+        map_result=lambda result: _map_gdb_exec_result(command, result),
         stem="gdb_exec",
         timeout=timeout,
     )
