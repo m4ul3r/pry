@@ -1103,6 +1103,8 @@ def test_gdb_exec_empty_output(monkeypatch, capsys):
         ("kbase -r", "kernel memory mappings are missing\n"),
         ("klookup commit_creds", "kbase does not work when kernel-vmmap is set to none\n"),
         ("klookup", "\x1b[31mUnable to locate the kernel base\x1b[0m\n"),
+        ("klookup commit_creds", "No symbol found for commit_creds\n"),
+        ("klookup 0xffffffff81000000", "No symbol found at 0xffffffff81000000\n"),
     ],
 )
 def test_gdb_exec_kernel_helper_soft_failure_exits_nonzero(monkeypatch, capsys, command, output):
@@ -1118,7 +1120,12 @@ def test_gdb_exec_kernel_helper_soft_failure_exits_nonzero(monkeypatch, capsys, 
     assert rc == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "Unable to locate the kernel base" in captured.err or "kernel memory" in captured.err or "kernel-vmmap" in captured.err
+    assert (
+        "Unable to locate the kernel base" in captured.err
+        or "kernel memory" in captured.err
+        or "kernel-vmmap" in captured.err
+        or "No symbol found" in captured.err
+    )
 
 
 def test_gdb_exec_kernel_helper_soft_failure_json_error_shape(monkeypatch, capsys):

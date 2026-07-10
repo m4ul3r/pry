@@ -2385,6 +2385,10 @@ _KERNEL_HELPER_FAILURE_PHRASES = (
     "unable to locate the kernel base",
     "kernel memory mappings are missing",
     "kbase does not work when kernel-vmmap is set to none",
+    # pwndbg `klookup` prints this on a lookup miss ("No symbol found at/for ...").
+    # Safe to match broadly because detection is already scoped to the
+    # kbase/klookup commands in _kernel_helper_failure_message().
+    "no symbol found",
 )
 
 
