@@ -11,9 +11,12 @@ When connected to a QEMU kernel with KASLR enabled, vmlinux symbols are at link-
 pry launch --connect localhost:1234   # connect WITHOUT --symbols (no link-time copy)
                                       # (with qmu: `qmu gdb --vm <id>` and DON'T pass --symbols)
 pry gdb kbase                         # -> "Found virtual text base address: 0x...."
-pry load ./vmlinux --base 0x<kbase>   # one clean copy; pry offsets ALL sections by the slide
+pry load ./vmlinux --base 0x<kbase> --src /path/to/linux-src --gdb-scripts
+# one clean copy; offsets ALL sections; maps source; sources vmlinux-gdb.py (lx-*)
 pry break set commit_creds            # symbol breakpoints, print, disasm now resolve correctly
 pry print "init_task.comm"            # data symbols work too
+pry source list commit_creds          # needs --src when DWARF paths are relative / under /src
+pry gdb 'p $lx_current()->pid'        # needs --gdb-scripts (Linux lx helpers)
 pry continue
 ```
 
