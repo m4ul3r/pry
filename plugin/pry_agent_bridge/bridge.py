@@ -377,8 +377,10 @@ def parse_qemu_monitor_idt(monitor_output: str) -> tuple[int, int] | None:
 def parse_idt_entry_offset(entry: bytes) -> int:
     """Return the handler virtual address from a raw IDT gate descriptor.
 
-    Supports 16-byte x86-64 and 8-byte i386 layouts (same bit packing as
-    pwndbg's ``IDTEntry``).
+    Decodes a 16-byte x86-64 gate. An 8-byte i386 gate is decoded too when a
+    caller passes exactly 8 bytes, but the live ``pry kbase`` path only targets
+    x86-64: it cannot distinguish 32- vs 64-bit mode from the stub, so it always
+    reads a 16-byte descriptor. i386 is not a supported live target.
     """
     if len(entry) == 16:
         lo = int.from_bytes(entry[0:2], "little")
@@ -3344,12 +3346,16 @@ class GdbBridge:
             attempt["idt_limit"] = hex(idt_limit)
         attempt["idt_source"] = source
 
-        # x86-64 IDT entries are 16 bytes; i386 are 8. Prefer 16.
+        # x86-64 IDT entries are 16 bytes. This path targets x86-64 only; on a
+        # real 32-bit guest a 16-byte read succeeds and would mis-parse entry 1's
+        # bytes as offset_high, so i386 is not reliably supported here. The
+        # 8-byte fallback below only covers the rare case where reading 16 bytes
+        # fails (e.g. a single mapped gate at the edge of readable memory).
         entry_size = 16
         try:
             raw = self._read_remote_memory(idt_base, entry_size)
         except Exception as exc:
-            # Retry as 8-byte i386 gate.
+            # Fallback: retry an 8-byte read (best-effort, not full i386 support).
             try:
                 entry_size = 8
                 raw = self._read_remote_memory(idt_base, entry_size)
@@ -3374,11 +3380,13 @@ class GdbBridge:
                 return {"attempt": attempt}
 
         attempt["handler"] = hex(handler)
-        base = estimate_kbase_from_handler(
-            handler,
-            align=_KBASE_ALIGN_2M,
-            readable=lambda a: self._memory_readable(a, 1),
-        )
+        # IDT[0] (asm_exc_divide_error) sits within the first 2 MiB window of
+        # _text on Linux, so rounding the handler down to the KASLR alignment is
+        # already exact. Do NOT pass a `readable` walk-down here: the walk can
+        # only move the estimate *below* the true base (and would silently do so
+        # if any 2 MiB page under _text happens to be mapped), which mis-rebases
+        # every symbol. Round-down only.
+        base = estimate_kbase_from_handler(handler, align=_KBASE_ALIGN_2M)
         # If 2 MiB walk didn't move and the handler is far above, also try 1 GiB
         # only when the 2 MiB candidate is unreadable (unlikely); keep 2 MiB.
         if not self._memory_readable(base, 1):
