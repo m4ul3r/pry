@@ -594,6 +594,31 @@ def test_memory_read_text_includes_address_by_default(monkeypatch, capsys):
     assert capsys.readouterr().out == "0x401000: 41424344\n"
 
 
+def test_memory_read_accepts_hex_and_decimal_length(monkeypatch, capsys):
+    # Lengths from GDB/disasm are often hex (0x10); decimal must still work.
+    seen: list[int] = []
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        assert op == "memory_read"
+        seen.append(params["length"])
+        length = params["length"]
+        return {
+            "ok": True,
+            "result": {
+                "address": "0x401000",
+                "length": length,
+                "format": "hex",
+                "data": "00" * length,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    assert pry.cli.main(["memory", "read", "0x401000", "16"]) == 0
+    assert pry.cli.main(["memory", "read", "0x401000", "0x10"]) == 0
+    assert seen == [16, 16]
+
+
 def test_memory_read_nonpositive_count_rejected(monkeypatch, capsys):
     # Must fail fast before reaching GDB (which leaks a raw OverflowError on a
     # negative length and an opaque message on zero).
@@ -606,8 +631,9 @@ def test_memory_read_nonpositive_count_rejected(monkeypatch, capsys):
     monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
 
     for bad in ("0", "-4"):
-        rc = pry.cli.main(["memory", "read", "0x1000", bad])
-        assert rc == 1
+        with pytest.raises(SystemExit) as exc:
+            pry.cli.main(["memory", "read", "0x1000", bad])
+        assert exc.value.code == 2
         assert "positive integer" in capsys.readouterr().err.lower()
     assert sent["called"] is False
 

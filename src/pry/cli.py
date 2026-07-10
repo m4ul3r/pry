@@ -172,14 +172,16 @@ def _add_output_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _positive_int(s: str) -> int:
-    v = int(s)
+    # Base 0 accepts decimal, 0x… hex, and 0o…/0b… — useful for sizes/counts
+    # agents copy from disassembly or GDB output.
+    v = int(s, 0)
     if v < 1:
         raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {v}")
     return v
 
 
 def _nonneg_int(s: str) -> int:
-    v = int(s)
+    v = int(s, 0)
     if v < 0:
         raise argparse.ArgumentTypeError(f"must be >= 0, got {v}")
     return v
@@ -2152,11 +2154,8 @@ def _mappings(args: argparse.Namespace) -> int:
 
 
 def _memory_read(args: argparse.Namespace) -> int:
-    # Guard non-positive counts here: GDB's read leaks a raw
-    # "OverflowError: can't convert negative int to unsigned" for a negative
-    # length and an opaque message for 0.
-    if args.length <= 0:
-        raise BridgeError(f"byte count must be a positive integer, got {args.length}")
+    # Non-positive lengths are rejected by argparse type=_positive_int so GDB
+    # never sees them (negative would OverflowError; 0 is opaque).
     mem_fmt = getattr(args, "mem_format", "hex")
     plain = bool(getattr(args, "plain", False))
     params: dict[str, Any] = {
@@ -2898,7 +2897,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(mem_read)
     _add_thread_arg(mem_read)
     mem_read.add_argument("address", help="Start address (hex or expression)")
-    mem_read.add_argument("length", type=int, help="Number of bytes to read")
+    mem_read.add_argument("length", type=_positive_int, help="Number of bytes to read (decimal or 0x hex)")
     mem_read.add_argument("--display", dest="mem_format",
                           choices=("hex", "bytes", "string", "pretty"), default="hex",
                           help="Memory display format (pretty = xxd-style hex+ASCII)")
