@@ -567,7 +567,7 @@ def test_break_set_ignore_count(monkeypatch):
 def test_breakpoint_dict_includes_resolved_location(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     loc = types.SimpleNamespace(
-        address=0x401445, source=("workshop.c", 75), function="main"
+        address=0x401445, source=("workshop.c", 75), function="main", enabled=True
     )
     base = dict(
         number=1, enabled=True, location="main", expression=None, condition=None,
@@ -580,12 +580,69 @@ def test_breakpoint_dict_includes_resolved_location(monkeypatch):
     assert d["file"] == "workshop.c"
     assert d["line"] == 75
     assert d["function"] == "main"
+    assert d["location_count"] == 1
+    assert d["locations"] == [
+        {
+            "address": "0x401445",
+            "file": "workshop.c",
+            "line": 75,
+            "function": "main",
+            "enabled": True,
+        }
+    ]
 
     # Watchpoints are not code locations — the resolved fields must be omitted
     # even if a location object is present.
     wp = types.SimpleNamespace(type=fake_gdb.BP_WATCHPOINT, **base)
     dw = bridge_mod._breakpoint_to_dict(wp)
     assert "address" not in dw
+    assert "locations" not in dw
+
+
+def test_breakpoint_dict_includes_all_multi_locations(monkeypatch):
+    """Inlined / multi-location BPs must surface every site, not just the first.
+
+    GDB often places free_msg-style symbols at an inlined site inside a caller
+    *and* at the out-of-line body. Agents that only see locs[0] get the wrong
+    address.
+    """
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    locs = [
+        types.SimpleNamespace(
+            address=0x401100, source=("msg.c", 20), function="load_msg", enabled=True
+        ),
+        types.SimpleNamespace(
+            address=0x401280, source=("msg.c", 55), function="free_msg", enabled=True
+        ),
+    ]
+    bp = types.SimpleNamespace(
+        type=fake_gdb.BP_BREAKPOINT,
+        number=3,
+        enabled=True,
+        location="free_msg",
+        expression=None,
+        condition=None,
+        hit_count=0,
+        temporary=False,
+        pending=False,
+        thread=None,
+        ignore_count=0,
+        locations=locs,
+    )
+    d = bridge_mod._breakpoint_to_dict(bp)
+    # Top-level fields stay on the first location for backward compatibility.
+    assert d["address"] == "0x401100"
+    assert d["function"] == "load_msg"
+    assert d["file"] == "msg.c"
+    assert d["line"] == 20
+    assert d["location_count"] == 2
+    assert len(d["locations"]) == 2
+    assert d["locations"][0]["address"] == "0x401100"
+    assert d["locations"][0]["function"] == "load_msg"
+    assert d["locations"][1]["address"] == "0x401280"
+    assert d["locations"][1]["function"] == "free_msg"
+    assert d["locations"][1]["file"] == "msg.c"
+    assert d["locations"][1]["line"] == 55
 
 
 def test_break_delete_multiple(monkeypatch):
@@ -983,6 +1040,68 @@ def test_dispatch_exec_first_run_reports_codeless_exit(monkeypatch):
     response = bridge.dispatch({"op": "run", "params": {}})
     assert response["ok"] is True
     assert response["result"]["status"] == "exited"
+
+
+def test_run_with_stdin_file_redirects_fd0(monkeypatch, tmp_path):
+    """stdin_file opens the payload and temporarily dup2's it onto fd 0 so the
+    inferior inherits a real file (not argv tokens, not a cooked PTY)."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"A" * 8 + b"\x00\x11END\n")
+
+    seen_fd0: list[bytes] = []
+
+    def _execute(cmd, to_string=False):
+        fake_gdb._execute_log.append(cmd)
+        if (cmd.split()[0] if cmd else "") == "run":
+            # During run, fd 0 must be the payload file (raw bytes).
+            import os
+            data = os.read(0, 64)
+            seen_fd0.append(data)
+            # Rewind so a real consumer could re-read; tests only need the
+            # snapshot. Also fire a stop so dispatch_exec completes.
+            os.lseek(0, 0, os.SEEK_SET)
+            fake_gdb.events.stop.fire(fake_gdb._FakeStopEvent())
+        return ""
+
+    fake_gdb.execute = _execute
+    fake_gdb._pending_stop_event = None
+
+    # Capture original stdin identity so we can confirm it is restored.
+    import os
+    orig_stat = os.fstat(0)
+
+    response = bridge.dispatch({
+        "op": "run",
+        "params": {"stdin_file": str(payload), "args": ["foo"]},
+    })
+    assert response["ok"] is True
+    assert response["result"]["status"] == "stopped"
+    assert "set args foo" in fake_gdb._execute_log
+    assert "run" in fake_gdb._execute_log
+    assert seen_fd0 == [b"A" * 8 + b"\x00\x11END\n"]
+    # GDB's original stdin must be restored after run (keepalive pipe under
+    # pry launch; leaving a drained payload file would EOF the session).
+    assert os.fstat(0).st_ino == orig_stat.st_ino
+    assert os.fstat(0).st_dev == orig_stat.st_dev
+
+
+def test_run_with_stdin_file_missing_errors(monkeypatch, tmp_path):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    missing = tmp_path / "nope.bin"
+
+    response = bridge.dispatch({
+        "op": "run",
+        "params": {"stdin_file": str(missing)},
+    })
+    assert response["ok"] is False
+    assert "stdin file not found" in response["error"]
+    # Never reached run
+    assert not any((c.split()[0] if c else "") == "run" for c in fake_gdb._execute_log)
 
 
 def test_looks_like_function_name(monkeypatch):
@@ -2147,6 +2266,74 @@ def test_load_rejects_base_and_slide_together(monkeypatch):
     resp = bridge.dispatch({"op": "load", "params": {"path": "/x", "base": "0x1000", "slide": "0x10"}})
     assert resp["ok"] is False
     assert "both" in resp["error"]
+
+
+def test_load_with_src_sets_directory_and_substitute_path(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    src = "/home/user/linux-src"
+    result = bridge._dispatch_op(
+        "load", {"path": "/x/vmlinux", "src": src}
+    )
+    assert result["loaded"] == "/x/vmlinux"
+    assert result["src"] == src
+    log = fake_gdb._execute_log
+    assert any(c == f"directory {src}" for c in log)
+    assert any(c == f"set substitute-path /src {src}" for c in log)
+
+
+def test_load_with_gdb_scripts_sources_and_safe_path(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    scripts = "/home/user/linux/scripts/gdb/vmlinux-gdb.py"
+    result = bridge._dispatch_op(
+        "load",
+        {
+            "path": "/x/vmlinux",
+            "slide": "0x1000",
+            "src": "/home/user/linux",
+            "gdb_scripts": scripts,
+        },
+    )
+    assert result["gdb_scripts"] == scripts
+    assert result["src"] == "/home/user/linux"
+    log = fake_gdb._execute_log
+    assert "add-auto-load-safe-path /home/user/linux/scripts/gdb" in log
+    assert "add-auto-load-safe-path /home/user/linux/scripts" in log
+    assert f"source {scripts}" in log
+    assert "directory /home/user/linux" in log
+    # add-auto-load-safe-path MUST precede `source`, or GDB refuses to auto-load
+    # the script. This ordering is the whole point of the feature — pin it.
+    assert log.index("add-auto-load-safe-path /home/user/linux/scripts/gdb") < log.index(
+        f"source {scripts}"
+    )
+    # Relocated load still happens first.
+    assert "add-symbol-file /x/vmlinux -o 0x1000" in log
+
+
+def test_load_gdb_scripts_source_failure_raises(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    orig = fake_gdb.execute
+
+    def _execute(cmd, to_string=False):
+        if cmd.startswith("source "):
+            raise fake_gdb.error("No such file or directory")
+        return orig(cmd, to_string=to_string)
+
+    fake_gdb.execute = _execute
+    resp = bridge.dispatch(
+        {
+            "op": "load",
+            "params": {
+                "path": "/x/vmlinux",
+                "gdb_scripts": "/missing/vmlinux-gdb.py",
+            },
+        }
+    )
+    assert resp["ok"] is False
+    assert "failed to source" in resp["error"]
+    assert "/missing/vmlinux-gdb.py" in resp["error"]
 
 
 def test_disasm_count_zero_or_negative_returns_empty_list(monkeypatch):

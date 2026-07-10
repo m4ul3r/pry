@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import platform
-import tempfile
 from pathlib import Path
 
 
@@ -74,7 +73,7 @@ def gdb_pid_path() -> Path:
 
 
 def spill_root() -> Path:
-    root = Path(tempfile.gettempdir()) / "pry-spills"
+    root = cache_home() / "spills"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

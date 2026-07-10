@@ -11,9 +11,12 @@ When connected to a QEMU kernel with KASLR enabled, vmlinux symbols are at link-
 pry launch --connect localhost:1234   # connect WITHOUT --symbols (no link-time copy)
                                       # (with qmu: `qmu gdb --vm <id>` and DON'T pass --symbols)
 pry kbase                             # preferred over `pry gdb kbase` — has IDT fallback
-pry load ./vmlinux --base 0x<kbase>   # one clean copy; pry offsets ALL sections by the slide
+pry load ./vmlinux --base 0x<kbase> --src /path/to/linux-src --gdb-scripts
+# one clean copy; offsets ALL sections; maps source; sources vmlinux-gdb.py (lx-*)
 pry break set commit_creds            # symbol breakpoints, print, disasm now resolve correctly
 pry print "init_task.comm"            # data symbols work too
+pry source list commit_creds          # needs --src when DWARF paths are relative / under /src
+pry gdb 'p $lx_current()->pid'        # needs --gdb-scripts (Linux lx helpers)
 pry continue
 ```
 
@@ -22,7 +25,7 @@ pry continue
 **Prefer `pry kbase` over `pry gdb kbase`.** The first-class command returns structured `{base, method, ...}` and hard-fails (non-zero) when discovery fails. Method chain:
 
 1. **pwndbg** — same as `pry gdb kbase`. On x86-64 it reads the IDT, parses entry 0 for a `.text` address, then walks page tables (gdb-pt-dump / `kernel-vmmap page-tables`) to find the mapping base. On AArch64 it uses VBAR_EL1.
-2. **IDT fallback (pry-owned)** — if pwndbg fails, pry reads IDTR via QEMU `monitor info registers` (or GDB `idtr`), reads IDT[0] through the **remote** target memory API (`inferior.read_memory` — not host `/proc/$qemu/mem`), then rounds the handler down to the 2 MiB KASLR alignment (with an optional walk-down while pages stay readable).
+2. **IDT fallback (pry-owned)** — if pwndbg fails, pry reads IDTR via QEMU `monitor info registers` (or GDB `idtr`), reads IDT[0] through the **remote** target memory API (`inferior.read_memory` — not host `/proc/$qemu/mem`), then rounds the handler down to the 2 MiB KASLR alignment (exact for the IDT[0] path, which sits within the first alignment window of `_text`).
 
 **Yama / ptrace footgun:** pwndbg's page-table walk needs host ptrace of QEMU's `/proc/$pid/mem`. With `kernel.yama.ptrace_scope=1` (default on many distros) and GDB **not** an ancestor of QEMU (the common `qmu`/shell spawns QEMU, `pry launch` spawns separate GDB layout), that read is denied and raw `pry gdb kbase` prints `Permission error when attempting to parse page tables...` / `Unable to locate the kernel base`. `pry kbase`'s IDT path does **not** need host ptrace of QEMU — only the remote GDB stub.
 

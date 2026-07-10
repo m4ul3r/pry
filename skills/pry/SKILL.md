@@ -87,6 +87,18 @@ pry continue                        # Continue execution
 > ```
 > Prefer `pry kbase` over `pry gdb kbase`. The first-class command falls back to an IDT-based discovery over the **remote** GDB stub when pwndbg's page-table walk fails under `kernel.yama.ptrace_scope=1` (common when `qmu`/shell spawns QEMU and pry spawns a separate GDB). Do **not** use `kbase -r` for rebasing — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
 
+> **Kernel source + lx scripts:** DWARF often has relative paths (`kernel/sys.c`) or absolute Docker kbuild paths (`/src/...`), so `pry source list` fails until GDB knows where the tree is. Linux also ships `scripts/gdb/vmlinux-gdb.py` (`lx-ps`, `$lx_current()`, …) that is **not** auto-loaded from a cached vmlinux alone:
+> ```bash
+> # After connect + kbase (see KASLR above):
+> pry load $VMLINUX --base $KBASE --src /path/to/linux-src --gdb-scripts
+> # --src         → `directory DIR` + `set substitute-path /src DIR`
+> # --gdb-scripts → auto-find DIR/scripts/gdb/vmlinux-gdb.py (or sibling of vmlinux)
+> #                 then add-auto-load-safe-path + source it
+> # Or pass an explicit script: --gdb-scripts /path/to/vmlinux-gdb.py
+> pry source list __x64_sys_newuname
+> pry gdb 'p $lx_current()->pid'
+> ```
+
 ### Connection management
 
 ```bash
@@ -141,6 +153,7 @@ Outputs above 10,000 `o200k_base` tokens auto-spill to disk. When that happens, 
 
 ```bash
 pry run [args...]            # Run the program (blocks until stop/exit)
+pry run --stdin-file /path/to/payload [args...]  # Feed raw stdin from a file (CTF/exploit)
 pry continue                 # Continue from current stop
 pry step [count]             # Step into (source-level)
 pry next [count]             # Step over (source-level)
@@ -161,6 +174,8 @@ pry thread select 3          # Make thread 3 the persistently selected one
 `pry finish` reports the function's return value as `return value: ...` (x86-64 integer/pointer returns; void/float/struct are omitted). Most inspection commands accept `--thread N` to run against a specific thread without persistently switching (the prior selection is restored); use `pry thread select N` to switch persistently.
 
 Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
+
+**Stdin for the inferior:** use `pry run --stdin-file PATH` to open `PATH` as the inferior's real stdin (fd 0). Bytes are delivered raw — no PTY, so cooked-mode XON/XOFF cannot eat payload bytes (e.g. `0x11` in addresses). Program args stay separate (`pry run --stdin-file payload.bin arg1 arg2`). Shell-style redirection via `pry gdb 'run < file'` is **not** supported: `pry launch` sets `startup-with-shell off` for byte-precise argv, so `<` and the path become argv tokens. Prefer `--stdin-file`.
 
 `pry status` reports one of: `running`, `stopped`, `exited`, or `not-started`.
 
@@ -234,6 +249,8 @@ pry watch enable 2                          # Enable watchpoint #2
 pry watch disable 2                         # Disable watchpoint #2
 pry watch list                              # List all (same as break list)
 ```
+
+**Multi-location breakpoints:** GDB can resolve one symbolic breakpoint to several sites (common with inlined callees — e.g. `free_msg` may also land inside `load_msg`). `pry break set` / `pry break list` report `location_count` and a full `locations[]` of `{address,file,line,function}` (text lists every site). Do not assume the top-level `address`/`function` is the only hit site; inspect `locations` when `location_count > 1`.
 
 ### PIE/ASLR rebasing
 
@@ -401,6 +418,7 @@ pry info target                  # Show target connection info
 
 ## Known Quirks
 
+- **No shell stdin redirect via `pry gdb 'run < file'`**: launch disables `startup-with-shell`, so `<` and the path become argv. Use `pry run --stdin-file PATH` for true file-as-stdin (raw bytes, no PTY).
 - **Multiple sessions require `--instance`**: commands auto-select the bridge only when exactly one `pry launch` session is alive. The moment a second one exists, every command needs `pry --instance <pid> ...` or it hard-errors — copying a bare example will fail. Run `pry doctor` to list live PIDs.
 - **Socket timeout vs bridge timeout**: without `--timeout`, the CLI socket gives up at 30s while the bridge only auto-interrupts at 120s — so a plain `pry continue` on a program that runs >30s returns a transport error even though the inferior is still running. For long runs pass `--timeout N` (the bridge honors it and auto-interrupts) or use `--background` + `pry wait`.
 - **Execution commands block**: `pry run`, `pry continue`, `pry finish` block until the inferior stops. Use `--timeout` for auto-interrupt recovery, or `--background` to return immediately and poll with `pry status`/`pry wait`.

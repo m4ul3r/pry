@@ -334,6 +334,42 @@ def test_run_text_rendering_signal(monkeypatch, capsys):
     assert "reason: signal SIGSEGV" in output
 
 
+def test_run_stdin_file_sends_absolute_path(monkeypatch, tmp_path, capsys):
+    payload = tmp_path / "p.bin"
+    payload.write_bytes(b"\x00\x11payload")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "status": "stopped",
+                "reason": {"kind": "exited", "code": 0},
+                "frame": None,
+                "thread": None,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["run", "--stdin-file", str(payload), "arg1", "arg2"])
+
+    assert rc == 0
+    assert captured["op"] == "run"
+    assert captured["params"]["stdin_file"] == str(payload.resolve())
+    assert captured["params"]["args"] == ["arg1", "arg2"]
+
+
+def test_run_stdin_file_missing_errors(tmp_path, capsys):
+    missing = tmp_path / "missing.bin"
+    rc = pry.cli.main(["run", "--stdin-file", str(missing)])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "stdin file not found" in err
+
+
 def test_registers_text_rendering(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         return {
@@ -594,6 +630,31 @@ def test_memory_read_text_includes_address_by_default(monkeypatch, capsys):
     assert capsys.readouterr().out == "0x401000: 41424344\n"
 
 
+def test_memory_read_accepts_hex_and_decimal_length(monkeypatch, capsys):
+    # Lengths from GDB/disasm are often hex (0x10); decimal must still work.
+    seen: list[int] = []
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        assert op == "memory_read"
+        seen.append(params["length"])
+        length = params["length"]
+        return {
+            "ok": True,
+            "result": {
+                "address": "0x401000",
+                "length": length,
+                "format": "hex",
+                "data": "00" * length,
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    assert pry.cli.main(["memory", "read", "0x401000", "16"]) == 0
+    assert pry.cli.main(["memory", "read", "0x401000", "0x10"]) == 0
+    assert seen == [16, 16]
+
+
 def test_memory_read_nonpositive_count_rejected(monkeypatch, capsys):
     # Must fail fast before reaching GDB (which leaks a raw OverflowError on a
     # negative length and an opaque message on zero).
@@ -606,8 +667,9 @@ def test_memory_read_nonpositive_count_rejected(monkeypatch, capsys):
     monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
 
     for bad in ("0", "-4"):
-        rc = pry.cli.main(["memory", "read", "0x1000", bad])
-        assert rc == 1
+        with pytest.raises(SystemExit) as exc:
+            pry.cli.main(["memory", "read", "0x1000", bad])
+        assert exc.value.code == 2
         assert "positive integer" in capsys.readouterr().err.lower()
     assert sent["called"] is False
 
@@ -1158,6 +1220,85 @@ def test_gdb_exec_empty_output(monkeypatch, capsys):
     assert "(no output)" in output
 
 
+@pytest.mark.parametrize(
+    "command,output",
+    [
+        ("kbase", "Unable to locate the kernel base\n"),
+        ("kbase -r", "kernel memory mappings are missing\n"),
+        ("klookup commit_creds", "kbase does not work when kernel-vmmap is set to none\n"),
+        ("klookup", "\x1b[31mUnable to locate the kernel base\x1b[0m\n"),
+        ("klookup commit_creds", "No symbol found for commit_creds\n"),
+        ("klookup 0xffffffff81000000", "No symbol found at 0xffffffff81000000\n"),
+    ],
+)
+def test_gdb_exec_kernel_helper_soft_failure_exits_nonzero(monkeypatch, capsys, command, output):
+    """pwndbg kbase/klookup print soft errors as output; agents need exit ≠ 0."""
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"output": output}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", command])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        "Unable to locate the kernel base" in captured.err
+        or "kernel memory" in captured.err
+        or "kernel-vmmap" in captured.err
+        or "No symbol found" in captured.err
+    )
+
+
+def test_gdb_exec_kernel_helper_soft_failure_json_error_shape(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": {"output": "Unable to locate the kernel base\n"}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "--format", "json", "kbase"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload == {"ok": False, "error": "Unable to locate the kernel base"}
+
+
+def test_gdb_exec_success_kbase_still_exits_zero(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {"output": "Found virtual text base address: 0xffffffff81000000\n"},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "kbase"])
+
+    assert rc == 0
+    assert "0xffffffff81000000" in capsys.readouterr().out
+
+
+def test_gdb_exec_unrelated_command_with_failure_phrase_still_exits_zero(monkeypatch, capsys):
+    """Do not hard-fail general passthrough just because output mentions a phrase."""
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {"output": "note: Unable to locate the kernel base is a kbase error\n"},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["gdb", "echo note"])
+
+    assert rc == 0
+    assert "Unable to locate the kernel base" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # Feature 1: Timeout propagation to bridge
 # ---------------------------------------------------------------------------
@@ -1652,6 +1793,146 @@ def test_load_slide_sends_param(monkeypatch, capsys):
     assert "loaded /x/vmlinux (slide 0x7000000)" in out
 
 
+def test_resolve_gdb_scripts_path_explicit(tmp_path):
+    scripts = tmp_path / "custom" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, scripts=scripts)
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_explicit_missing(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    with pytest.raises(FileNotFoundError, match="not found"):
+        pry.cli.resolve_gdb_scripts_path(vmlinux, scripts=tmp_path / "nope.py")
+
+
+def test_resolve_gdb_scripts_path_auto_from_src(tmp_path):
+    src = tmp_path / "linux"
+    scripts = src / "scripts" / "gdb" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "artifacts" / "vmlinux"
+    vmlinux.parent.mkdir()
+    vmlinux.write_text("x")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, src=src, scripts="auto")
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_auto_sibling(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    scripts = tmp_path / "vmlinux-gdb.py"
+    scripts.write_text("# fake\n")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, scripts="auto")
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_auto_under_binary_scripts(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    scripts = tmp_path / "scripts" / "gdb" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    resolved = pry.cli.resolve_gdb_scripts_path(vmlinux, scripts=None)
+    assert resolved == scripts.resolve()
+
+
+def test_resolve_gdb_scripts_path_auto_missing(tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    with pytest.raises(FileNotFoundError, match="could not auto-detect"):
+        pry.cli.resolve_gdb_scripts_path(vmlinux, scripts="auto")
+
+
+def test_load_src_and_gdb_scripts_sends_params(monkeypatch, capsys, tmp_path):
+    src = tmp_path / "linux"
+    scripts = src / "scripts" / "gdb" / "vmlinux-gdb.py"
+    scripts.parent.mkdir(parents=True)
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "loaded": params["path"],
+                "base": params.get("base"),
+                "slide": "0x1",
+                "src": params.get("src"),
+                "gdb_scripts": params.get("gdb_scripts"),
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main([
+        "load", str(vmlinux),
+        "--base", "0xffffffff84400000",
+        "--src", str(src),
+        "--gdb-scripts",
+        "--format", "text",
+    ])
+    assert rc == 0
+    assert captured["op"] == "load"
+    assert captured["params"]["src"] == str(src.resolve())
+    assert captured["params"]["gdb_scripts"] == str(scripts.resolve())
+    out = capsys.readouterr().out
+    assert f"src {src.resolve()}" in out
+    assert f"scripts {scripts.resolve()}" in out
+
+
+def test_load_gdb_scripts_explicit_path(monkeypatch, tmp_path):
+    scripts = tmp_path / "my-vmlinux-gdb.py"
+    scripts.write_text("# fake\n")
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["params"] = params
+        return {"ok": True, "result": {"loaded": params["path"], "gdb_scripts": params["gdb_scripts"]}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    rc = pry.cli.main(["load", str(vmlinux), "--gdb-scripts", str(scripts)])
+    assert rc == 0
+    assert captured["params"]["gdb_scripts"] == str(scripts.resolve())
+
+
+def test_load_gdb_scripts_auto_missing_errors(monkeypatch, capsys, tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    monkeypatch.setattr(
+        pry.cli,
+        "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not send")),
+    )
+    rc = pry.cli.main(["load", str(vmlinux), "--gdb-scripts"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "could not auto-detect" in err or "vmlinux-gdb.py" in err
+
+
+def test_load_src_missing_dir_errors(monkeypatch, capsys, tmp_path):
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_text("x")
+    monkeypatch.setattr(
+        pry.cli,
+        "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not send")),
+    )
+    rc = pry.cli.main(["load", str(vmlinux), "--src", str(tmp_path / "no-such-src")])
+    assert rc == 1
+    assert "not found" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Agent-ease review fixes: kill --all, logs
 # ---------------------------------------------------------------------------
@@ -2115,6 +2396,84 @@ def test_render_breakpoint_set_without_resolved_location():
     value = {"number": 1, "kind": "breakpoint", "location": "main", "enabled": True}
     text = pry.cli._render_breakpoint_set_text(value)
     assert "@" not in text
+
+
+def test_render_breakpoint_set_shows_all_multi_locations():
+    value = {
+        "number": 1,
+        "kind": "breakpoint",
+        "location": "free_msg",
+        "enabled": True,
+        "address": "0x401100",
+        "file": "msg.c",
+        "line": 20,
+        "function": "load_msg",
+        "location_count": 2,
+        "locations": [
+            {
+                "address": "0x401100",
+                "file": "msg.c",
+                "line": 20,
+                "function": "load_msg",
+            },
+            {
+                "address": "0x401280",
+                "file": "msg.c",
+                "line": 55,
+                "function": "free_msg",
+            },
+        ],
+    }
+    text = pry.cli._render_breakpoint_set_text(value)
+    assert "breakpoint #1 set at free_msg [enabled] (2 locations)" in text
+    assert "@ 0x401100 load_msg msg.c:20" in text
+    assert "@ 0x401280 free_msg msg.c:55" in text
+
+
+def test_render_breakpoint_list_shows_all_multi_locations():
+    value = [
+        {
+            "number": 1,
+            "kind": "breakpoint",
+            "location": "free_msg",
+            "enabled": True,
+            "hits": 0,
+            "location_count": 2,
+            "locations": [
+                {
+                    "address": "0x401100",
+                    "file": "msg.c",
+                    "line": 20,
+                    "function": "load_msg",
+                },
+                {
+                    "address": "0x401280",
+                    "file": "msg.c",
+                    "line": 55,
+                    "function": "free_msg",
+                },
+            ],
+        },
+        {
+            "number": 2,
+            "kind": "breakpoint",
+            "location": "main",
+            "enabled": True,
+            "hits": 1,
+            "location_count": 1,
+            "locations": [
+                {"address": "0x401445", "file": "main.c", "line": 10, "function": "main"}
+            ],
+        },
+    ]
+    text = pry.cli._render_breakpoint_list_text(value)
+    assert "#1 breakpoint at free_msg [enabled] hits=0 (2 locations)" in text
+    assert "@ 0x401100 load_msg msg.c:20" in text
+    assert "@ 0x401280 free_msg msg.c:55" in text
+    # Single-location BPs keep the compact one-line form (no detail dump).
+    assert "#2 breakpoint at main [enabled] hits=1" in text
+    assert "(1 locations)" not in text
+    assert "0x401445" not in text
 
 
 def test_render_status_text_shows_displays():

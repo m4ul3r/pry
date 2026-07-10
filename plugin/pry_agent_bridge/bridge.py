@@ -765,6 +765,28 @@ def _bp_kind(bp_type: int) -> str:
     return _BP_KIND_BY_TYPE.get(int(bp_type), f"type-{bp_type}")
 
 
+def _bp_location_to_dict(loc) -> dict[str, Any]:
+    """Serialize one gdb.BreakpointLocation to a JSON-friendly dict.
+
+    GDB multi-location breakpoints (inlined callees, multiple TUs that define
+    the same static, etc.) expose several of these under one Breakpoint.
+    """
+    entry: dict[str, Any] = {}
+    addr = getattr(loc, "address", None)
+    if addr is not None:
+        entry["address"] = hex(addr)
+    src = getattr(loc, "source", None)
+    if src:
+        entry["file"], entry["line"] = src[0], src[1]
+    fn = getattr(loc, "function", None)
+    if fn:
+        entry["function"] = fn
+    # Individual locations can be enabled/disabled independently of the owner.
+    if hasattr(loc, "enabled"):
+        entry["enabled"] = bool(loc.enabled)
+    return entry
+
+
 def _breakpoint_to_dict(bp) -> dict[str, Any]:
     """Convert a gdb.Breakpoint to a JSON-friendly dict."""
     result: dict[str, Any] = {
@@ -788,26 +810,28 @@ def _breakpoint_to_dict(bp) -> dict[str, Any]:
         "thread": getattr(bp, "thread", None),
         "ignore": getattr(bp, "ignore_count", 0),
     }
-    # Resolved placement (GDB 13+): the actual address and source line a
+    # Resolved placement (GDB 13+): the actual address(es) and source line(s) a
     # symbolic / file:line breakpoint landed on, so agents can confirm where it
     # went (e.g. `break main` lands past the prologue) without having to run.
-    # Watchpoints/catchpoints have no meaningful code location, and older GDB
-    # lacks `.locations` or leaves a pending breakpoint with none — stay
-    # defensive and just omit the fields when unavailable.
+    # Multi-location BPs (inlined sites) can have several entries — surface all
+    # of them; keep top-level address/file/line/function from the first for
+    # backward compatibility. Watchpoints/catchpoints have no meaningful code
+    # location, and older GDB lacks `.locations` or leaves a pending breakpoint
+    # with none — stay defensive and just omit the fields when unavailable.
     if result["kind"] in ("breakpoint", "hw-breakpoint"):
         try:
             locs = getattr(bp, "locations", None) or []
             if locs:
-                loc = locs[0]
-                addr = getattr(loc, "address", None)
-                if addr is not None:
-                    result["address"] = hex(addr)
-                src = getattr(loc, "source", None)
-                if src:
-                    result["file"], result["line"] = src[0], src[1]
-                fn = getattr(loc, "function", None)
-                if fn:
-                    result["function"] = fn
+                serialized = [_bp_location_to_dict(loc) for loc in locs]
+                # Drop empties (defensive against odd location objects).
+                serialized = [s for s in serialized if s]
+                if serialized:
+                    result["locations"] = serialized
+                    result["location_count"] = len(serialized)
+                    first = serialized[0]
+                    for key in ("address", "file", "line", "function"):
+                        if key in first:
+                            result[key] = first[key]
         except Exception:
             pass
     return result
@@ -1981,13 +2005,45 @@ class GdbBridge:
             pass
         return False
 
+    def _apply_src_and_scripts(
+        self, result: dict[str, Any], params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """After loading symbols, optionally map source paths and load lx scripts."""
+        src = params.get("src")
+        if src:
+            gdb.execute(f"directory {src}", to_string=True)
+            # Docker/kbuild images often compile with absolute paths under /src.
+            with contextlib.suppress(gdb.error):
+                gdb.execute(f"set substitute-path /src {src}", to_string=True)
+            result["src"] = src
+
+        gdb_scripts = params.get("gdb_scripts")
+        if gdb_scripts:
+            scripts_dir = os.path.dirname(gdb_scripts) or "."
+            # Linux scripts check auto-load-safe-path against the scripts tree
+            # (and often the kernel root above scripts/gdb/).
+            with contextlib.suppress(gdb.error):
+                gdb.execute(f"add-auto-load-safe-path {scripts_dir}", to_string=True)
+            parent = os.path.dirname(scripts_dir)
+            if parent and parent != scripts_dir:
+                with contextlib.suppress(gdb.error):
+                    gdb.execute(f"add-auto-load-safe-path {parent}", to_string=True)
+            try:
+                gdb.execute(f"source {gdb_scripts}", to_string=True)
+            except gdb.error as exc:
+                raise RuntimeError(
+                    f"failed to source GDB scripts {gdb_scripts}: {exc}"
+                ) from exc
+            result["gdb_scripts"] = gdb_scripts
+        return result
+
     def _load(self, params: dict[str, Any]) -> dict[str, Any]:
         path = params["path"]
         base = params.get("base")
         slide = params.get("slide")
         if base is None and slide is None:
             gdb.execute(f"file {path}", to_string=True)
-            return {"loaded": path}
+            return self._apply_src_and_scripts({"loaded": path}, params)
         if base is not None and slide is not None:
             raise ValueError("pass either --base or --slide, not both")
         # Load symbols at a runtime base (relocated/PIE/KASLR module). Two
@@ -2025,7 +2081,7 @@ class GdbBridge:
         result: dict[str, Any] = {"loaded": path, "slide": hex(slide_int)}
         if base is not None:
             result["base"] = hex(self._parse_addr(base))
-        return result
+        return self._apply_src_and_scripts(result, params)
 
     @staticmethod
     def _pid_exists(pid: int) -> bool:
@@ -2128,7 +2184,54 @@ class GdbBridge:
             else:
                 arg_str = str(args)
             gdb.execute(f"set args {arg_str}", to_string=True)
+
+        stdin_file = params.get("stdin_file")
+        if stdin_file:
+            return self._run_with_stdin_file(str(stdin_file))
         return self._exec_and_stop("run")
+
+    def _run_with_stdin_file(self, stdin_file: str) -> Any:
+        """Run the inferior with *stdin_file* as its real stdin (fd 0).
+
+        Opens the file and temporarily dup2's it onto GDB's stdin so the
+        inferior inherits a direct file descriptor at fork/exec. This keeps
+        ``startup-with-shell off`` (byte-precise argv), feeds raw bytes
+        without a PTY (no cooked-mode XON/XOFF footguns), and restores GDB's
+        original stdin afterwards (the keepalive pipe under ``pry launch``).
+
+        Shell-style ``run < file`` remains unsupported under pry because
+        launch disables startup-with-shell; use ``pry run --stdin-file``.
+        """
+        path = Path(stdin_file).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"stdin file not found: {stdin_file}"
+            ) from exc
+        if not path.is_file():
+            raise RuntimeError(f"stdin file is not a regular file: {path}")
+
+        payload_fd = os.open(path, os.O_RDONLY)
+        saved_stdin = -1
+        try:
+            saved_stdin = os.dup(0)
+            os.dup2(payload_fd, 0)
+            os.close(payload_fd)
+            payload_fd = -1
+            return self._exec_and_stop("run")
+        finally:
+            # Always put GDB's stdin back — under pry launch fd 0 is the
+            # keepalive pipe; leaving it on a drained payload file would make
+            # GDB see EOF and may tear the session down.
+            if saved_stdin >= 0:
+                with contextlib.suppress(OSError):
+                    os.dup2(saved_stdin, 0)
+                with contextlib.suppress(OSError):
+                    os.close(saved_stdin)
+            if payload_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(payload_fd)
 
     def _continue(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._exec_and_stop("continue")
