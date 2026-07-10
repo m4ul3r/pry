@@ -985,6 +985,68 @@ def test_dispatch_exec_first_run_reports_codeless_exit(monkeypatch):
     assert response["result"]["status"] == "exited"
 
 
+def test_run_with_stdin_file_redirects_fd0(monkeypatch, tmp_path):
+    """stdin_file opens the payload and temporarily dup2's it onto fd 0 so the
+    inferior inherits a real file (not argv tokens, not a cooked PTY)."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"A" * 8 + b"\x00\x11END\n")
+
+    seen_fd0: list[bytes] = []
+
+    def _execute(cmd, to_string=False):
+        fake_gdb._execute_log.append(cmd)
+        if (cmd.split()[0] if cmd else "") == "run":
+            # During run, fd 0 must be the payload file (raw bytes).
+            import os
+            data = os.read(0, 64)
+            seen_fd0.append(data)
+            # Rewind so a real consumer could re-read; tests only need the
+            # snapshot. Also fire a stop so dispatch_exec completes.
+            os.lseek(0, 0, os.SEEK_SET)
+            fake_gdb.events.stop.fire(fake_gdb._FakeStopEvent())
+        return ""
+
+    fake_gdb.execute = _execute
+    fake_gdb._pending_stop_event = None
+
+    # Capture original stdin identity so we can confirm it is restored.
+    import os
+    orig_stat = os.fstat(0)
+
+    response = bridge.dispatch({
+        "op": "run",
+        "params": {"stdin_file": str(payload), "args": ["foo"]},
+    })
+    assert response["ok"] is True
+    assert response["result"]["status"] == "stopped"
+    assert "set args foo" in fake_gdb._execute_log
+    assert "run" in fake_gdb._execute_log
+    assert seen_fd0 == [b"A" * 8 + b"\x00\x11END\n"]
+    # GDB's original stdin must be restored after run (keepalive pipe under
+    # pry launch; leaving a drained payload file would EOF the session).
+    assert os.fstat(0).st_ino == orig_stat.st_ino
+    assert os.fstat(0).st_dev == orig_stat.st_dev
+
+
+def test_run_with_stdin_file_missing_errors(monkeypatch, tmp_path):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    missing = tmp_path / "nope.bin"
+
+    response = bridge.dispatch({
+        "op": "run",
+        "params": {"stdin_file": str(missing)},
+    })
+    assert response["ok"] is False
+    assert "stdin file not found" in response["error"]
+    # Never reached run
+    assert not any((c.split()[0] if c else "") == "run" for c in fake_gdb._execute_log)
+
+
 def test_looks_like_function_name(monkeypatch):
     bridge_mod, _ = _load_bridge(monkeypatch)
     f = bridge_mod.GdbBridge._looks_like_function_name

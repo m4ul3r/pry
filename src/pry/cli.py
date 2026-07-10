@@ -1855,6 +1855,16 @@ def _run(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.args:
         params["args"] = args.args
+    stdin_file = getattr(args, "stdin_file", None)
+    if stdin_file:
+        # Resolve on the CLI side so the path is absolute and unambiguous
+        # regardless of GDB's cwd; bridge re-checks existence.
+        path = Path(stdin_file).expanduser().resolve()
+        if not path.is_file():
+            raise BridgeError(
+                f"stdin file not found: {stdin_file} (resolved to {path})"
+            )
+        params["stdin_file"] = str(path)
     ep, tt = _exec_params(args)
     params.update(ep)
     renderer = _render_background_text if params.get("_background") else _render_stop_text
@@ -2676,6 +2686,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_timeout_arg(run)
     _add_output_arg(run)
     run.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
+    run.add_argument(
+        "--stdin-file",
+        metavar="PATH",
+        help=(
+            "Feed PATH as the inferior's stdin (raw file bytes, no PTY). "
+            "Preferred for CTF/exploit payloads; shell-style "
+            "`pry gdb 'run < file'` is not supported (startup-with-shell off)."
+        ),
+    )
     run.add_argument("args", nargs="*", help="Program arguments")
     run.set_defaults(handler=_run)
 
