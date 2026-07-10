@@ -1214,6 +1214,23 @@ def _render_gdb_exec_text(value: Any) -> str:
     return output.rstrip()
 
 
+def _render_kbase_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    base = value.get("base")
+    method = value.get("method", "unknown")
+    if not base:
+        return "Unable to locate the kernel base"
+    lines = [f"Found virtual text base address: {base} (method={method})"]
+    handler = value.get("handler")
+    if handler:
+        lines.append(f"handler: {handler}")
+    note = value.get("note")
+    if note:
+        lines.append(f"note: {note}")
+    return "\n".join(lines)
+
+
 def _render_plugin_install_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2620,6 +2637,17 @@ def _gdb_exec(args: argparse.Namespace) -> int:
     )
 
 
+def _kbase(args: argparse.Namespace) -> int:
+    """First-class kernel base discovery (pwndbg + IDT remote-memory fallback)."""
+    return _call(
+        args,
+        "kbase",
+        {},
+        text_renderer=_render_kbase_text,
+        stem="kbase",
+    )
+
+
 # --- Python escape hatch ---
 
 def _py_exec(args: argparse.Namespace) -> int:
@@ -2811,7 +2839,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load symbols so .text lands at this runtime base, as the sole copy, "
              "offsetting ALL sections uniformly (text+data). For relocated/PIE/KASLR "
              "modules; avoids the duplicate-symbol and data-not-relocated traps of "
-             '`kbase -r`. Get a kernel base from `pry gdb "kbase"`.',
+             '`kbase -r`. Get a kernel base from `pry kbase`.',
     )
     load.add_argument(
         "--slide", metavar="OFFSET",
@@ -3239,6 +3267,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_timeout_arg(gdb_cmd)
     gdb_cmd.add_argument("command", help="GDB command to execute (e.g. 'kbase', 'info proc mappings')")
     gdb_cmd.set_defaults(handler=_gdb_exec)
+
+    # --- kbase ---
+    kbase_cmd = subparsers.add_parser(
+        "kbase",
+        help="Find the kernel virtual text base (KASLR); pwndbg then IDT fallback",
+    )
+    _common_io_options(kbase_cmd)
+    kbase_cmd.set_defaults(handler=_kbase)
 
     # --- trace ---
     trace_cmd = subparsers.add_parser("trace", help="Trace memory accesses within a code range")

@@ -96,6 +96,7 @@ READ_LOCKED_OPS = {
     "target_info",
     "mappings",
     "display_list",
+    "kbase",
 }
 
 EXEC_OPS = {
@@ -315,6 +316,128 @@ def _elf_text_vaddr(path: str) -> int | None:
     except (OSError, struct.error):
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Kernel base (KASLR) discovery helpers — pure/logic side unit-tested
+# ---------------------------------------------------------------------------
+
+# Linux x86-64 KASLR places the kernel image on a 2 MiB boundary
+# (CONFIG_PHYSICAL_ALIGN / PMD). IDT entry 0 points at asm_exc_divide_error,
+# which sits a few KB after _text, so rounding that handler down to 2 MiB
+# recovers the virtual text base without page-table walks.
+_KBASE_ALIGN_2M = 0x200000
+_KBASE_ALIGN_1G = 0x40000000
+# Floor of the high canonical kernel range (covers classic __START_KERNEL_map
+# and typical KASLR slides). Used only to bound downward walks.
+_KERNEL_VA_FLOOR = 0xFFFF800000000000
+
+_PWNDBG_KBASE_RE = re.compile(
+    r"Found virtual text base address:\s*(0x[0-9a-fA-F]+)",
+    re.IGNORECASE,
+)
+# QEMU monitor `info registers` line, e.g. "IDT=     fffffe0000000000 00000fff"
+_QEMU_IDT_RE = re.compile(
+    r"IDT=\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)",
+    re.IGNORECASE,
+)
+# GDB `info registers` / `info all-registers` variants for idtr.
+_GDB_IDTR_RE = re.compile(
+    r"\bidtr\b[^\n]*?(?:base\s*=\s*)?(0x[0-9a-fA-F]+)",
+    re.IGNORECASE,
+)
+_GDB_VBAR_RE = re.compile(
+    r"\bvbar_el1\b\s+(0x[0-9a-fA-F]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_pwndbg_kbase_output(output: str) -> int | None:
+    """Extract the hex base from pwndbg ``kbase`` success output."""
+    if not output:
+        return None
+    # Strip ANSI so colorized pwndbg still matches.
+    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output)
+    m = _PWNDBG_KBASE_RE.search(clean)
+    if not m:
+        return None
+    return int(m.group(1), 16)
+
+
+def parse_qemu_monitor_idt(monitor_output: str) -> tuple[int, int] | None:
+    """Parse ``(base, limit)`` from QEMU monitor ``info registers`` IDT line."""
+    if not monitor_output:
+        return None
+    m = _QEMU_IDT_RE.search(monitor_output)
+    if not m:
+        return None
+    return int(m.group(1), 16), int(m.group(2), 16)
+
+
+def parse_idt_entry_offset(entry: bytes) -> int:
+    """Return the handler virtual address from a raw IDT gate descriptor.
+
+    Decodes a 16-byte x86-64 gate. An 8-byte i386 gate is decoded too when a
+    caller passes exactly 8 bytes, but the live ``pry kbase`` path only targets
+    x86-64: it cannot distinguish 32- vs 64-bit mode from the stub, so it always
+    reads a 16-byte descriptor. i386 is not a supported live target.
+    """
+    if len(entry) == 16:
+        lo = int.from_bytes(entry[0:2], "little")
+        mid = int.from_bytes(entry[6:8], "little")
+        hi = int.from_bytes(entry[8:12], "little")
+        return (hi << 32) | (mid << 16) | lo
+    if len(entry) == 8:
+        lo = int.from_bytes(entry[0:2], "little")
+        mid = int.from_bytes(entry[6:8], "little")
+        return (mid << 16) | lo
+    raise ValueError(f"IDT entry must be 8 or 16 bytes, got {len(entry)}")
+
+
+def align_down(addr: int, align: int) -> int:
+    """Round ``addr`` down to a multiple of ``align`` (power-of-two)."""
+    return addr & ~(align - 1)
+
+
+def estimate_kbase_from_handler(
+    handler: int,
+    *,
+    align: int = _KBASE_ALIGN_2M,
+    readable: Any | None = None,
+    max_steps: int = 256,
+) -> int:
+    """Estimate kernel ``_text`` from an in-``.text`` handler address.
+
+    Primary rule: round down to ``align`` (default 2 MiB — Linux KASLR).
+    When ``readable(addr) -> bool`` is provided, walk further down while pages
+    remain readable to approximate the mapping base (pwndbg's page-table
+    approach without host ``/proc/$qemu/mem``).
+    """
+    if handler <= 0:
+        raise ValueError(f"invalid handler address: {handler:#x}")
+    base = align_down(handler, align)
+    if readable is None:
+        return base
+    # Confirm the aligned candidate itself is mapped before walking.
+    try:
+        if not readable(base):
+            return base
+    except Exception:
+        return base
+    last = base
+    floor = max(_KERNEL_VA_FLOOR, 0)
+    for _ in range(max_steps):
+        nxt = last - align
+        if nxt < floor:
+            break
+        try:
+            ok = readable(nxt)
+        except Exception:
+            break
+        if not ok:
+            break
+        last = nxt
+    return last
 
 
 _DISASM_LINE_RE = re.compile(
@@ -1746,6 +1869,10 @@ class GdbBridge:
         if op == "gdb_exec":
             return self._gdb_exec(params)
 
+        # Kernel base (KASLR)
+        if op == "kbase":
+            return self._kbase(params)
+
         raise ValueError(f"Unknown op: {op!r}")
 
     # ------------------------------------------------------------------
@@ -3153,6 +3280,289 @@ class GdbBridge:
         command = params["command"]
         output = gdb.execute(command, to_string=True)
         return {"output": output}
+
+    # ------------------------------------------------------------------
+    # Kernel base (KASLR) — pwndbg first, then remote-memory IDT fallback
+    # ------------------------------------------------------------------
+
+    def _kbase(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Locate the kernel virtual text base (KASLR).
+
+        Fallback chain (agent-first; no host ptrace of QEMU required for the
+        IDT path):
+
+        1. **pwndbg** ``kbase`` — exact mapping base when page tables work
+           (needs ``/proc/$qemu/mem`` under ``kernel-vmmap page-tables``).
+        2. **IDT** (x86/x86-64) — read IDTR via QEMU monitor / GDB registers,
+           parse IDT[0] through the remote target memory API, round down to
+           the 2 MiB KASLR alignment (optionally walk down while readable).
+        3. **VBAR** (AArch64) — same idea using ``vbar_el1``.
+
+        Raises if every method fails, with an actionable yama/kallsyms note.
+        """
+        attempts: list[dict[str, Any]] = []
+
+        pwndbg = self._kbase_via_pwndbg()
+        attempts.append(pwndbg["attempt"])
+        if pwndbg.get("base") is not None:
+            return self._kbase_result(
+                base=pwndbg["base"],
+                method="pwndbg",
+                attempts=attempts,
+                extra=pwndbg.get("extra"),
+            )
+
+        idt = self._kbase_via_idt()
+        attempts.append(idt["attempt"])
+        if idt.get("base") is not None:
+            return self._kbase_result(
+                base=idt["base"],
+                method="idt",
+                attempts=attempts,
+                extra=idt.get("extra"),
+            )
+
+        vbar = self._kbase_via_vbar()
+        attempts.append(vbar["attempt"])
+        if vbar.get("base") is not None:
+            return self._kbase_result(
+                base=vbar["base"],
+                method="vbar",
+                attempts=attempts,
+                extra=vbar.get("extra"),
+            )
+
+        detail_parts = []
+        for a in attempts:
+            err = a.get("error")
+            if err:
+                detail_parts.append(f"{a.get('method')}: {err}")
+        detail = "; ".join(detail_parts) if detail_parts else "no methods available"
+        raise RuntimeError(
+            "unable to locate kernel base — "
+            f"{detail}. "
+            "pwndbg kbase needs host ptrace of QEMU (/proc/$pid/mem) which "
+            "fails when kernel.yama.ptrace_scope>=1 and GDB is not QEMU's "
+            "parent; the IDT fallback needs a stopped x86-64 QEMU remote "
+            "with readable guest memory. Fallback: resume the guest and read "
+            "`grep 'T _text$' /proc/kallsyms` (after `echo 0 > "
+            "/proc/sys/kernel/kptr_restrict`), then "
+            "`pry load vmlinux --base 0x...`"
+        )
+
+    @staticmethod
+    def _kbase_result(
+        *,
+        base: int,
+        method: str,
+        attempts: list[dict[str, Any]],
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "base": hex(base),
+            "method": method,
+            "attempts": attempts,
+        }
+        if extra:
+            out.update(extra)
+        return out
+
+    def _kbase_via_pwndbg(self) -> dict[str, Any]:
+        attempt: dict[str, Any] = {"method": "pwndbg"}
+        try:
+            output = gdb.execute("kbase", to_string=True)
+        except Exception as exc:
+            attempt["error"] = f"{type(exc).__name__}: {exc}"
+            return {"attempt": attempt}
+        attempt["output"] = (output or "")[:500]
+        base = parse_pwndbg_kbase_output(output or "")
+        if base is None:
+            # Soft-fail messages from pwndbg (ptrace / unable to locate / none)
+            clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output or "").strip()
+            attempt["error"] = clean.splitlines()[-1] if clean else "no base in output"
+            return {"attempt": attempt}
+        attempt["ok"] = True
+        return {"attempt": attempt, "base": base}
+
+    def _read_remote_memory(self, addr: int, length: int) -> bytes:
+        """Read guest memory via the selected inferior (remote GDB stub OK)."""
+        inf = gdb.selected_inferior()
+        return bytes(inf.read_memory(addr, length))
+
+    def _memory_readable(self, addr: int, length: int = 1) -> bool:
+        try:
+            self._read_remote_memory(addr, length)
+            return True
+        except Exception:
+            return False
+
+    def _idt_base_from_qemu_monitor(self) -> tuple[int, int] | None:
+        try:
+            out = gdb.execute("monitor info registers", to_string=True)
+        except Exception:
+            return None
+        return parse_qemu_monitor_idt(out or "")
+
+    def _idt_base_from_gdb_regs(self) -> int | None:
+        # Prefer a direct register read when GDB exposes idtr.
+        for expr in ("$idtr", "idtr"):
+            try:
+                val = gdb.parse_and_eval(expr)
+                n = int(val) & 0xFFFFFFFFFFFFFFFF
+                if n:
+                    return n
+            except Exception:
+                pass
+        try:
+            out = gdb.execute("info registers idtr", to_string=True)
+        except Exception:
+            try:
+                out = gdb.execute("info all-registers", to_string=True)
+            except Exception:
+                return None
+        m = _GDB_IDTR_RE.search(out or "")
+        if m:
+            return int(m.group(1), 16)
+        return None
+
+    def _kbase_via_idt(self) -> dict[str, Any]:
+        attempt: dict[str, Any] = {"method": "idt"}
+        idt_base: int | None = None
+        idt_limit: int | None = None
+        source = None
+
+        mon = self._idt_base_from_qemu_monitor()
+        if mon is not None:
+            idt_base, idt_limit = mon
+            source = "qemu_monitor"
+        else:
+            idt_base = self._idt_base_from_gdb_regs()
+            if idt_base is not None:
+                source = "gdb_regs"
+
+        if idt_base is None:
+            attempt["error"] = "could not read IDTR (not x86 or no QEMU monitor/GDB idtr)"
+            return {"attempt": attempt}
+
+        attempt["idt_base"] = hex(idt_base)
+        if idt_limit is not None:
+            attempt["idt_limit"] = hex(idt_limit)
+        attempt["idt_source"] = source
+
+        # x86-64 IDT entries are 16 bytes. This path targets x86-64 only; on a
+        # real 32-bit guest a 16-byte read succeeds and would mis-parse entry 1's
+        # bytes as offset_high, so i386 is not reliably supported here. The
+        # 8-byte fallback below only covers the rare case where reading 16 bytes
+        # fails (e.g. a single mapped gate at the edge of readable memory).
+        entry_size = 16
+        try:
+            raw = self._read_remote_memory(idt_base, entry_size)
+        except Exception as exc:
+            # Fallback: retry an 8-byte read (best-effort, not full i386 support).
+            try:
+                entry_size = 8
+                raw = self._read_remote_memory(idt_base, entry_size)
+            except Exception:
+                attempt["error"] = (
+                    f"cannot read IDT at {idt_base:#x} via remote memory: {exc}"
+                )
+                return {"attempt": attempt}
+
+        try:
+            handler = parse_idt_entry_offset(raw)
+        except ValueError as exc:
+            attempt["error"] = str(exc)
+            return {"attempt": attempt}
+
+        if handler == 0 or not (handler >> 63):  # not a kernel canonical address
+            # High half of canonical form: top bit set for kernel VAs on x86-64.
+            # i386 kernel is often >= 0xc0000000; accept that too for 32-bit.
+            if handler < 0xC0000000:
+                attempt["error"] = f"IDT[0] handler {handler:#x} is not a kernel address"
+                attempt["handler"] = hex(handler)
+                return {"attempt": attempt}
+
+        attempt["handler"] = hex(handler)
+        # IDT[0] (asm_exc_divide_error) sits within the first 2 MiB window of
+        # _text on Linux, so rounding the handler down to the KASLR alignment is
+        # already exact. Do NOT pass a `readable` walk-down here: the walk can
+        # only move the estimate *below* the true base (and would silently do so
+        # if any 2 MiB page under _text happens to be mapped), which mis-rebases
+        # every symbol. Round-down only.
+        base = estimate_kbase_from_handler(handler, align=_KBASE_ALIGN_2M)
+        # If 2 MiB walk didn't move and the handler is far above, also try 1 GiB
+        # only when the 2 MiB candidate is unreadable (unlikely); keep 2 MiB.
+        if not self._memory_readable(base, 1):
+            base_1g = estimate_kbase_from_handler(handler, align=_KBASE_ALIGN_1G)
+            if self._memory_readable(base_1g, 1):
+                base = base_1g
+                attempt["align"] = hex(_KBASE_ALIGN_1G)
+            else:
+                attempt["error"] = (
+                    f"estimated base {base:#x} (from handler {handler:#x}) "
+                    "is not readable via remote memory"
+                )
+                return {"attempt": attempt}
+        else:
+            attempt["align"] = hex(_KBASE_ALIGN_2M)
+
+        attempt["ok"] = True
+        extra = {
+            "handler": hex(handler),
+            "idt_base": hex(idt_base),
+            "note": (
+                "IDT-derived base: rounded down to KASLR alignment from "
+                "IDT[0] handler via remote target memory (no host "
+                "/proc/$qemu/mem). Exact when exception stubs sit within "
+                "the first alignment window of _text (typical Linux)."
+            ),
+        }
+        return {"attempt": attempt, "base": base, "extra": extra}
+
+    def _kbase_via_vbar(self) -> dict[str, Any]:
+        """AArch64: VBAR_EL1 points into kernel vectors; align like IDT path."""
+        attempt: dict[str, Any] = {"method": "vbar"}
+        vbar: int | None = None
+        for expr in ("$vbar_el1", "vbar_el1", "$VBAR_EL1"):
+            try:
+                val = gdb.parse_and_eval(expr)
+                n = int(val) & 0xFFFFFFFFFFFFFFFF
+                if n:
+                    vbar = n
+                    break
+            except Exception:
+                pass
+        if vbar is None:
+            try:
+                out = gdb.execute("info all-registers", to_string=True)
+            except Exception as exc:
+                attempt["error"] = f"could not read VBAR_EL1: {exc}"
+                return {"attempt": attempt}
+            m = _GDB_VBAR_RE.search(out or "")
+            if m:
+                vbar = int(m.group(1), 16)
+        if vbar is None:
+            attempt["error"] = "VBAR_EL1 not available (not aarch64 or no target)"
+            return {"attempt": attempt}
+
+        attempt["vbar"] = hex(vbar)
+        base = estimate_kbase_from_handler(
+            vbar,
+            align=_KBASE_ALIGN_2M,
+            readable=lambda a: self._memory_readable(a, 1),
+        )
+        if not self._memory_readable(base, 1):
+            attempt["error"] = f"estimated base {base:#x} not readable"
+            return {"attempt": attempt}
+        attempt["ok"] = True
+        return {
+            "attempt": attempt,
+            "base": base,
+            "extra": {
+                "handler": hex(vbar),
+                "note": "VBAR_EL1-derived base (2 MiB align + optional walk-down).",
+            },
+        }
 
     # ------------------------------------------------------------------
     # Python escape hatch
