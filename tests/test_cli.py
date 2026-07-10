@@ -1083,6 +1083,68 @@ def test_gdb_exec_json_format(monkeypatch, capsys):
     assert payload["output"] == "KBASE: 0xffffffff81000000\n"
 
 
+def test_kbase_sends_correct_op(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "base": "0xffffffffb0200000",
+                "method": "idt",
+                "handler": "0xffffffffb0201030",
+                "note": "IDT-derived base",
+                "attempts": [
+                    {"method": "pwndbg", "error": "Unable to locate the kernel base"},
+                    {"method": "idt", "ok": True},
+                ],
+            },
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["kbase"])
+
+    assert rc == 0
+    assert captured["op"] == "kbase"
+    out = capsys.readouterr().out
+    assert "0xffffffffb0200000" in out
+    assert "method=idt" in out
+    assert "handler: 0xffffffffb0201030" in out
+
+
+def test_kbase_json_format(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {
+            "ok": True,
+            "result": {"base": "0xffffffff81000000", "method": "pwndbg", "attempts": []},
+        }
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["kbase", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["base"] == "0xffffffff81000000"
+    assert payload["method"] == "pwndbg"
+
+
+def test_kbase_bridge_error_nonzero(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        raise pry.cli.BridgeError("unable to locate kernel base — pwndbg: ...")
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+
+    rc = pry.cli.main(["kbase"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "unable to locate kernel base" in err
+
+
 def test_gdb_exec_empty_output(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         return {"ok": True, "result": {"output": ""}}

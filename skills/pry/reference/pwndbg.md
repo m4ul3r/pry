@@ -10,7 +10,7 @@ When connected to a QEMU kernel with KASLR enabled, vmlinux symbols are at link-
 ```bash
 pry launch --connect localhost:1234   # connect WITHOUT --symbols (no link-time copy)
                                       # (with qmu: `qmu gdb --vm <id>` and DON'T pass --symbols)
-pry gdb kbase                         # -> "Found virtual text base address: 0x...."
+pry kbase                             # preferred over `pry gdb kbase` — has IDT fallback
 pry load ./vmlinux --base 0x<kbase>   # one clean copy; pry offsets ALL sections by the slide
 pry break set commit_creds            # symbol breakpoints, print, disasm now resolve correctly
 pry print "init_task.comm"            # data symbols work too
@@ -19,14 +19,20 @@ pry continue
 
 `pry load --base` reads vmlinux's link-time `.text` address, computes `slide = base - .text`, and runs `add-symbol-file vmlinux -o <slide>` after dropping any prior copy — so there is exactly one symbol table and every section (text + data) lands at its runtime address.
 
-**How `kbase` works:** On x86-64 it reads the IDT via the IDTR register (available from the GDB stub without symbols), parses IDT entry 0 to get a `.text` address, then walks page tables to find the containing mapping's base. On AArch64 it reads VBAR_EL1. No symbols or /proc access needed.
+**Prefer `pry kbase` over `pry gdb kbase`.** The first-class command returns structured `{base, method, ...}` and hard-fails (non-zero) when discovery fails. Method chain:
 
-> **Pitfall — `kbase -r` is not enough.** `pry gdb "kbase -r"` does `add-symbol-file vmlinux <base>`, which (a) *adds* a second copy without removing the link-time one (so `print &sym`/`break sym` resolve to the stale, unmapped link-time address → `MemoryError`), and (b) only relocates `.text`, leaving data symbols (`jiffies`, `init_task`) at link addresses. If you loaded vmlinux as the primary file (e.g. `pry launch --symbols vmlinux` or `qmu gdb --symbols vmlinux`), `kbase -r` will *not* make symbol lookups work. Prefer `pry load --base`. If you don't have vmlinux at all, `klookup` reads the in-memory kallsyms and gives correct runtime addresses.
+1. **pwndbg** — same as `pry gdb kbase`. On x86-64 it reads the IDT, parses entry 0 for a `.text` address, then walks page tables (gdb-pt-dump / `kernel-vmmap page-tables`) to find the mapping base. On AArch64 it uses VBAR_EL1.
+2. **IDT fallback (pry-owned)** — if pwndbg fails, pry reads IDTR via QEMU `monitor info registers` (or GDB `idtr`), reads IDT[0] through the **remote** target memory API (`inferior.read_memory` — not host `/proc/$qemu/mem`), then rounds the handler down to the 2 MiB KASLR alignment (with an optional walk-down while pages stay readable).
+
+**Yama / ptrace footgun:** pwndbg's page-table walk needs host ptrace of QEMU's `/proc/$pid/mem`. With `kernel.yama.ptrace_scope=1` (default on many distros) and GDB **not** an ancestor of QEMU (the common `qmu`/shell spawns QEMU, `pry launch` spawns separate GDB layout), that read is denied and raw `pry gdb kbase` prints `Permission error when attempting to parse page tables...` / `Unable to locate the kernel base`. `pry kbase`'s IDT path does **not** need host ptrace of QEMU — only the remote GDB stub.
+
+> **Pitfall — `kbase -r` is not enough.** `pry gdb "kbase -r"` does `add-symbol-file vmlinux <base>`, which (a) *adds* a second copy without removing the link-time one (so `print &sym`/`break sym` resolve to the stale, unmapped link-time address → `MemoryError`), and (b) only relocates `.text`, leaving data symbols (`jiffies`, `init_task`) at link addresses. If you loaded vmlinux as the primary file (e.g. `pry launch --symbols vmlinux` or `qmu gdb --symbols vmlinux`), `kbase -r` will *not* make symbol lookups work. Prefer `pry load --base`. If you don't have vmlinux at all, `klookup` reads the in-memory kallsyms and gives correct runtime addresses (but also needs kernel mappings / can fail under the same yama conditions). Guest fallback when everything fails: `grep 'T _text$' /proc/kallsyms` after relaxing `kptr_restrict`.
 
 ### Kernel Inspection
 
 ```bash
-pry gdb kbase                         # Kernel virtual base address (then: pry load vmlinux --base <kbase>)
+pry kbase                             # Kernel virtual base (prefer this; IDT fallback without host ptrace)
+pry gdb kbase                         # Raw pwndbg only (no pry IDT fallback)
 pry gdb "klookup commit_creds"        # Symbol lookup via in-memory kallsyms (no debug syms needed)
 pry gdb "klookup 0xffffffff81234567"  # Reverse lookup: address → symbol name
 pry gdb kcmdline                      # /proc/cmdline from kernel memory

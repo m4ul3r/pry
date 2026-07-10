@@ -82,10 +82,10 @@ pry continue                        # Continue execution
 > **KASLR kernels:** loading vmlinux at its link-time base (via `--symbols`/`pry load`) leaves symbols at the wrong addresses, so `pry break set <fn>` / `pry print <global>` won't resolve. Connect **without** symbols, read the base, then rebase in one clean step:
 > ```bash
 > pry launch --connect localhost:1234
-> pry gdb kbase                       # -> Found virtual text base address: 0x....
+> pry kbase                           # preferred — pwndbg, then IDT remote-memory fallback
 > pry load ./vmlinux --base 0x<kbase> # offsets ALL sections; text + data resolve
 > ```
-> Do **not** use `kbase -r` for this — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
+> Prefer `pry kbase` over `pry gdb kbase`. The first-class command falls back to an IDT-based discovery over the **remote** GDB stub when pwndbg's page-table walk fails under `kernel.yama.ptrace_scope=1` (common when `qmu`/shell spawns QEMU and pry spawns a separate GDB). Do **not** use `kbase -r` for rebasing — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
 
 ### Connection management
 
@@ -379,14 +379,14 @@ pwndbg is loaded alongside the bridge, so **any** pwndbg command runs verbatim t
 
 ```bash
 pry gdb "pwndbg"                      # Full list of pwndbg commands (--list-categories for groups)
-pry gdb kbase                         # Kernel virtual base (KASLR) — then `pry load vmlinux --base <kbase>`
+pry kbase                             # Kernel virtual base (KASLR) — prefer over `pry gdb kbase`
 pry gdb checksec                      # Binary security (NX, PIE, RELRO, canary)
 pry gdb vmmap                         # Virtual memory map
 ```
 
-For KASLR symbol rebasing use `pry load vmlinux --base <kbase>` — see **Remote Debugging → KASLR kernels** above for the recipe and [reference/pwndbg.md](reference/pwndbg.md) for why not `kbase -r`.
+For KASLR symbol rebasing use `pry kbase` then `pry load vmlinux --base <kbase>` — see **Remote Debugging → KASLR kernels** above for the recipe and [reference/pwndbg.md](reference/pwndbg.md) for why not `kbase -r` and for the yama/ptrace_scope footgun.
 
-Prefer the first-class structured commands where they exist — `pry mappings` (over `vmmap`), `pry registers` / `pry registers write`, `pry disasm` (symbol-annotated), `pry backtrace` — and drop to `pry gdb` for everything else.
+Prefer the first-class structured commands where they exist — `pry kbase` (over `pry gdb kbase`), `pry mappings` (over `vmmap`), `pry registers` / `pry registers write`, `pry disasm` (symbol-annotated), `pry backtrace` — and drop to `pry gdb` for everything else.
 
 
 ## Inferior Management

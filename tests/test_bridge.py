@@ -1103,6 +1103,155 @@ def test_gdb_exec_passthrough(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# kbase helpers + fallback chain (issue #29)
+# ---------------------------------------------------------------------------
+
+def test_parse_pwndbg_kbase_output(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    parse = bridge_mod.parse_pwndbg_kbase_output
+    assert parse("Found virtual text base address: 0xffffffffb0200000\n") == 0xFFFFFFFFB0200000
+    # ANSI-colored
+    colored = "\x1b[32mFound virtual text base address: 0xffffffff81000000\x1b[0m"
+    assert parse(colored) == 0xFFFFFFFF81000000
+    assert parse("Unable to locate the kernel base\n") is None
+    assert parse("") is None
+
+
+def test_parse_qemu_monitor_idt(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    parse = bridge_mod.parse_qemu_monitor_idt
+    mon = (
+        "RAX=0000000000000000 RBX=0000000000000000\n"
+        "IDT=     fffffe0000000000 00000fff\n"
+        "CR0=80050033 CR2=0000000000000000\n"
+    )
+    assert parse(mon) == (0xFFFFFE0000000000, 0xFFF)
+    assert parse("no idt here") is None
+
+
+def test_parse_idt_entry_offset(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    parse = bridge_mod.parse_idt_entry_offset
+    # Build a 16-byte x86-64 gate for handler 0xffffffffb0212340
+    handler = 0xFFFFFFFFB0212340
+    off_lo = handler & 0xFFFF
+    off_mid = (handler >> 16) & 0xFFFF
+    off_hi = (handler >> 32) & 0xFFFFFFFF
+    entry = struct.pack("<HHBBHII", off_lo, 0x10, 0, 0x8E, off_mid, off_hi, 0)
+    assert parse(entry) == handler
+    # 8-byte i386 gate
+    h32 = 0xC0101030
+    e32 = struct.pack("<HHBBH", h32 & 0xFFFF, 0x10, 0, 0x8E, (h32 >> 16) & 0xFFFF)
+    assert parse(e32) == h32
+    with pytest.raises(ValueError):
+        parse(b"\x00" * 4)
+
+
+def test_estimate_kbase_from_handler_align(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    est = bridge_mod.estimate_kbase_from_handler
+    # Real Linux: asm_exc_divide_error is _text+0x1030
+    handler = 0xFFFFFFFFB0201030
+    assert est(handler) == 0xFFFFFFFFB0200000
+    # Walk-down: readable region starts lower
+    floor = 0xFFFFFFFFB0000000
+
+    def readable(addr: int) -> bool:
+        return addr >= floor
+
+    assert est(handler, readable=readable) == floor
+
+
+def test_kbase_via_pwndbg_success(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    real_exec = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return "Found virtual text base address: 0xffffffffb0200000\n"
+        return real_exec(cmd, to_string=to_string)
+
+    fake_gdb.execute = _exec
+    result = bridge._dispatch_op("kbase", {})
+    assert result["base"] == "0xffffffffb0200000"
+    assert result["method"] == "pwndbg"
+    assert result["attempts"][0]["ok"] is True
+
+
+def test_kbase_falls_back_to_idt_when_pwndbg_fails(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    idt_base = 0xFFFFFE0000000000
+    handler = 0xFFFFFFFFB0201030  # _text + 0x1030
+    text_base = 0xFFFFFFFFB0200000
+    off_lo = handler & 0xFFFF
+    off_mid = (handler >> 16) & 0xFFFF
+    off_hi = (handler >> 32) & 0xFFFFFFFF
+    idt_entry = struct.pack("<HHBBHII", off_lo, 0x10, 0, 0x8E, off_mid, off_hi, 0)
+
+    mem: dict[int, bytes] = {idt_base: idt_entry}
+    # Mark text region readable in 2MiB steps down to text_base
+    for a in range(text_base, handler + 0x1000, 0x200000):
+        mem.setdefault(a, b"\x90")
+
+    real_exec = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return (
+                "Permission error when attempting to parse page tables with gdb-pt-dump.\n"
+                "Unable to locate the kernel base\n"
+            )
+        if cmd == "monitor info registers":
+            return f"IDT=     {idt_base:016x} 00000fff\n"
+        return real_exec(cmd, to_string=to_string)
+
+    def _read_memory(addr, length):
+        # Exact page or any address in a mapped 2MiB window from text_base..handler
+        if addr in mem:
+            data = mem[addr]
+            return data[:length] if len(data) >= length else data + bytes(length - len(data))
+        if text_base <= addr < handler + 0x10000:
+            return bytes(length)
+        raise OSError(f"Cannot access memory at address {addr:#x}")
+
+    fake_gdb.execute = _exec
+    fake_gdb.selected_inferior().read_memory = _read_memory
+
+    result = bridge._dispatch_op("kbase", {})
+    assert result["base"] == hex(text_base)
+    assert result["method"] == "idt"
+    assert result["handler"] == hex(handler)
+    assert result["attempts"][0]["method"] == "pwndbg"
+    assert result["attempts"][0].get("ok") is not True
+    assert result["attempts"][1]["ok"] is True
+
+
+def test_kbase_all_methods_fail(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    real_exec = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return "Unable to locate the kernel base\n"
+        if cmd == "monitor info registers":
+            raise fake_gdb.error("Monitor command failed")
+        if cmd.startswith("info"):
+            return ""
+        return real_exec(cmd, to_string=to_string)
+
+    fake_gdb.execute = _exec
+    # parse_and_eval shouldn't yield a kernel idtr/vbar
+    fake_gdb.parse_and_eval = lambda expr: (_ for _ in ()).throw(ValueError("nope"))
+
+    with pytest.raises(RuntimeError, match="unable to locate kernel base"):
+        bridge._dispatch_op("kbase", {})
+
+
+# ---------------------------------------------------------------------------
 # Feature 1: Lock-free interrupt
 # ---------------------------------------------------------------------------
 
