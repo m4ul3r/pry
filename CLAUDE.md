@@ -49,7 +49,7 @@ The bridge runs a threaded socket server inside GDB, but the GDB Python API is o
 
 ### Output Spilling (src/pry/output.py)
 
-`write_output_result()` counts tokens (`o200k_base` via tiktoken); output over 10k tokens is spilled to `/tmp/pry-spills/<date>/` and replaced by a JSON artifact envelope (path, bytes, tokens, sha256, summary). `--out <path>` always writes to a file. This is deliberate context-window protection for agents — don't bypass it when adding commands.
+`write_output_result()` counts tokens (`o200k_base` via tiktoken); output over 10k tokens is spilled to `<cache_home>/spills/<date>/` (via `spill_root()`) and replaced by a JSON artifact envelope (path, bytes, tokens, sha256, summary). `--out <path>` always writes to a file. This is deliberate context-window protection for agents — don't bypass it when adding commands.
 
 ### Key Files
 
