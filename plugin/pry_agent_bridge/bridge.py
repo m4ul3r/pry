@@ -642,6 +642,28 @@ def _bp_kind(bp_type: int) -> str:
     return _BP_KIND_BY_TYPE.get(int(bp_type), f"type-{bp_type}")
 
 
+def _bp_location_to_dict(loc) -> dict[str, Any]:
+    """Serialize one gdb.BreakpointLocation to a JSON-friendly dict.
+
+    GDB multi-location breakpoints (inlined callees, multiple TUs that define
+    the same static, etc.) expose several of these under one Breakpoint.
+    """
+    entry: dict[str, Any] = {}
+    addr = getattr(loc, "address", None)
+    if addr is not None:
+        entry["address"] = hex(addr)
+    src = getattr(loc, "source", None)
+    if src:
+        entry["file"], entry["line"] = src[0], src[1]
+    fn = getattr(loc, "function", None)
+    if fn:
+        entry["function"] = fn
+    # Individual locations can be enabled/disabled independently of the owner.
+    if hasattr(loc, "enabled"):
+        entry["enabled"] = bool(loc.enabled)
+    return entry
+
+
 def _breakpoint_to_dict(bp) -> dict[str, Any]:
     """Convert a gdb.Breakpoint to a JSON-friendly dict."""
     result: dict[str, Any] = {
@@ -665,26 +687,28 @@ def _breakpoint_to_dict(bp) -> dict[str, Any]:
         "thread": getattr(bp, "thread", None),
         "ignore": getattr(bp, "ignore_count", 0),
     }
-    # Resolved placement (GDB 13+): the actual address and source line a
+    # Resolved placement (GDB 13+): the actual address(es) and source line(s) a
     # symbolic / file:line breakpoint landed on, so agents can confirm where it
     # went (e.g. `break main` lands past the prologue) without having to run.
-    # Watchpoints/catchpoints have no meaningful code location, and older GDB
-    # lacks `.locations` or leaves a pending breakpoint with none — stay
-    # defensive and just omit the fields when unavailable.
+    # Multi-location BPs (inlined sites) can have several entries — surface all
+    # of them; keep top-level address/file/line/function from the first for
+    # backward compatibility. Watchpoints/catchpoints have no meaningful code
+    # location, and older GDB lacks `.locations` or leaves a pending breakpoint
+    # with none — stay defensive and just omit the fields when unavailable.
     if result["kind"] in ("breakpoint", "hw-breakpoint"):
         try:
             locs = getattr(bp, "locations", None) or []
             if locs:
-                loc = locs[0]
-                addr = getattr(loc, "address", None)
-                if addr is not None:
-                    result["address"] = hex(addr)
-                src = getattr(loc, "source", None)
-                if src:
-                    result["file"], result["line"] = src[0], src[1]
-                fn = getattr(loc, "function", None)
-                if fn:
-                    result["function"] = fn
+                serialized = [_bp_location_to_dict(loc) for loc in locs]
+                # Drop empties (defensive against odd location objects).
+                serialized = [s for s in serialized if s]
+                if serialized:
+                    result["locations"] = serialized
+                    result["location_count"] = len(serialized)
+                    first = serialized[0]
+                    for key in ("address", "file", "line", "function"):
+                        if key in first:
+                            result[key] = first[key]
         except Exception:
             pass
     return result

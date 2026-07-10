@@ -567,7 +567,7 @@ def test_break_set_ignore_count(monkeypatch):
 def test_breakpoint_dict_includes_resolved_location(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     loc = types.SimpleNamespace(
-        address=0x401445, source=("workshop.c", 75), function="main"
+        address=0x401445, source=("workshop.c", 75), function="main", enabled=True
     )
     base = dict(
         number=1, enabled=True, location="main", expression=None, condition=None,
@@ -580,12 +580,69 @@ def test_breakpoint_dict_includes_resolved_location(monkeypatch):
     assert d["file"] == "workshop.c"
     assert d["line"] == 75
     assert d["function"] == "main"
+    assert d["location_count"] == 1
+    assert d["locations"] == [
+        {
+            "address": "0x401445",
+            "file": "workshop.c",
+            "line": 75,
+            "function": "main",
+            "enabled": True,
+        }
+    ]
 
     # Watchpoints are not code locations — the resolved fields must be omitted
     # even if a location object is present.
     wp = types.SimpleNamespace(type=fake_gdb.BP_WATCHPOINT, **base)
     dw = bridge_mod._breakpoint_to_dict(wp)
     assert "address" not in dw
+    assert "locations" not in dw
+
+
+def test_breakpoint_dict_includes_all_multi_locations(monkeypatch):
+    """Inlined / multi-location BPs must surface every site, not just the first.
+
+    GDB often places free_msg-style symbols at an inlined site inside a caller
+    *and* at the out-of-line body. Agents that only see locs[0] get the wrong
+    address.
+    """
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    locs = [
+        types.SimpleNamespace(
+            address=0x401100, source=("msg.c", 20), function="load_msg", enabled=True
+        ),
+        types.SimpleNamespace(
+            address=0x401280, source=("msg.c", 55), function="free_msg", enabled=True
+        ),
+    ]
+    bp = types.SimpleNamespace(
+        type=fake_gdb.BP_BREAKPOINT,
+        number=3,
+        enabled=True,
+        location="free_msg",
+        expression=None,
+        condition=None,
+        hit_count=0,
+        temporary=False,
+        pending=False,
+        thread=None,
+        ignore_count=0,
+        locations=locs,
+    )
+    d = bridge_mod._breakpoint_to_dict(bp)
+    # Top-level fields stay on the first location for backward compatibility.
+    assert d["address"] == "0x401100"
+    assert d["function"] == "load_msg"
+    assert d["file"] == "msg.c"
+    assert d["line"] == 20
+    assert d["location_count"] == 2
+    assert len(d["locations"]) == 2
+    assert d["locations"][0]["address"] == "0x401100"
+    assert d["locations"][0]["function"] == "load_msg"
+    assert d["locations"][1]["address"] == "0x401280"
+    assert d["locations"][1]["function"] == "free_msg"
+    assert d["locations"][1]["file"] == "msg.c"
+    assert d["locations"][1]["line"] == 55
 
 
 def test_break_delete_multiple(monkeypatch):

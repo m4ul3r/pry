@@ -2055,6 +2055,84 @@ def test_render_breakpoint_set_without_resolved_location():
     assert "@" not in text
 
 
+def test_render_breakpoint_set_shows_all_multi_locations():
+    value = {
+        "number": 1,
+        "kind": "breakpoint",
+        "location": "free_msg",
+        "enabled": True,
+        "address": "0x401100",
+        "file": "msg.c",
+        "line": 20,
+        "function": "load_msg",
+        "location_count": 2,
+        "locations": [
+            {
+                "address": "0x401100",
+                "file": "msg.c",
+                "line": 20,
+                "function": "load_msg",
+            },
+            {
+                "address": "0x401280",
+                "file": "msg.c",
+                "line": 55,
+                "function": "free_msg",
+            },
+        ],
+    }
+    text = pry.cli._render_breakpoint_set_text(value)
+    assert "breakpoint #1 set at free_msg [enabled] (2 locations)" in text
+    assert "@ 0x401100 load_msg msg.c:20" in text
+    assert "@ 0x401280 free_msg msg.c:55" in text
+
+
+def test_render_breakpoint_list_shows_all_multi_locations():
+    value = [
+        {
+            "number": 1,
+            "kind": "breakpoint",
+            "location": "free_msg",
+            "enabled": True,
+            "hits": 0,
+            "location_count": 2,
+            "locations": [
+                {
+                    "address": "0x401100",
+                    "file": "msg.c",
+                    "line": 20,
+                    "function": "load_msg",
+                },
+                {
+                    "address": "0x401280",
+                    "file": "msg.c",
+                    "line": 55,
+                    "function": "free_msg",
+                },
+            ],
+        },
+        {
+            "number": 2,
+            "kind": "breakpoint",
+            "location": "main",
+            "enabled": True,
+            "hits": 1,
+            "location_count": 1,
+            "locations": [
+                {"address": "0x401445", "file": "main.c", "line": 10, "function": "main"}
+            ],
+        },
+    ]
+    text = pry.cli._render_breakpoint_list_text(value)
+    assert "#1 breakpoint at free_msg [enabled] hits=0 (2 locations)" in text
+    assert "@ 0x401100 load_msg msg.c:20" in text
+    assert "@ 0x401280 free_msg msg.c:55" in text
+    # Single-location BPs keep the compact one-line form (no detail dump).
+    assert "#2 breakpoint at main [enabled] hits=1" in text
+    assert "(1 locations)" not in text
+    assert "0x401445" not in text
+
+
 def test_render_status_text_shows_displays():
     # Displays are attached to the status payload while stopped; the text
     # renderer must surface them too (not just JSON / the stop renderer).

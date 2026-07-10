@@ -650,6 +650,40 @@ def _bp_target_preposition(bp: dict) -> str:
     return "on" if "watchpoint" in kind else "at"
 
 
+def _bp_location_entries(bp: dict) -> list[dict]:
+    """Return resolved location dicts for a breakpoint payload, if any."""
+    locs = bp.get("locations")
+    if isinstance(locs, list):
+        return [loc for loc in locs if isinstance(loc, dict)]
+    return []
+
+
+def _format_bp_location_detail(loc: dict) -> str:
+    """Format one resolved location as '@ ADDR [FN] [FILE:LINE]'."""
+    addr = loc.get("address")
+    if not addr:
+        return ""
+    where = f"@ {addr}"
+    fn = loc.get("function")
+    if fn:
+        where += f" {fn}"
+    f = loc.get("file")
+    line = loc.get("line")
+    if f and line is not None:
+        where += f" {f}:{line}"
+    elif f:
+        where += f" {f}"
+    return where
+
+
+def _bp_location_count(bp: dict) -> int:
+    """Resolved location count, preferring explicit location_count."""
+    count = bp.get("location_count")
+    if isinstance(count, int) and count > 0:
+        return count
+    return len(_bp_location_entries(bp))
+
+
 def _render_breakpoint_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -685,7 +719,18 @@ def _render_breakpoint_list_text(value: Any) -> str:
         cond = bp.get("condition")
         if cond:
             line += f" if {cond}"
+        # Multi-location breakpoints (inlined sites, etc.): announce the count
+        # and list every resolved address so agents don't assume the first is
+        # the real hit site.
+        loc_count = _bp_location_count(bp)
+        if loc_count > 1:
+            line += f" ({loc_count} locations)"
         lines.append(line)
+        if loc_count > 1:
+            for loc in _bp_location_entries(bp):
+                detail = _format_bp_location_detail(loc)
+                if detail:
+                    lines.append(f"  {detail}")
     return "\n".join(lines)
 
 
@@ -699,14 +744,21 @@ def _render_breakpoint_set_text(value: Any) -> str:
     noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
     enabled = "enabled" if value.get("enabled") else "disabled"
     parts = [f"{noun} #{num} set {prep} {target} [{enabled}]"]
-    addr = value.get("address")
-    if addr:
-        where = f"@ {addr}"
-        f = value.get("file")
-        line = value.get("line")
-        if f and line is not None:
-            where += f" {f}:{line}"
-        parts.append(where)
+    loc_entries = _bp_location_entries(value)
+    loc_count = _bp_location_count(value)
+    # Multi-location: show count on the header line and each address below.
+    # Single resolved location keeps the compact trailing "@ ADDR FILE:LINE".
+    if loc_count > 1:
+        parts.append(f"({loc_count} locations)")
+    else:
+        addr = value.get("address")
+        if addr:
+            where = f"@ {addr}"
+            f = value.get("file")
+            line = value.get("line")
+            if f and line is not None:
+                where += f" {f}:{line}"
+            parts.append(where)
     if value.get("pending"):
         parts.append("(pending — location not yet resolved)")
     if value.get("temporary"):
@@ -720,7 +772,16 @@ def _render_breakpoint_set_text(value: Any) -> str:
     rebased = value.get("rebased")
     if isinstance(rebased, dict):
         parts.append(f"(rebased from {rebased.get('offset', '?')} in {rebased.get('module', '?')})")
-    return " ".join(parts)
+    header = " ".join(parts)
+    if loc_count > 1:
+        detail_lines = []
+        for loc in loc_entries:
+            detail = _format_bp_location_detail(loc)
+            if detail:
+                detail_lines.append(f"  {detail}")
+        if detail_lines:
+            return header + "\n" + "\n".join(detail_lines)
+    return header
 
 
 def _render_breakpoint_delete_text(value: Any) -> str:
