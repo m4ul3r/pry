@@ -21,3 +21,4 @@ tests/fixtures/*.bin
 
 # Local scratch binaries / audit fixtures
 tmp/
+.herd/
