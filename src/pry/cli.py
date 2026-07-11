@@ -2836,15 +2836,21 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("path", help="Path to binary")
     load.add_argument(
         "--base", metavar="ADDR",
-        help="Load symbols so .text lands at this runtime base, as the sole copy, "
-             "offsetting ALL sections uniformly (text+data). For relocated/PIE/KASLR "
-             "modules; avoids the duplicate-symbol and data-not-relocated traps of "
-             '`kbase -r`. Get a kernel base from `pry kbase`.',
+        help="Runtime address of the kernel/image _text symbol (as reported by "
+             "`pry kbase`, `qmu kbase`, or kallsyms `_text`). Loads symbols as the "
+             "sole copy, offsetting ALL sections uniformly (text+data) by "
+             "base - link-time _text, avoiding the duplicate-symbol and "
+             "data-not-relocated traps of `kbase -r`. The slide is keyed to the "
+             "_text symbol (not the .text section base, which equals _stext on "
+             "arm and would be 0x10000 low on arm64); on x86 _text == _stext so "
+             "behaviour is unchanged.",
     )
     load.add_argument(
         "--slide", metavar="OFFSET",
-        help="Offset added to every section (alternative to --base when the file's "
-             ".text address can't be read).",
+        help="Offset added to every section (alternative to --base). Use when "
+             "the base is not the _text value or the ELF _text/.text can't be "
+             "read; e.g. `--slide 0` for a non-KASLR build where link == runtime "
+             "(multi_v7 arm32).",
     )
     load.add_argument(
         "--src", metavar="DIR",

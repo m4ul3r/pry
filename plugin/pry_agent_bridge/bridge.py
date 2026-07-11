@@ -276,45 +276,157 @@ def _resolve_to_address(expr: str) -> int | None:
         return None
 
 
-def _elf_text_vaddr(path: str) -> int | None:
-    """Link-time virtual address of the ``.text`` section of an ELF64 file.
+def _elf_sections(path: str):
+    """Parse an ELF32 or ELF64 file's section headers, resolving section names.
 
-    Used to compute the uniform relocation slide for ``pry load --base``:
-    ``slide = runtime_base - link_text_vaddr``. Returns None if the file isn't
-    a readable ELF64 or has no ``.text`` section.
+    Returns ``(hdr, sections)`` where ``hdr`` carries endian/class geometry and
+    each section is a dict with ``name`` (bytes), ``type``, ``addr``, ``offset``,
+    ``size``, ``link``, and ``entsize``. Returns ``None`` if the file is not a
+    readable ELF. Shared by :func:`_elf_text_vaddr` and
+    :func:`_elf_symbol_vaddrs` so the same walk serves both classes.
     """
     try:
         with open(path, "rb") as f:
             ehdr = f.read(64)
-            if len(ehdr) < 64 or ehdr[:4] != b"\x7fELF" or ehdr[4] != 2:
-                return None  # not ELF64
+            if len(ehdr) < 52 or ehdr[:4] != b"\x7fELF" or ehdr[4] not in (1, 2):
+                return None  # not an ELF32/ELF64 file
+            is64 = ehdr[4] == 2
+            if is64 and len(ehdr) < 64:
+                return None
             endian = "<" if ehdr[5] == 1 else ">"
-            e_shoff = struct.unpack_from(endian + "Q", ehdr, 0x28)[0]
-            e_shentsize = struct.unpack_from(endian + "H", ehdr, 0x3A)[0]
-            e_shnum = struct.unpack_from(endian + "H", ehdr, 0x3C)[0]
-            e_shstrndx = struct.unpack_from(endian + "H", ehdr, 0x3E)[0]
+            if is64:
+                e_shoff = struct.unpack_from(endian + "Q", ehdr, 0x28)[0]
+                e_shentsize = struct.unpack_from(endian + "H", ehdr, 0x3A)[0]
+                e_shnum = struct.unpack_from(endian + "H", ehdr, 0x3C)[0]
+                e_shstrndx = struct.unpack_from(endian + "H", ehdr, 0x3E)[0]
+            else:
+                e_shoff = struct.unpack_from(endian + "I", ehdr, 0x20)[0]
+                e_shentsize = struct.unpack_from(endian + "H", ehdr, 0x2E)[0]
+                e_shnum = struct.unpack_from(endian + "H", ehdr, 0x30)[0]
+                e_shstrndx = struct.unpack_from(endian + "H", ehdr, 0x32)[0]
             if not e_shoff or not e_shnum or e_shstrndx >= e_shnum:
                 return None
             f.seek(e_shoff)
-            shdrs = f.read(e_shentsize * e_shnum)
+            raw = f.read(e_shentsize * e_shnum)
+            if len(raw) < e_shentsize * e_shnum:
+                return None
 
-            def _sh(i: int) -> bytes:
-                return shdrs[i * e_shentsize:(i + 1) * e_shentsize]
+            # Section-header field offsets differ by ELF class; the word width
+            # (W) covers sh_addr/sh_offset/sh_size/sh_entsize.
+            if is64:
+                W, a_off, o_off, s_off, l_off, e_off = "Q", 0x10, 0x18, 0x20, 0x28, 0x38
+            else:
+                W, a_off, o_off, s_off, l_off, e_off = "I", 0x0C, 0x10, 0x14, 0x18, 0x24
 
-            strhdr = _sh(e_shstrndx)
-            str_off = struct.unpack_from(endian + "Q", strhdr, 0x18)[0]
-            str_size = struct.unpack_from(endian + "Q", strhdr, 0x20)[0]
-            f.seek(str_off)
-            strtab = f.read(str_size)
-            for i in range(e_shnum):
-                h = _sh(i)
-                name_off = struct.unpack_from(endian + "I", h, 0)[0]
-                end = strtab.find(b"\x00", name_off)
-                name = strtab[name_off:end if end != -1 else None]
-                if name == b".text":
-                    return struct.unpack_from(endian + "Q", h, 0x10)[0]
+            def _parse(i: int) -> dict:
+                b = raw[i * e_shentsize:(i + 1) * e_shentsize]
+                return {
+                    "name_off": struct.unpack_from(endian + "I", b, 0)[0],
+                    "type": struct.unpack_from(endian + "I", b, 4)[0],
+                    "addr": struct.unpack_from(endian + W, b, a_off)[0],
+                    "offset": struct.unpack_from(endian + W, b, o_off)[0],
+                    "size": struct.unpack_from(endian + W, b, s_off)[0],
+                    "link": struct.unpack_from(endian + "I", b, l_off)[0],
+                    "entsize": struct.unpack_from(endian + W, b, e_off)[0],
+                }
+
+            sections = [_parse(i) for i in range(e_shnum)]
+            strhdr = sections[e_shstrndx]
+            f.seek(strhdr["offset"])
+            shstrtab = f.read(strhdr["size"])
+            for s in sections:
+                end = shstrtab.find(b"\x00", s["name_off"])
+                s["name"] = shstrtab[s["name_off"]:end if end != -1 else None]
+            return {"endian": endian, "is64": is64}, sections
     except (OSError, struct.error):
         return None
+
+
+def _elf_text_vaddr(path: str) -> int | None:
+    """Link-time virtual address of the ``.text`` section of an ELF32/64 file.
+
+    Returns ``None`` if the file isn't a readable ELF or has no ``.text``
+    section. Kept as the final fallback for slide math (see
+    :func:`_elf_reloc_reference`); on x86 the ``.text`` base coincides with
+    ``_text``/``_stext``.
+    """
+    parsed = _elf_sections(path)
+    if parsed is None:
+        return None
+    _hdr, sections = parsed
+    for s in sections:
+        if s["name"] == b".text":
+            return s["addr"]
+    return None
+
+
+def _elf_symbol_vaddrs(path: str, names) -> dict:
+    """Link-time values of the requested symbols from an ELF32/64 symbol table.
+
+    Reads ``.symtab`` (falling back to ``.dynsym``) and returns
+    ``{name: st_value}`` for every requested name that is present; missing names
+    are omitted and any failure yields ``{}``. Used to rebase kernels against the
+    ``_text``/``_stext`` symbols that ``qmu kbase`` and guest kallsyms report,
+    rather than the ``.text`` section base (which is ``_stext`` on arm).
+    """
+    parsed = _elf_sections(path)
+    if parsed is None:
+        return {}
+    hdr, sections = parsed
+    endian, is64 = hdr["endian"], hdr["is64"]
+    wanted = {n.encode() if isinstance(n, str) else n for n in names}
+    result: dict[str, int] = {}
+    # Prefer SHT_SYMTAB (2); .dynsym (SHT_DYNSYM, 11) rarely carries _text but
+    # is a harmless fallback for oddly-built images.
+    symsecs = [s for s in sections if s["type"] == 2]
+    symsecs += [s for s in sections if s["type"] == 11]
+    try:
+        with open(path, "rb") as f:
+            for sym in symsecs:
+                entsize = sym["entsize"] or (24 if is64 else 16)
+                if entsize <= 0 or sym["link"] >= len(sections):
+                    continue
+                strsec = sections[sym["link"]]
+                f.seek(strsec["offset"])
+                strtab = f.read(strsec["size"])
+                f.seek(sym["offset"])
+                data = f.read(sym["size"])
+                for i in range(len(data) // entsize):
+                    e = data[i * entsize:(i + 1) * entsize]
+                    name_off = struct.unpack_from(endian + "I", e, 0)[0]
+                    if is64:
+                        st_value = struct.unpack_from(endian + "Q", e, 8)[0]
+                    else:
+                        st_value = struct.unpack_from(endian + "I", e, 4)[0]
+                    end = strtab.find(b"\x00", name_off)
+                    nm = strtab[name_off:end if end != -1 else None]
+                    if nm in wanted and nm.decode() not in result:
+                        result[nm.decode()] = st_value
+    except (OSError, struct.error):
+        return result
+    return result
+
+
+def _elf_reloc_reference(path: str):
+    """Link-time vaddr to subtract from a runtime ``--base`` for the slide.
+
+    Returns ``(vaddr, name)`` where ``name`` labels the reference point, or
+    ``None`` when nothing is readable (stripped/non-ELF). Prefers the ``_text``
+    symbol: it is the address ``qmu kbase`` and guest kallsyms report and what
+    agents pass as ``--base``. On arm64/arm32 ``_text`` sits at ``.head.text``,
+    0x10000 (arm64) / a page (arm32) below the ``.text`` section base
+    (``_stext``); keying the slide to the ``.text`` section — the old behaviour —
+    rebased every symbol that far too low. Falls back to ``_stext`` then the
+    ``.text`` section vaddr; on x86 all three coincide, so x86 is unchanged.
+    """
+    syms = _elf_symbol_vaddrs(path, ("_text", "_stext"))
+    if "_text" in syms:
+        return syms["_text"], "_text"
+    if "_stext" in syms:
+        return syms["_stext"], "_stext"
+    sec = _elf_text_vaddr(path)
+    if sec is not None:
+        return sec, ".text"
     return None
 
 
@@ -2054,16 +2166,23 @@ class GdbBridge:
         # data symbols (jiffies, init_task, ...) at link addresses. So: drop any
         # prior copy, then add the file with ALL sections offset by a uniform
         # slide, giving exactly one table where both text AND data resolve.
+        reference: str | None = None
         if slide is not None:
             slide_int = self._parse_addr(slide)
         else:
-            text_vaddr = _elf_text_vaddr(path)
-            if text_vaddr is None:
+            ref = _elf_reloc_reference(path)
+            if ref is None:
                 raise ValueError(
-                    f"could not read the .text address from {path} to compute "
-                    "the relocation slide; pass --slide <offset> explicitly"
+                    f"could not read _text/_stext/.text from {path} to compute "
+                    "the relocation slide; pass --slide <offset> explicitly "
+                    "(e.g. --slide 0 for a non-KASLR build where link == runtime)"
                 )
-            slide_int = self._parse_addr(base) - text_vaddr
+            ref_vaddr, reference = ref
+            # --base is the runtime _text (what qmu kbase / kallsyms report);
+            # subtract the matching link-time reference so ALL sections shift by
+            # one uniform slide. Using _text (not the .text section base) lands
+            # correctly where _text != _stext (arm), and is identical on x86.
+            slide_int = self._parse_addr(base) - ref_vaddr
         # Drop any existing copy so the relocated table is authoritative.
         # remove-symbol-file only removes add-symbol-file'd copies and fails
         # (raises or prints "No symbol file found") on the *primary* objfile
@@ -2081,6 +2200,10 @@ class GdbBridge:
         result: dict[str, Any] = {"loaded": path, "slide": hex(slide_int)}
         if base is not None:
             result["base"] = hex(self._parse_addr(base))
+        if reference is not None:
+            # Name the symbol/section the slide was keyed to so agents can see
+            # (and trust) that a kallsyms _text base rebased against _text.
+            result["reference"] = reference
         return self._apply_src_and_scripts(result, params)
 
     @staticmethod
