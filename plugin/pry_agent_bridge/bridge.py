@@ -3353,9 +3353,8 @@ class GdbBridge:
             "or resume the guest and read the runtime base directly — "
             "`grep 'T _text$' /proc/kallsyms` (after `echo 0 > "
             "/proc/sys/kernel/kptr_restrict`). Then rebase with "
-            "`pry load vmlinux --base 0x...`; note that on arm64 `pry load "
-            "--base` expects `_stext` (the ELF text section base), not `_text` "
-            "— read `grep 'T _stext$' /proc/kallsyms`."
+            "`pry load vmlinux --base 0x...` using that runtime `_text` — it is "
+            "the correct base on both x86-64 and arm64."
         )
 
     @staticmethod

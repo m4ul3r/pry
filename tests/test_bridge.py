@@ -1508,7 +1508,8 @@ def test_kbase_vbar_unavailable_names_fallbacks(monkeypatch):
     msg = str(excinfo.value)
     assert "qmu kbase" in msg
     assert "_text" in msg
-    assert "_stext" in msg  # arm64 pry load --base guidance (sibling #45)
+    # arm64 `pry load --base` takes the runtime `_text` after #48, not `_stext`.
+    assert "_stext" not in msg
 
 
 def test_kbase_vbar_reports_unstopped_target(monkeypatch):
