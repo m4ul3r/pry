@@ -27,7 +27,14 @@ from .paths import (
     plugin_source_dir,
     repo_root,
 )
-from .transport import BridgeError, _send_request_to_instance, _socket_is_live, list_instances, send_request
+from .transport import (
+    BridgeError,
+    _send_request_to_instance,
+    _socket_is_live,
+    list_instances,
+    match_instance,
+    send_request,
+)
 from .version import VERSION, build_id_for_file
 
 
@@ -150,8 +157,9 @@ def _common_io_options(
     )
     parser.add_argument("--out", type=Path, help="Write output to a file instead of stdout")
     parser.add_argument(
-        "--instance", type=int, default=None, metavar="PID",
-        help="Target a specific bridge instance by GDB PID",
+        "--instance", default=None, metavar="PID|NAME",
+        help="Target a specific bridge instance by GDB PID or its stable "
+             "--instance-id name (a pid wins over a same-spelled name)",
     )
 
 
@@ -257,6 +265,21 @@ def _render_fallback_text(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
 
 
+def _resolve_instance_arg(selector: str | int | None) -> int | None:
+    """Resolve a ``--instance`` selector (pid or unique live name) to a pid.
+
+    Returns ``None`` when no selector was given, so callers keep their existing
+    sole-instance / ambiguity handling for the unselected case. A non-None
+    selector is resolved against the live registry via :func:`match_instance`,
+    which raises ``BridgeError`` on an unknown pid, unknown name, or a name that
+    is ambiguous across live instances. Uses the module-level ``list_instances``
+    so tests that patch ``pry.cli.list_instances`` drive resolution too.
+    """
+    if selector is None:
+        return None
+    return match_instance(list_instances(), selector).pid
+
+
 def _resolve_instance_pid(instance_pid: int | None) -> int | None:
     """Best-effort: the pid of the targeted (or sole) running instance."""
     if instance_pid is not None:
@@ -325,7 +348,10 @@ def _call(
     if timeout is not None:
         kw["timeout"] = timeout
 
-    instance_pid = getattr(args, "instance", None)
+    # Resolve `--instance` (pid or unique live name) to a concrete pid up front
+    # so both the request routing and the session-log diffing below operate on a
+    # real pid. None (no selector) is passed through unchanged.
+    instance_pid = _resolve_instance_arg(getattr(args, "instance", None))
 
     # `--output` (exec commands): capture the inferior's new stdout/stderr
     # produced during this command by diffing the session log around the call.
@@ -400,9 +426,12 @@ def _render_doctor_text(value: Any) -> str:
             continue
         doctor = item.get("doctor") if isinstance(item.get("doctor"), dict) else {}
         status = "ok" if doctor and not doctor.get("error") else "error"
+        name = item.get("instance_id")
+        name_part = f" name={name}" if name else ""
         lines.append(
             "- "
-            + f"pid={item.get('pid', '<unknown>')} plugin={item.get('plugin_version', '<unknown>')} status={status}"
+            + f"pid={item.get('pid', '<unknown>')}{name_part} "
+            + f"plugin={item.get('plugin_version', '<unknown>')} status={status}"
         )
         build_id = item.get("plugin_build_id")
         if build_id:
@@ -1273,12 +1302,13 @@ def _doctor(args: argparse.Namespace) -> int:
     install_build_id = build_id_for_file(install_bridge)
     source_build_id = build_id_for_file(source_bridge)
 
-    target_pid = getattr(args, "instance", None)
+    selector = getattr(args, "instance", None)
     discovered = list_instances()
-    if target_pid is not None:
-        discovered = [i for i in discovered if i.pid == target_pid]
-        if not discovered:
-            raise BridgeError(f"No running GDB bridge instance with pid {target_pid}")
+    if selector is not None:
+        # Resolve pid-or-name against the instances we just listed; raises a
+        # BridgeError if the pid/name is unknown or the name is ambiguous.
+        target = match_instance(discovered, selector)
+        discovered = [target]
 
     instances = []
     for instance in discovered:
@@ -1302,6 +1332,7 @@ def _doctor(args: argparse.Namespace) -> int:
         instances.append(
             {
                 "pid": instance.pid,
+                "instance_id": instance.instance_id,
                 "socket_path": str(instance.socket_path),
                 "plugin_version": instance.plugin_version,
                 "plugin_build_id": loaded_build_id,
@@ -1493,6 +1524,8 @@ def _read_log_tail(log_path: Path, max_chars: int = 500) -> str:
 
 def _render_launch_text(result: dict[str, Any]) -> str:
     lines = [f"GDB launched (pid={result['pid']})"]
+    if result.get("instance_id"):
+        lines.append(f"instance-id: {result['instance_id']}")
     if result.get("gdb_binary"):
         lines.append(f"gdb: {result['gdb_binary']}")
     if result.get("binary"):
@@ -1569,10 +1602,48 @@ def _multiarch_gdb_hint(result: dict[str, Any], gdb_binary: str) -> str | None:
     )
 
 
+def _annotate_registry_instance_id(pid: int, instance_id: str) -> None:
+    """Merge a stable name into the bridge's pid-keyed registry JSON.
+
+    The bridge plugin writes ``<pid>.json`` (pid/socket_path/started_at/…) once
+    during startup and never rewrites it, so we read that record and add the
+    ``instance_id`` field in place. A short retry covers the small window where
+    the socket is already accepting but the plugin has not flushed the registry
+    yet; if it never appears we still persist a minimal record so the name is
+    resolvable.
+    """
+    reg_path = bridge_registry_path(pid)
+    payload: dict[str, Any] | None = None
+    for _ in range(20):
+        try:
+            payload = json.loads(reg_path.read_text(encoding="utf-8"))
+            break
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    if not isinstance(payload, dict):
+        payload = {"pid": pid, "socket_path": str(bridge_socket_path(pid))}
+    payload["instance_id"] = instance_id
+    with contextlib.suppress(OSError):
+        reg_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def _launch(args: argparse.Namespace) -> int:
     from .paths import instances_dir as _instances_dir
 
     gdb_binary = _resolve_gdb_binary(getattr(args, "gdb_binary", None))
+
+    # Refuse a duplicate stable name while an instance already holds it live —
+    # names are meant to disambiguate, so a collision must fail loudly rather
+    # than create two instances that `--instance NAME` can no longer separate.
+    instance_id = getattr(args, "instance_id", None)
+    if instance_id:
+        for inst in list_instances():
+            if inst.instance_id == instance_id:
+                raise BridgeError(
+                    f"An instance named {instance_id!r} is already running "
+                    f"(pid {inst.pid}). Pick another --instance-id or kill it "
+                    f"first (pry kill --instance {instance_id})."
+                )
 
     plugin_parent = _resolve_plugin_path()
 
@@ -1696,10 +1767,17 @@ def _launch(args: argparse.Namespace) -> int:
             f"Log ({log_path}):\n{log_tail}"
         )
 
+    # The bridge plugin owns <pid>.json and writes it once at startup without a
+    # name field; merge the stable name in now that the socket is live so
+    # list_instances()/choose_instance() can resolve `--instance NAME`.
+    if instance_id:
+        _annotate_registry_instance_id(pid, instance_id)
+
     result: dict[str, Any] = {
         "launched": True,
         "pid": pid,
         "gdb_binary": gdb_binary,
+        "instance_id": instance_id,
         "socket_path": str(socket_path),
         "log_path": str(log_path),
     }
@@ -1765,9 +1843,9 @@ def _kill(args: argparse.Namespace) -> int:
             _render_result({"killed": True, "pids": killed}, fmt=args.format, out_path=args.out, stem="kill")
         return 0
 
-    target_pid: int | None = getattr(args, "instance", None)
+    selector = getattr(args, "instance", None)
 
-    if target_pid is None:
+    if selector is None:
         instances = list_instances()
         if not instances:
             raise BridgeError("No running GDB session found to kill.")
@@ -1775,15 +1853,15 @@ def _kill(args: argparse.Namespace) -> int:
             pids = ", ".join(str(i.pid) for i in instances)
             raise BridgeError(
                 f"Multiple bridge instances running (pids: {pids}). "
-                f"Use --instance <pid> to select one, or 'pry kill --all'."
+                f"Use --instance <pid|name> to select one, or 'pry kill --all'."
             )
         target_pid = instances[0].pid
     else:
-        # Validate an explicit --instance so we don't falsely report "Killed"
-        # for a pid that was never a pry instance (os.kill silently no-ops a
-        # dead pid). Matches how every other command resolves --instance.
-        if not any(i.pid == target_pid for i in list_instances()):
-            raise BridgeError(f"No running GDB bridge instance with pid {target_pid}")
+        # Resolve an explicit --instance (pid or unique live name) so we don't
+        # falsely report "Killed" for something that was never a pry instance
+        # (os.kill silently no-ops a dead pid). match_instance raises on an
+        # unknown pid/name or an ambiguous name.
+        target_pid = match_instance(list_instances(), selector).pid
 
     _kill_instance(target_pid)
 
@@ -1801,17 +1879,19 @@ def _logs(args: argparse.Namespace) -> int:
     The inferior's output is written to ~/.cache/pry/instances/<pid>.log; this
     is the only place an agent can see what the debugged program printed.
     """
-    target_pid: int | None = getattr(args, "instance", None)
-    if target_pid is None:
+    selector = getattr(args, "instance", None)
+    if selector is None:
         instances = list_instances()
         if not instances:
             raise BridgeError("No running GDB session found. Launch one with 'pry launch <binary>'.")
         if len(instances) > 1:
             pids = ", ".join(str(i.pid) for i in instances)
             raise BridgeError(
-                f"Multiple bridge instances running (pids: {pids}). Use --instance <pid>."
+                f"Multiple bridge instances running (pids: {pids}). Use --instance <pid|name>."
             )
         target_pid = instances[0].pid
+    else:
+        target_pid = match_instance(list_instances(), selector).pid
 
     log_path = gdb_log_path(target_pid)
     if not log_path.exists():
@@ -2833,8 +2913,9 @@ def build_parser() -> argparse.ArgumentParser:
     # <cmd>` matches the form shown throughout the README/SKILL docs. The
     # subcommand-level --instance is still accepted and wins when both are set.
     parser.add_argument(
-        "--instance", type=int, default=None, metavar="PID", dest="instance_global",
-        help="Target a specific bridge instance by GDB PID (global form)",
+        "--instance", default=None, metavar="PID|NAME", dest="instance_global",
+        help="Target a specific bridge instance by GDB PID or stable "
+             "--instance-id name (global form)",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -2898,6 +2979,12 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument(
         "--symbols", metavar="PATH", default=None,
         help="Load symbol file (e.g. vmlinux) before connecting",
+    )
+    launch.add_argument(
+        "--instance-id", metavar="NAME", default=None, dest="instance_id",
+        help="Assign a stable name to this instance so later commands can pass "
+             "--instance NAME instead of the ephemeral GDB pid (e.g. kern-df2). "
+             "Refused if another live instance already uses the name.",
     )
     launch.set_defaults(handler=_launch)
 
