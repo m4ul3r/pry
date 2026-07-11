@@ -458,8 +458,12 @@ _GDB_IDTR_RE = re.compile(
     r"\bidtr\b[^\n]*?(?:base\s*=\s*)?(0x[0-9a-fA-F]+)",
     re.IGNORECASE,
 )
+# AArch64 exception vector base. QEMU's gdbstub exposes this system register
+# as bare ``VBAR`` in ``info all-registers`` (not ``vbar_el1``); other stubs use
+# the architectural ``VBAR_EL1`` name. Anchor to line start so ``RVBAR``/
+# ``RVBAR_EL1`` (the *reset* vector base register) never matches.
 _GDB_VBAR_RE = re.compile(
-    r"\bvbar_el1\b\s+(0x[0-9a-fA-F]+)",
+    r"(?m)^\s*VBAR(?:_EL1)?\s+(0x[0-9a-fA-F]+)",
     re.IGNORECASE,
 )
 
@@ -3466,11 +3470,14 @@ class GdbBridge:
             f"{detail}. "
             "pwndbg kbase needs host ptrace of QEMU (/proc/$pid/mem) which "
             "fails when kernel.yama.ptrace_scope>=1 and GDB is not QEMU's "
-            "parent; the IDT fallback needs a stopped x86-64 QEMU remote "
-            "with readable guest memory. Fallback: resume the guest and read "
+            "parent; the IDT fallback needs a stopped x86-64 QEMU remote and "
+            "the VBAR fallback a stopped aarch64 remote, both with readable "
+            "guest memory. Proven fallback: use `qmu kbase` (kallsyms `_text`), "
+            "or resume the guest and read the runtime base directly — "
             "`grep 'T _text$' /proc/kallsyms` (after `echo 0 > "
-            "/proc/sys/kernel/kptr_restrict`), then "
-            "`pry load vmlinux --base 0x...`"
+            "/proc/sys/kernel/kptr_restrict`). Then rebase with "
+            "`pry load vmlinux --base 0x...` using that runtime `_text` — it is "
+            "the correct base on both x86-64 and arm64."
         )
 
     @staticmethod
@@ -3643,10 +3650,24 @@ class GdbBridge:
         return {"attempt": attempt, "base": base, "extra": extra}
 
     def _kbase_via_vbar(self) -> dict[str, Any]:
-        """AArch64: VBAR_EL1 points into kernel vectors; align like IDT path."""
+        """AArch64: VBAR_EL1 points into kernel vectors; align like IDT path.
+
+        On a stopped arm64 target VBAR_EL1 holds the address of the ``vectors``
+        exception table, which lives within the first 2 MiB window of ``_text``
+        (a few tens of KiB above it: ``_text`` → head → ``_stext`` → vectors).
+        Rounding the vector base down to the 2 MiB KASLR alignment therefore
+        lands exactly on ``_text`` — matching ``qmu kbase`` / kallsyms ``_text``.
+
+        QEMU's gdbstub does not expose this in ``monitor info registers`` and
+        names the register bare ``VBAR`` (convenience ``$VBAR``) rather than the
+        architectural ``VBAR_EL1``; we read whichever name the stub provides.
+        """
         attempt: dict[str, Any] = {"method": "vbar"}
         vbar: int | None = None
-        for expr in ("$vbar_el1", "vbar_el1", "$VBAR_EL1"):
+        read_error: str | None = None
+        # ``$VBAR`` is what QEMU's aarch64 stub exposes; the ``_EL1`` spellings
+        # cover stubs that ship the architectural sysreg name.
+        for expr in ("$VBAR", "$vbar_el1", "$VBAR_EL1", "$vbar"):
             try:
                 val = gdb.parse_and_eval(expr)
                 n = int(val) & 0xFFFFFFFFFFFFFFFF
@@ -3659,31 +3680,47 @@ class GdbBridge:
             try:
                 out = gdb.execute("info all-registers", to_string=True)
             except Exception as exc:
-                attempt["error"] = f"could not read VBAR_EL1: {exc}"
-                return {"attempt": attempt}
+                # Regs unreadable at this moment (inferior running / no selected
+                # frame). Record it but keep the actionable summary below.
+                read_error = f"could not read registers: {exc}"
+                out = ""
             m = _GDB_VBAR_RE.search(out or "")
             if m:
                 vbar = int(m.group(1), 16)
         if vbar is None:
-            attempt["error"] = "VBAR_EL1 not available (not aarch64 or no target)"
+            if read_error is not None:
+                attempt["error"] = read_error
+            else:
+                attempt["error"] = (
+                    "VBAR/VBAR_EL1 not available (not aarch64, or the guest is "
+                    "not stopped with a selected frame)"
+                )
             return {"attempt": attempt}
 
         attempt["vbar"] = hex(vbar)
-        base = estimate_kbase_from_handler(
-            vbar,
-            align=_KBASE_ALIGN_2M,
-            readable=lambda a: self._memory_readable(a, 1),
-        )
+        # Round-down ONLY. Like the IDT path, a downward readability walk can
+        # only move the estimate *below* the true base (mis-rebasing every
+        # symbol) if any lower 2 MiB page happens to be mapped; the vector base
+        # already sits inside _text's first 2 MiB window, so round-down is exact.
+        base = estimate_kbase_from_handler(vbar, align=_KBASE_ALIGN_2M)
         if not self._memory_readable(base, 1):
-            attempt["error"] = f"estimated base {base:#x} not readable"
+            attempt["error"] = (
+                f"estimated base {base:#x} (from VBAR {vbar:#x}) is not readable "
+                "via remote memory"
+            )
             return {"attempt": attempt}
+        attempt["align"] = hex(_KBASE_ALIGN_2M)
         attempt["ok"] = True
         return {
             "attempt": attempt,
             "base": base,
             "extra": {
                 "handler": hex(vbar),
-                "note": "VBAR_EL1-derived base (2 MiB align + optional walk-down).",
+                "note": (
+                    "VBAR-derived base: arm64 exception vector base "
+                    "(vectors, in _text) rounded down to the 2 MiB KASLR "
+                    "alignment. Matches kallsyms _text."
+                ),
             },
         }
 

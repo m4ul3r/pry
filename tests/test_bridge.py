@@ -1371,6 +1371,177 @@ def test_kbase_all_methods_fail(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# VBAR (AArch64) kbase fallback — pry #46
+# ---------------------------------------------------------------------------
+
+# Ground truth captured live from a Linux 7.0 arm64 guest under QEMU TCG:
+#   VBAR (== `vectors` symbol) = 0xffffb4a677611000
+#   _text (== `qmu kbase`)      = 0xffffb4a677600000  (VBAR rounded down to 2 MiB)
+_VBAR_LIVE = 0xFFFFB4A677611000
+_ARM64_TEXT = 0xFFFFB4A677600000
+# QEMU's aarch64 gdbstub exposes the register bare as ``VBAR`` (not ``vbar_el1``)
+# in ``info all-registers``; ``RVBAR_EL1`` (reset vector base) also appears and
+# must NOT be confused for it.
+_ARM64_ALLREGS = (
+    "x0             0x0                 0\n"
+    "pc             0xffffb4a67a4616fc  0xffffb4a67a4616fc\n"
+    f"VBAR           {hex(_VBAR_LIVE)}  -82847916290048\n"
+    "RVBAR_EL1      0x0                 0\n"
+    "RMR_EL1        0x1                 1\n"
+)
+
+
+def _make_arm64_readable(base):
+    """read_memory that treats the whole kernel VA range as mapped."""
+
+    def _read_memory(addr, length):
+        if addr >= base:
+            return bytes(length)
+        raise OSError(f"Cannot access memory at address {addr:#x}")
+
+    return _read_memory
+
+
+def test_vbar_regex_matches_qemu_bare_name_not_rvbar(monkeypatch):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    rx = bridge_mod._GDB_VBAR_RE
+
+    m = rx.search(_ARM64_ALLREGS)
+    assert m is not None
+    assert int(m.group(1), 16) == _VBAR_LIVE
+    # Architectural sysreg spelling is also accepted.
+    m2 = rx.search("VBAR_EL1       0xffffb4a677611000  0\n")
+    assert m2 is not None and int(m2.group(1), 16) == _VBAR_LIVE
+    # RVBAR_EL1 alone must never match (would give a bogus base of 0).
+    assert rx.search("RVBAR_EL1      0x0                 0\n") is None
+
+
+def test_kbase_falls_back_to_vbar_via_all_registers(monkeypatch):
+    """pwndbg + IDT fail; VBAR is recovered from ``info all-registers``."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return "Unable to locate the kernel base\n"
+        if cmd == "monitor info registers":
+            raise fake_gdb.error("Monitor command failed")
+        if cmd == "info registers idtr":
+            return ""  # no IDTR → IDT path yields nothing
+        if cmd == "info all-registers":
+            return _ARM64_ALLREGS
+        return ""
+
+    fake_gdb.execute = _exec
+    # No register is directly evaluable (forces the regex path for both idt/vbar)
+    fake_gdb.parse_and_eval = lambda expr: (_ for _ in ()).throw(
+        fake_gdb.error("Cannot convert value to long.")
+    )
+    fake_gdb.selected_inferior().read_memory = _make_arm64_readable(_ARM64_TEXT)
+
+    result = bridge._dispatch_op("kbase", {})
+    assert result["base"] == hex(_ARM64_TEXT)
+    assert result["method"] == "vbar"
+    assert result["handler"] == hex(_VBAR_LIVE)
+    assert result["attempts"][-1]["ok"] is True
+    assert result["attempts"][-1]["align"] == hex(bridge_mod._KBASE_ALIGN_2M)
+
+
+def test_kbase_via_vbar_convenience_register(monkeypatch):
+    """QEMU exposes ``$VBAR``; the round-down base must NOT walk below _text."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return "Unable to locate the kernel base\n"
+        if cmd == "monitor info registers":
+            raise fake_gdb.error("Monitor command failed")
+        if cmd == "info registers idtr":
+            return ""
+        return ""
+
+    class _V:
+        def __init__(self, v):
+            self._v = v
+
+        def __int__(self):
+            return self._v
+
+    def _eval(expr):
+        if expr == "$VBAR":
+            return _V(_VBAR_LIVE)
+        raise fake_gdb.error("Cannot convert value to long.")
+
+    fake_gdb.execute = _exec
+    fake_gdb.parse_and_eval = _eval
+    # EVERYTHING below the base is also "readable"; the old walk-down code would
+    # have descended below _text. Round-down-only must land exactly on _text.
+    fake_gdb.selected_inferior().read_memory = lambda addr, length: bytes(length)
+
+    result = bridge._dispatch_op("kbase", {})
+    assert result["base"] == hex(_ARM64_TEXT)
+    assert result["method"] == "vbar"
+
+
+def test_kbase_vbar_unavailable_names_fallbacks(monkeypatch):
+    """When VBAR can't be read, the hard error names the proven fallbacks."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return "Unable to locate the kernel base\n"
+        if cmd == "monitor info registers":
+            raise fake_gdb.error("Monitor command failed")
+        if cmd.startswith("info"):
+            return ""  # no idtr, no VBAR line
+        return ""
+
+    fake_gdb.execute = _exec
+    fake_gdb.parse_and_eval = lambda expr: (_ for _ in ()).throw(
+        fake_gdb.error("Cannot convert value to long.")
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        bridge._dispatch_op("kbase", {})
+    msg = str(excinfo.value)
+    assert "qmu kbase" in msg
+    assert "_text" in msg
+    # arm64 `pry load --base` takes the runtime `_text` after #48, not `_stext`.
+    assert "_stext" not in msg
+
+
+def test_kbase_vbar_reports_unstopped_target(monkeypatch):
+    """If regs are unreadable (guest running), the attempt says so."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return "Unable to locate the kernel base\n"
+        if cmd == "monitor info registers":
+            raise fake_gdb.error("Monitor command failed")
+        if cmd == "info registers idtr":
+            return ""
+        if cmd == "info all-registers":
+            raise fake_gdb.error("The program has no registers now.")
+        return ""
+
+    fake_gdb.execute = _exec
+    fake_gdb.parse_and_eval = lambda expr: (_ for _ in ()).throw(
+        fake_gdb.error("Cannot convert value to long.")
+    )
+
+    with pytest.raises(RuntimeError):
+        bridge._dispatch_op("kbase", {})
+    # Inspect the recorded vbar attempt directly.
+    vbar_attempt = bridge._kbase_via_vbar()["attempt"]
+    assert "could not read registers" in vbar_attempt["error"]
+    assert "no registers now" in vbar_attempt["error"]
+
+
+# ---------------------------------------------------------------------------
 # Feature 1: Lock-free interrupt
 # ---------------------------------------------------------------------------
 
