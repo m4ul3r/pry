@@ -81,11 +81,22 @@ Every command accepts `--format [text|json|ndjson]`, `--out <path>`, and `--inst
 
 | Command | Description |
 |---------|-------------|
-| `pry launch [binary] [-- gdb-args...]` | Spawn headless GDB with bridge |
+| `pry launch [binary] [-- gdb-args...]` | Spawn headless GDB with bridge (`--instance-id NAME`, `--gdb-binary`) |
 | `pry kill` | Terminate GDB session |
+| `pry logs` | Show a session's captured inferior stdout/stderr and GDB output |
 | `pry doctor` | Bridge health check and version info |
 | `pry plugin install` | Install GDB bridge plugin |
 | `pry skill install` | Install bundled agent skills |
+
+### Targets
+
+| Command | Description |
+|---------|-------------|
+| `pry load <path>` | Load a binary into GDB |
+| `pry attach <pid>` | Attach to a running process |
+| `pry connect <host:port>` | Connect to a remote GDB target (QEMU, gdbserver) (`--connect-timeout`) |
+| `pry disconnect` | Disconnect from the remote target |
+| `pry inferior list` | List inferiors |
 
 ### Execution control
 
@@ -101,6 +112,7 @@ All execution commands block until the inferior stops or exits, returning struct
 | `pry nexti` | Instruction-level step over |
 | `pry finish` | Run until function returns (`--timeout`, `--background`) |
 | `pry until <location>` | Run until location (`--timeout`, `--background`) |
+| `pry jump <location>` | Resume execution at a location (GDB `jump`) |
 | `pry interrupt` | Interrupt running inferior (always works, even during background exec) |
 | `pry status` | Show inferior execution state (running/stopped) |
 | `pry wait` | Wait for running inferior to stop (`--timeout`) |
@@ -157,6 +169,10 @@ Uses hardware watchpoints gated by range boundary breakpoints for native-speed t
 | `pry registers` | CPU registers (`--all`) |
 | `pry memory read <addr> <len>` | Read memory (`--display hex\|string\|bytes\|pretty`, `--plain`) |
 | `pry memory write <addr> <hex>` | Write memory |
+| `pry mappings` | List process memory mappings (structured vmmap) |
+| `pry examine <addr>` | Examine memory GDB-style (`x/NFU`) |
+| `pry call <expr>` | Call an inferior function and return its value |
+| `pry display add/list/remove` | Auto-display expressions on each stop |
 
 ### Code & symbols
 
@@ -165,9 +181,11 @@ Uses hardware watchpoints gated by range boundary breakpoints for native-speed t
 | `pry disasm [location]` | Disassemble (`--count N`) |
 | `pry functions` | List functions (`--query`, `--limit`, `--offset`) |
 | `pry symbols` | List symbols (`--query`, `--limit`, `--offset`) |
+| `pry symbols` | List symbols (`--query`, `--limit`, `--offset`) |
 | `pry types show <name>` | Type info (size, fields, declaration) |
 | `pry source list [location]` | Source listing (`--count N`) |
 | `pry info files` | ELF section info |
+| `pry kbase` | Find the kernel virtual text base (KASLR); pwndbg then IDT fallback |
 
 ### Session
 
@@ -181,21 +199,37 @@ Uses hardware watchpoints gated by range boundary breakpoints for native-speed t
 ### Escape hatch
 
 ```bash
+# Run any raw GDB command — works with pwndbg, custom scripts, user-defined commands
+pry gdb 'info proc mappings'
+pry gdb 'vmmap'          # e.g. a pwndbg command, if pwndbg is loaded
+
+# Run arbitrary Python inside GDB
 pry py exec --code 'result["value"] = gdb.parse_and_eval("argc").string()'
 pry py exec --script trace.py --timeout 120
 ```
 
-Runs arbitrary Python inside GDB with the `gdb` module and a `result` dict in scope. Use `--timeout` to prevent long-running scripts from hanging the bridge.
+`pry gdb` forwards a raw command line to GDB, so anything GDB (or a loaded extension like pwndbg) understands is available without a dedicated pry subcommand. `pry py exec` runs arbitrary Python inside GDB with the `gdb` module and a `result` dict in scope. Use `--timeout` to prevent long-running scripts from hanging the bridge.
 
 ## Multiple sessions
 
-pry supports multiple concurrent GDB sessions. Each registers at `~/.cache/pry/instances/<pid>.sock`. With one session, commands auto-connect. With multiple, use `--instance <pid>`:
+pry supports multiple concurrent GDB sessions. Each bridge registers itself under `~/.cache/pry/instances/` (override with `$PRY_CACHE_DIR`) as `<gdb-pid>.json` (metadata), `<pid>.sock`, and `<pid>.log`. Stale registrations are purged automatically as instances are discovered.
+
+With a single session, commands auto-connect. With multiple, target one with `--instance`:
 
 ```bash
 pry launch ./server
 pry launch ./client
-pry --instance 12345 break set handle_request
+pry --instance 12345 break set handle_request   # by GDB pid
 ```
+
+You can also assign a stable name at launch and target it by name — handy when pids change across restarts:
+
+```bash
+pry launch ./server --instance-id web
+pry --instance web break set handle_request      # by name
+```
+
+`--instance` accepts a pid or a name; if a name and a pid are spelled the same, the pid wins.
 
 ## Output spilling
 

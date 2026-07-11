@@ -35,7 +35,7 @@ No live GDB needed: `tests/test_bridge.py` injects a fake `gdb` module into `sys
 
 CLI -> Unix socket -> Bridge inside GDB
 
-`pry launch` spawns headless GDB with the bridge loaded. Each bridge registers itself under `~/.cache/pry/instances/` (override with `PRY_CACHE_DIR`) as `<gdb-pid>.json` (registry metadata), `<pid>.sock`, and `<pid>.log`. `transport.list_instances()` discovers instances by probing the socket, purging stale registrations and orphaned files as it goes. Commands auto-select the only running instance; with multiple, `--instance <pid>` is required.
+`pry launch` spawns headless GDB with the bridge loaded. Each bridge registers itself under `~/.cache/pry/instances/` (override with `PRY_CACHE_DIR`) as `<gdb-pid>.json` (registry metadata), `<pid>.sock`, and `<pid>.log`. `transport.list_instances()` discovers instances by probing the socket, purging stale registrations and orphaned files as it goes. Commands auto-select the only running instance; with multiple, `--instance <pid-or-name>` is required (a name is assigned at launch with `--instance-id`; a pid wins over a same-spelled name).
 
 The CLI is stateless: every command opens a fresh socket connection, sends one request, and reads to EOF.
 

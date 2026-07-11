@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Agent-friendly GDB CLI with an in-process bridge"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "tiktoken>=0.12.0",
 ]
