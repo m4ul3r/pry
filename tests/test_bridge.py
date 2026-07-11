@@ -1956,7 +1956,218 @@ def test_load_with_base_errors_when_text_unreadable(monkeypatch, tmp_path):
         {"op": "load", "params": {"path": str(notelf), "base": "0xffffffff88000000"}}
     )
     assert resp["ok"] is False
+    # Precise, actionable message: names --slide AND the non-KASLR recipe.
     assert "--slide" in resp["error"]
+    assert "--slide 0" in resp["error"]
+
+
+# --- cross-arch load --base slide math (issues #45 arm64, #47 arm32) ----------
+
+def _write_elf_with_symbols(
+    path: Path,
+    *,
+    is64: bool,
+    endian: str,
+    text_section_vaddr: int,
+    symbols: dict[str, int],
+) -> None:
+    """Write a valid ELF32/64 with a ``.text`` section plus a ``.symtab``.
+
+    ``text_section_vaddr`` is the ``.text`` *section* base (== ``_stext`` on
+    arm). ``symbols`` maps names (e.g. ``_text``/``_stext``) to link-time values;
+    a null symbol is prepended automatically.
+    """
+    e = "<" if endian == "little" else ">"
+    ehsize = 64 if is64 else 52
+    shentsize = 64 if is64 else 40
+    symentsize = 24 if is64 else 16
+
+    shstrtab = b"\x00.text\x00.symtab\x00.strtab\x00.shstrtab\x00"
+    n_text = shstrtab.index(b".text\x00")
+    n_symtab = shstrtab.index(b".symtab\x00")
+    n_strtab = shstrtab.index(b".strtab\x00")
+    n_shstrtab = shstrtab.index(b".shstrtab\x00")
+
+    # Symbol string table + entries (index 0 is the reserved null symbol).
+    strtab = bytearray(b"\x00")
+    name_offs: dict[str, int] = {}
+    for name in symbols:
+        name_offs[name] = len(strtab)
+        strtab += name.encode() + b"\x00"
+
+    def sym(name_off: int, value: int) -> bytes:
+        b = bytearray(symentsize)
+        struct.pack_into(e + "I", b, 0, name_off)  # st_name
+        if is64:
+            struct.pack_into(e + "Q", b, 8, value)  # st_value
+        else:
+            struct.pack_into(e + "I", b, 4, value)  # st_value
+        return bytes(b)
+
+    symdata = sym(0, 0)  # null symbol
+    for name, value in symbols.items():
+        symdata += sym(name_offs[name], value)
+
+    # File layout: ehdr, then section data blobs, then the section header table.
+    off = ehsize
+    symtab_off = off; off += len(symdata)
+    strtab_off = off; off += len(strtab)
+    shstrtab_off = off; off += len(bytes(shstrtab))
+    shoff = off
+
+    ehdr = bytearray(ehsize)
+    ehdr[0:4] = b"\x7fELF"
+    ehdr[4] = 2 if is64 else 1
+    ehdr[5] = 1 if endian == "little" else 2
+    ehdr[6] = 1
+    struct.pack_into(e + "H", ehdr, 16, 2)  # e_type ET_EXEC
+    struct.pack_into(e + "H", ehdr, 18, 0xB7 if is64 else 0x28)  # aarch64 / arm
+    struct.pack_into(e + "I", ehdr, 20, 1)  # e_version
+    if is64:
+        struct.pack_into(e + "Q", ehdr, 0x28, shoff)
+        struct.pack_into(e + "H", ehdr, 0x34, ehsize)
+        struct.pack_into(e + "H", ehdr, 0x3A, shentsize)
+        struct.pack_into(e + "H", ehdr, 0x3C, 5)  # e_shnum
+        struct.pack_into(e + "H", ehdr, 0x3E, 4)  # e_shstrndx
+    else:
+        struct.pack_into(e + "I", ehdr, 0x20, shoff)
+        struct.pack_into(e + "H", ehdr, 0x28, ehsize)
+        struct.pack_into(e + "H", ehdr, 0x2E, shentsize)
+        struct.pack_into(e + "H", ehdr, 0x30, 5)  # e_shnum
+        struct.pack_into(e + "H", ehdr, 0x32, 4)  # e_shstrndx
+
+    def shdr(name, sh_type, addr=0, off_=0, size=0, link=0, entsize=0) -> bytes:
+        b = bytearray(shentsize)
+        struct.pack_into(e + "I", b, 0, name)
+        struct.pack_into(e + "I", b, 4, sh_type)
+        if is64:
+            struct.pack_into(e + "Q", b, 0x10, addr)
+            struct.pack_into(e + "Q", b, 0x18, off_)
+            struct.pack_into(e + "Q", b, 0x20, size)
+            struct.pack_into(e + "I", b, 0x28, link)
+            struct.pack_into(e + "Q", b, 0x38, entsize)
+        else:
+            struct.pack_into(e + "I", b, 0x0C, addr)
+            struct.pack_into(e + "I", b, 0x10, off_)
+            struct.pack_into(e + "I", b, 0x14, size)
+            struct.pack_into(e + "I", b, 0x18, link)
+            struct.pack_into(e + "I", b, 0x24, entsize)
+        return bytes(b)
+
+    sections = (
+        shdr(0, 0)                                                      # [0] null
+        + shdr(n_text, 1, addr=text_section_vaddr)                      # [1] .text
+        + shdr(n_symtab, 2, off_=symtab_off, size=len(symdata),
+               link=3, entsize=symentsize)                             # [2] .symtab
+        + shdr(n_strtab, 3, off_=strtab_off, size=len(strtab))         # [3] .strtab
+        + shdr(n_shstrtab, 3, off_=shstrtab_off, size=len(shstrtab))   # [4] .shstrtab
+    )
+    path.write_bytes(bytes(ehdr) + symdata + bytes(strtab) + bytes(shstrtab) + sections)
+
+
+def test_elf_symbol_vaddrs_reads_text_and_stext(monkeypatch, tmp_path):
+    """The ELF32/64 symbol reader recovers _text/_stext link-time values."""
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    elf64 = tmp_path / "vmlinux64"
+    _write_elf_with_symbols(
+        elf64, is64=True, endian="little",
+        text_section_vaddr=0xFFFF800080010000,
+        symbols={"_text": 0xFFFF800080000000, "_stext": 0xFFFF800080010000},
+    )
+    syms = bridge_mod._elf_symbol_vaddrs(str(elf64), ("_text", "_stext"))
+    assert syms == {"_text": 0xFFFF800080000000, "_stext": 0xFFFF800080010000}
+
+    elf32 = tmp_path / "vmlinux32"
+    _write_elf_with_symbols(
+        elf32, is64=False, endian="little",
+        text_section_vaddr=0xC0300000,
+        symbols={"_text": 0xC0208000, "_stext": 0xC0300000},
+    )
+    syms32 = bridge_mod._elf_symbol_vaddrs(str(elf32), ("_text", "_stext"))
+    assert syms32 == {"_text": 0xC0208000, "_stext": 0xC0300000}
+
+
+def test_elf_reloc_reference_prefers_text_symbol(monkeypatch, tmp_path):
+    """Reference keys to _text (not the .text/_stext section base) when present."""
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    elf = tmp_path / "vmlinux"
+    _write_elf_with_symbols(
+        elf, is64=True, endian="little",
+        text_section_vaddr=0xFFFF800080010000,  # .text base == _stext
+        symbols={"_text": 0xFFFF800080000000, "_stext": 0xFFFF800080010000},
+    )
+    assert bridge_mod._elf_reloc_reference(str(elf)) == (0xFFFF800080000000, "_text")
+
+
+def test_elf_reloc_reference_falls_back_to_section(monkeypatch, tmp_path):
+    """With no symbol table, reference falls back to the .text section (x86-style)."""
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    elf = tmp_path / "vmlinux"
+    _write_minimal_elf64(elf, 0xFFFFFFFF81000000)  # no .symtab
+    assert bridge_mod._elf_reloc_reference(str(elf)) == (0xFFFFFFFF81000000, ".text")
+
+
+def test_load_base_arm64_lands_on_text_not_stext(monkeypatch, tmp_path):
+    """#45: a --base at the runtime _text yields correct per-symbol addresses.
+
+    arm64 _text and _stext differ by 0x10000 (.head.text before .text). Keying
+    the slide to _text (not the .text section base == _stext) must reproduce the
+    issue's *correct* runtime address, not the 0x10000-low one.
+    """
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    link_text = 0xFFFF800080000000
+    link_stext = 0xFFFF800080010000
+    link_newuname = 0xFFFF8000801ADF98
+    runtime_text = 0xFFFFD5F6B5E00000  # what qmu kbase / kallsyms _text reports
+
+    elf = tmp_path / "vmlinux"
+    _write_elf_with_symbols(
+        elf, is64=True, endian="little",
+        text_section_vaddr=link_stext,
+        symbols={"_text": link_text, "_stext": link_stext},
+    )
+
+    result = bridge._dispatch_op("load", {"path": str(elf), "base": hex(runtime_text)})
+
+    correct_slide = runtime_text - link_text
+    wrong_stext_slide = runtime_text - link_stext
+    assert result["slide"] == hex(correct_slide)
+    assert result["slide"] != hex(wrong_stext_slide)
+    assert result["reference"] == "_text"
+    assert any(
+        c == f"add-symbol-file {elf} -o {hex(correct_slide)}"
+        for c in fake_gdb._execute_log
+    )
+    # Per-symbol runtime address matches the issue's documented correct value.
+    assert link_newuname + correct_slide == 0xFFFFD5F6B5FADF98
+
+
+def test_load_base_arm32_reads_elf32_no_valueerror(monkeypatch, tmp_path):
+    """#47: --base on a 32-bit ARM vmlinux no longer hard-fails on .text read.
+
+    multi_v7 has no KASLR slide (link == runtime), so --base at the _text value
+    yields slide 0 instead of the old bare ValueError.
+    """
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+
+    elf = tmp_path / "vmlinux"
+    _write_elf_with_symbols(
+        elf, is64=False, endian="little",
+        text_section_vaddr=0xC0300000,  # .text base == _stext
+        symbols={"_text": 0xC0208000, "_stext": 0xC0300000},
+    )
+
+    resp = bridge.dispatch(
+        {"op": "load", "params": {"path": str(elf), "base": "0xc0208000"}}
+    )
+    assert resp["ok"] is True
+    result = resp["result"]
+    assert result["slide"] == hex(0)
+    assert result["reference"] == "_text"
+    assert any(c == f"add-symbol-file {elf} -o 0x0" for c in fake_gdb._execute_log)
 
 
 def test_parse_disassemble_output(monkeypatch):
