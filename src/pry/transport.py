@@ -32,6 +32,10 @@ class BridgeInstance:
     plugin_version: str
     started_at: str | None
     meta: dict[str, Any]
+    # Optional stable name assigned at launch (`pry launch --instance-id NAME`);
+    # lets agents resolve `--instance` by a durable label instead of the
+    # ephemeral GDB pid. None for instances launched without a name.
+    instance_id: str | None = None
 
 
 def _purge_stale_registry(registry_path: Path) -> None:
@@ -65,6 +69,9 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         _purge_stale_registry(path)
         return None
 
+    raw_name = payload.get("instance_id")
+    instance_id = str(raw_name) if raw_name not in (None, "") else None
+
     return BridgeInstance(
         pid=pid,
         socket_path=socket_path,
@@ -73,6 +80,7 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         plugin_version=str(payload.get("plugin_version", "0")),
         started_at=payload.get("started_at"),
         meta=payload,
+        instance_id=instance_id,
     )
 
 
@@ -139,15 +147,54 @@ def list_instances() -> list[BridgeInstance]:
     return instances
 
 
-def choose_instance(pid: int | None = None) -> BridgeInstance:
+def match_instance(instances: list[BridgeInstance], selector: int | str) -> BridgeInstance:
+    """Resolve a `--instance` selector against a known list of live instances.
+
+    Resolution order (per issue #36): an exact GDB pid wins, otherwise a unique
+    live ``instance_id`` (name). A name shared by more than one live instance is
+    refused as ambiguous rather than picked arbitrarily. Raises ``BridgeError``
+    when nothing matches. This is pure — callers supply the instances list — so
+    the same logic backs both ``choose_instance`` (transport) and the CLI
+    handlers that resolve ``--instance`` before they have a pid.
+    """
+    sel = str(selector).strip()
+    numeric = sel.isdigit()
+
+    # 1) exact pid match — a pid always wins over a same-spelled name.
+    if numeric:
+        want = int(sel)
+        for inst in instances:
+            if inst.pid == want:
+                return inst
+
+    # 2) unique live name match.
+    named = [inst for inst in instances if inst.instance_id == sel]
+    if len(named) == 1:
+        return named[0]
+    if len(named) > 1:
+        pids = ", ".join(str(i.pid) for i in named)
+        raise BridgeError(
+            f"Multiple live instances named {sel!r} (pids: {pids}); "
+            f"use --instance <pid> to select one."
+        )
+
+    if numeric:
+        raise BridgeError(f"No running GDB bridge instance with pid {sel}")
+    raise BridgeError(f"No running GDB bridge instance named {sel!r}")
+
+
+def choose_instance(pid: int | str | None = None) -> BridgeInstance:
+    """Pick the target instance for a request.
+
+    ``pid`` is a ``--instance`` selector: a GDB pid or a unique live name (see
+    :func:`match_instance`). The parameter keeps the name ``pid`` for backward
+    compatibility with callers that pass ``pid=`` by keyword.
+    """
     instances = list_instances()
     if not instances:
         raise BridgeError("No running GDB bridge instances found")
     if pid is not None:
-        for inst in instances:
-            if inst.pid == pid:
-                return inst
-        raise BridgeError(f"No running GDB bridge instance with pid {pid}")
+        return match_instance(instances, pid)
     if len(instances) > 1:
         pids = ", ".join(str(i.pid) for i in instances)
         raise BridgeError(
