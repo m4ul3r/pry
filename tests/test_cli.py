@@ -913,6 +913,161 @@ def test_launch_binary_is_directory_errors(monkeypatch, capsys, tmp_path):
     assert "not a file" in capsys.readouterr().err.lower()
 
 
+# --- gdb-multiarch binary selection (issue #44) --------------------------------
+
+
+def test_resolve_gdb_prefers_multiarch(monkeypatch):
+    present = {"gdb-multiarch", "gdb"}
+    monkeypatch.setattr(
+        pry.cli.shutil, "which",
+        lambda c: f"/usr/bin/{c}" if c in present else None,
+    )
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    assert pry.cli._resolve_gdb_binary(None) == "gdb-multiarch"
+
+
+def test_resolve_gdb_falls_back_to_gdb(monkeypatch):
+    monkeypatch.setattr(
+        pry.cli.shutil, "which",
+        lambda c: "/usr/bin/gdb" if c == "gdb" else None,
+    )
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    assert pry.cli._resolve_gdb_binary(None) == "gdb"
+
+
+def test_resolve_gdb_none_available_errors(monkeypatch):
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda c: None)
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    with pytest.raises(pry.cli.BridgeError) as excinfo:
+        pry.cli._resolve_gdb_binary(None)
+    assert "gdb not found" in str(excinfo.value).lower()
+
+
+def test_resolve_gdb_explicit_bare_name_wins(monkeypatch):
+    # An explicit bare name is resolved on PATH and beats the multiarch default.
+    monkeypatch.setattr(
+        pry.cli.shutil, "which",
+        lambda c: f"/opt/{c}" if c == "my-gdb" else (
+            "/usr/bin/gdb-multiarch" if c == "gdb-multiarch" else None
+        ),
+    )
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    assert pry.cli._resolve_gdb_binary("my-gdb") == "/opt/my-gdb"
+
+
+def test_resolve_gdb_explicit_missing_bare_name_errors(monkeypatch):
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda c: None)
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    with pytest.raises(pry.cli.BridgeError) as excinfo:
+        pry.cli._resolve_gdb_binary("no-such-gdb")
+    assert "no-such-gdb" in str(excinfo.value)
+
+
+def test_resolve_gdb_env_override(monkeypatch):
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda c: f"/usr/bin/{c}")
+    monkeypatch.setenv("PRY_GDB", "gdb-multiarch")
+    assert pry.cli._resolve_gdb_binary(None) == "/usr/bin/gdb-multiarch"
+
+
+def test_resolve_gdb_explicit_flag_overrides_env(monkeypatch):
+    # --gdb-binary (explicit arg) wins over the PRY_GDB env var.
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda c: f"/usr/bin/{c}")
+    monkeypatch.setenv("PRY_GDB", "gdb-multiarch")
+    assert pry.cli._resolve_gdb_binary("special-gdb") == "/usr/bin/special-gdb"
+
+
+def test_resolve_gdb_explicit_path(monkeypatch, tmp_path):
+    fake = tmp_path / "gdb-multiarch"
+    fake.write_text("")
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda c: None)
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    assert pry.cli._resolve_gdb_binary(str(fake)) == str(fake)
+
+
+def test_resolve_gdb_explicit_missing_path_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda c: None)
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    with pytest.raises(pry.cli.BridgeError):
+        pry.cli._resolve_gdb_binary(str(tmp_path / "nope" / "gdb"))
+
+
+def test_launch_gdb_cmd_uses_multiarch(monkeypatch):
+    # End-to-end: the spawned GDB argv[0] is gdb-multiarch when it is on PATH.
+    present = {"gdb-multiarch", "gdb"}
+    monkeypatch.setattr(
+        pry.cli.shutil, "which",
+        lambda c: f"/usr/bin/{c}" if c in present else None,
+    )
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+
+    captured = {}
+
+    def _capture(cmd, *a, **k):
+        captured["cmd"] = cmd
+        raise RuntimeError("stop before real spawn")
+
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _capture)
+
+    rc = pry.cli.main(["launch"])
+    assert rc == 1
+    assert captured["cmd"][0] == "gdb-multiarch"
+
+
+def test_launch_gdb_binary_flag_reaches_spawn(monkeypatch):
+    present = {"gdb-multiarch", "gdb", "my-gdb"}
+    monkeypatch.setattr(
+        pry.cli.shutil, "which",
+        lambda c: f"/usr/bin/{c}" if c in present else None,
+    )
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+
+    captured = {}
+
+    def _capture(cmd, *a, **k):
+        captured["cmd"] = cmd
+        raise RuntimeError("stop before real spawn")
+
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _capture)
+
+    rc = pry.cli.main(["launch", "--gdb-binary", "my-gdb"])
+    assert rc == 1
+    assert captured["cmd"][0] == "/usr/bin/my-gdb"
+
+
+def test_launch_gdb_not_found_still_errors(monkeypatch, capsys):
+    # Preserves the original "gdb not found" failure when nothing is on PATH.
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda c: None)
+    monkeypatch.delenv("PRY_GDB", raising=False)
+    rc = pry.cli.main(["launch"])
+    assert rc == 1
+    assert "gdb not found" in capsys.readouterr().err.lower()
+
+
+def test_multiarch_hint_on_truncated_packet():
+    result = {
+        "post_launch_error": (
+            "connect failed: Truncated register 37 in remote 'g' packet"
+        )
+    }
+    hint = pry.cli._multiarch_gdb_hint(result, "gdb")
+    assert hint is not None
+    assert "gdb-multiarch" in hint
+
+
+def test_multiarch_hint_absent_without_symptom():
+    result = {"post_launch_error": "Connection refused"}
+    assert pry.cli._multiarch_gdb_hint(result, "gdb") is None
+
+
+def test_multiarch_hint_when_already_multiarch():
+    result = {"post_launch_error": "Truncated register 37 in remote 'g' packet"}
+    hint = pry.cli._multiarch_gdb_hint(result, "/usr/bin/gdb-multiarch")
+    assert hint is not None
+    assert "architecture" in hint.lower()
+
+
 def test_kill_no_session(monkeypatch, capsys):
     monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
 

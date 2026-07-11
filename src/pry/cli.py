@@ -1493,6 +1493,8 @@ def _read_log_tail(log_path: Path, max_chars: int = 500) -> str:
 
 def _render_launch_text(result: dict[str, Any]) -> str:
     lines = [f"GDB launched (pid={result['pid']})"]
+    if result.get("gdb_binary"):
+        lines.append(f"gdb: {result['gdb_binary']}")
     if result.get("binary"):
         lines.append(f"binary: {result['binary']}")
     if result.get("symbols"):
@@ -1505,18 +1507,76 @@ def _render_launch_text(result: dict[str, Any]) -> str:
     lines.append(f"log: {result['log_path']}")
     if result.get("post_launch_error"):
         lines.append(f"error: {result['post_launch_error']}")
+    if result.get("hint"):
+        lines.append(f"hint: {result['hint']}")
     return "\n".join(lines)
+
+
+def _resolve_gdb_binary(explicit: str | None) -> str:
+    """Pick the GDB executable for `pry launch`.
+
+    Precedence: explicit `--gdb-binary` > `PRY_GDB` env > `gdb-multiarch` on
+    PATH > `gdb` on PATH. `gdb-multiarch` is preferred whenever present because
+    it also debugs native x86 targets, and it is *required* for aarch64/arm
+    remote targets — stock `gdb` fails a non-native remote 'g' packet with
+    "Truncated register N in remote 'g' packet". An explicit override may be a
+    bare name (resolved on PATH) or a path to the executable.
+    """
+    for candidate in (explicit, os.environ.get("PRY_GDB")):
+        if not candidate:
+            continue
+        sep_in = os.sep in candidate or bool(os.altsep and os.altsep in candidate)
+        if sep_in:
+            path = Path(candidate).expanduser()
+            if path.is_file():
+                return str(path)
+            raise BridgeError(
+                f"GDB binary not found: {candidate} (resolved to {path})."
+            )
+        resolved = shutil.which(candidate)
+        if resolved is None:
+            raise BridgeError(f"GDB binary not found on PATH: {candidate}")
+        return resolved
+    for name in ("gdb-multiarch", "gdb"):
+        if shutil.which(name) is not None:
+            return name
+    raise BridgeError(
+        "gdb not found in PATH. Please install GDB (use 'gdb-multiarch' for "
+        "aarch64/arm remote targets)."
+    )
+
+
+def _multiarch_gdb_hint(result: dict[str, Any], gdb_binary: str) -> str | None:
+    """Return a one-line multiarch hint iff the truncated 'g' packet symptom is
+    present in the post-launch output. Never fabricate: only fires on the actual
+    symptom string GDB emits when an x86-only build meets a non-x86 target."""
+    blob = " ".join(
+        str(result.get(key) or "")
+        for key in ("post_launch_error", "target_status")
+    ).lower()
+    if "truncated register" not in blob and "remote 'g' packet" not in blob:
+        return None
+    if Path(gdb_binary).name == "gdb-multiarch":
+        return (
+            "remote 'g' packet was truncated even with gdb-multiarch — check "
+            "that the target architecture matches the guest (`set architecture`)."
+        )
+    return (
+        "a truncated remote 'g' packet usually means an x86-only GDB is "
+        "debugging a non-x86 (aarch64/arm) target. Install 'gdb-multiarch' and "
+        "re-run, or pin it with `--gdb-binary /path/to/gdb-multiarch` (or the "
+        "PRY_GDB env var)."
+    )
 
 
 def _launch(args: argparse.Namespace) -> int:
     from .paths import instances_dir as _instances_dir
 
-    if shutil.which("gdb") is None:
-        raise BridgeError("gdb not found in PATH. Please install GDB.")
+    gdb_binary = _resolve_gdb_binary(getattr(args, "gdb_binary", None))
 
     plugin_parent = _resolve_plugin_path()
 
-    gdb_cmd: list[str] = ["gdb", "-q"]
+    gdb_cmd: list[str] = [gdb_binary, "-q"]
     resolved_binary: str | None = None
     if args.binary:
         binary_path = Path(args.binary).expanduser().resolve()
@@ -1639,6 +1699,7 @@ def _launch(args: argparse.Namespace) -> int:
     result: dict[str, Any] = {
         "launched": True,
         "pid": pid,
+        "gdb_binary": gdb_binary,
         "socket_path": str(socket_path),
         "log_path": str(log_path),
     }
@@ -1674,6 +1735,10 @@ def _launch(args: argparse.Namespace) -> int:
                 result["target_status"] = connect_result.get("status")
     except BridgeError as exc:
         result["post_launch_error"] = str(exc)
+
+    hint = _multiarch_gdb_hint(result, gdb_binary)
+    if hint:
+        result["hint"] = hint
 
     if args.format == "text":
         _render_result(
@@ -2800,7 +2865,17 @@ def build_parser() -> argparse.ArgumentParser:
     skill_install_cmd.set_defaults(handler=_skill_install)
 
     # --- launch ---
-    launch = subparsers.add_parser("launch", help="Launch GDB headlessly with the bridge")
+    launch = subparsers.add_parser(
+        "launch",
+        help="Launch GDB headlessly with the bridge",
+        description=(
+            "Launch a headless GDB + bridge. The GDB binary is chosen as: "
+            "--gdb-binary > PRY_GDB env > gdb-multiarch (if on PATH) > gdb. "
+            "aarch64/arm remote targets (e.g. a QEMU gdbstub) REQUIRE a "
+            "multiarch GDB; stock x86-only gdb fails with "
+            "\"Truncated register N in remote 'g' packet\"."
+        ),
+    )
     _common_io_options(launch)
     launch.add_argument("binary", nargs="?", default=None, help="Path to binary to load")
     launch.add_argument("gdb_args", nargs=argparse.REMAINDER, help="Additional GDB arguments (after --)")
@@ -2810,7 +2885,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch.add_argument(
         "--connect", metavar="HOST:PORT", default=None,
-        help="Connect to a remote target after launch (e.g. localhost:1234)",
+        help="Connect to a remote target after launch (e.g. localhost:1234). "
+             "aarch64/arm remotes require a multiarch GDB (see --gdb-binary).",
+    )
+    launch.add_argument(
+        "--gdb-binary", metavar="PATH", default=None,
+        help="GDB executable to use (bare name resolved on PATH, or a path). "
+             "Overrides the PRY_GDB env var. Default: prefer 'gdb-multiarch' "
+             "if on PATH, else 'gdb'. Required to be multiarch for aarch64/arm "
+             "remote targets.",
     )
     launch.add_argument(
         "--symbols", metavar="PATH", default=None,
