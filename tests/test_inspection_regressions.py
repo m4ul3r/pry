@@ -111,7 +111,7 @@ def test_qualified_function_disassembly_stops_before_neighbor(monkeypatch, name)
     monkeypatch.setattr(gdb, "execute", disassemble)
     bridge = bridge_mod.GdbBridge()
     whole = bridge._dispatch_op("disasm", {"location": name})
-    assert [row["address"] for row in whole] == ["0x401000", "0x401004"]
+    assert [int(row["address"], 16) for row in whole] == [0x401000, 0x401004]
     assert whole[-1]["asm"] == "ret"
     counted = bridge._dispatch_op("disasm", {"location": name, "count": 3})
-    assert [row["address"] for row in counted] == ["0x401000", "0x401004", "0x401008"]
+    assert [int(row["address"], 16) for row in counted] == [0x401000, 0x401004, 0x401008]

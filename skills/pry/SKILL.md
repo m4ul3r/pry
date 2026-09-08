@@ -186,6 +186,8 @@ Execution commands block until the inferior stops or exits. Use `--timeout N` to
 
 `pry status` reports `running`, `stopped`, `exited`, or `not-started`; `state` and `status` agree. `wait` returns the same terminal state rather than calling an exited inferior stopped. Once GDB reports a remote transport loss, execution, status/wait, and inspection return an operational error until reconnect/attach succeeds. A normal exit or confirmed signal termination remains a successful debugger operation. GDB may retain cached frames before it observes the loss; cached data alone cannot establish remote liveness.
 
+Loading or clearing an executable discards prior exit codes and retained background results. Failed loads preserve the existing context. Intentional detach/disconnect leaves `state`/`status: "not-started"` with a `detached`/`disconnected` reason, not a fabricated process exit; the detached process may still be alive. This also applies to raw GDB lifecycle commands.
+
 ### Seeing the program's output
 
 The inferior's **stdout/stderr does not come back in command results** — it (plus GDB's own output) is captured to a per-session log. Use `pry logs` to read it; this is how you confirm what the program printed (e.g. to check a function actually ran):
@@ -285,15 +287,15 @@ pry trace --watch 0x7fffffffd5d4 --range 0x404610-0x405e30
 pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type access --timeout 60 --max-hits 1000
 ```
 
-The bridge single-steps instructions inside `[START, END)` with a hardware watchpoint enabled, and continues outside with that watchpoint disabled. It remembers return-to-caller locations so out-of-range calls do not hide subsequent in-range accesses. Hits accumulate across repeated passes, and execution stops on the `--max-hits`th access rather than one access later.
+The bridge single-steps instructions inside `[START, END)` with a hardware watchpoint enabled, and continues outside with that watchpoint disabled. It installs **persistent entry breakpoints at every decoded instruction**, so arbitrary branches into the middle and concurrent callers returning to the same address remain covered. Hits accumulate across repeated passes, and execution stops on the `--max-hits`th access rather than one access later.
 
-This is **instruction-stepped, not native-speed tracing**. Use tight ranges. Each step temporarily isolates the source thread through GDB's scheduler locking, which can change multithreaded timing. The target must support the requested hardware watchpoint and scheduler-locking operations.
+This is **instruction-stepped, not native-speed tracing**. Setup time and breakpoint storage scale with the number of decoded instructions; use tight ranges. Each step temporarily isolates the source thread through GDB's scheduler locking, which can change multithreaded timing. The target must support the requested hardware watchpoint, software entry breakpoints, and scheduler-locking operations.
 
 Each hit's `pc`/`asm` identifies the isolated accessing instruction; `stop_pc`/`stop_asm` separately records where GDB stopped. They need not be the same, and a hardware watchpoint can trap before instruction completion on some targets. `attribution: "instruction-step"` describes the method. An unidentifiable access stops tracing with an explicit incomplete `note` and `last_unattributed`, not a guessed instruction.
 
-**Pick `START` on an instruction boundary and the execution path**, or start with the inferior already stopped inside the range. `armed: false` means the range was never entered through a tracked entry, not proof of no accesses. `armed: true` with zero hits and no incomplete note means no watched hits were observed in the range.
+**Pick `START` on a valid instruction boundary in stable code.** Execution may enter at any decoded instruction in the range; it need not visit `START`. The range selects instruction start PCs, so the final instruction may extend past `END`. Decode/setup failures and observed PCs inconsistent with decoded boundaries are explicit errors. `armed: false` means no in-range instruction was stepped, not proof of no accesses elsewhere. `armed: true` with zero hits and no incomplete note means no watched hits were observed in the range.
 
-If `--timeout` fires first, the bridge interrupts and returns partial hits with `timeout_interrupt: true`. Internal breakpoints are removed before the response, and the prior scheduler setting is preserved, including after normal exit.
+If `--timeout` fires first, the bridge interrupts and returns partial hits with `timeout_interrupt: true`. `pry interrupt` cancels an active trace even between its internal steps, waits for internal-breakpoint cleanup, and marks the trace result `interrupted: true`. The prior scheduler setting is preserved, including after normal exit. Remote loss returns an operational error rather than a successful `exited` trace; confirmed normal and signal exits retain their terminal details.
 
 Options:
 - `--watch ADDR` — memory address to watch (required)

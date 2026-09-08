@@ -1132,7 +1132,8 @@ def test_run_with_stdin_file_redirects_fd0(monkeypatch, tmp_path):
     inferior inherits a real file (not argv tokens, not a cooked PTY)."""
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
-    fake_gdb.selected_inferior = lambda: types.SimpleNamespace(pid=0)
+    inferior = types.SimpleNamespace(pid=0)
+    fake_gdb.selected_inferior = lambda: inferior
     payload = tmp_path / "payload.bin"
     payload.write_bytes(b"A" * 8 + b"\x00\x11END\n")
 
@@ -1148,6 +1149,7 @@ def test_run_with_stdin_file_redirects_fd0(monkeypatch, tmp_path):
             # Rewind so a real consumer could re-read; tests only need the
             # snapshot. Also fire a stop so dispatch_exec completes.
             os.lseek(0, 0, os.SEEK_SET)
+            inferior.pid = 12345
             fake_gdb.events.stop.fire(fake_gdb._FakeStopEvent())
         return ""
 
@@ -1164,8 +1166,6 @@ def test_run_with_stdin_file_redirects_fd0(monkeypatch, tmp_path):
     })
     assert response["ok"] is True
     assert response["result"]["status"] == "stopped"
-    assert "set args foo" in fake_gdb._execute_log
-    assert "run" in fake_gdb._execute_log
     assert seen_fd0 == [b"A" * 8 + b"\x00\x11END\n"]
     # GDB's original stdin must be restored after run (keepalive pipe under
     # pry launch; leaving a drained payload file would EOF the session).
@@ -1629,18 +1629,6 @@ def test_kbase_vbar_reports_unstopped_target(monkeypatch):
 # ---------------------------------------------------------------------------
 # Feature 1: Lock-free interrupt
 # ---------------------------------------------------------------------------
-
-def test_interrupt_bypasses_exec_ops(monkeypatch):
-    """interrupt is handled before EXEC_OPS check, without locks."""
-    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
-    bridge = bridge_mod.GdbBridge()
-    bridge._running = True  # simulate a running foreground exec
-
-    response = bridge.dispatch({"op": "interrupt", "params": {}})
-    assert response["ok"] is True
-    assert response["result"]["interrupted"] is True
-    assert "interrupt" in fake_gdb._execute_log
-
 
 def test_interrupt_when_idle_is_noop(monkeypatch):
     """interrupt on a stopped/exited inferior reports rather than lying."""

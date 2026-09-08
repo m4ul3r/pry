@@ -3470,10 +3470,10 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Number of bytes to watch (default: 4)")
     trace_cmd.add_argument("--range", required=True, metavar="START-END",
                            help="Code range that gates recording (e.g., 0x404610-0x405e30): "
-                                "the watch is active only while the PC is in [START, END). START "
-                                "must lie on the execution path (e.g. inside the loop body) — or "
-                                "the inferior must already be stopped inside the range — or nothing "
-                                "is recorded (the result reports armed=false)")
+                                "instruction start PCs must be in [START, END). START must be an "
+                                "instruction boundary in stable code. Persistent entry breakpoints "
+                                "cover every decoded instruction, including arbitrary branch re-entry. "
+                                "Setup/storage scale with instruction count; prefer tight ranges")
     trace_cmd.add_argument("--type", choices=("write", "read", "access"), default="access",
                            dest="watch_type", help="Watch type (default: access)")
     trace_cmd.add_argument("--max-hits", type=_positive_int, default=10000, metavar="N",

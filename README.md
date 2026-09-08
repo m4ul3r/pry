@@ -106,6 +106,8 @@ All execution commands block until the inferior stops or exits, returning struct
 
 `pry run` preserves literal argv, including empty and whitespace-containing arguments, by temporarily using a safely quoted `/bin/sh` launch. It restores the debugger's launch settings afterward; `--stdin-file` still delivers raw bytes without shell redirection.
 
+Loading or clearing the executable resets prior exit/background history. Intentional detach/disconnect reports `not-started` with a `detached`/`disconnected` reason; it does not claim that the target process exited.
+
 | Command | Description |
 |---------|-------------|
 | `pry run [args...]` | Start program (`--timeout`, `--background`) |
@@ -158,7 +160,7 @@ pry trace --watch 0x7fffffffd5d4 --range 0x404610-0x405e30
 pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type access --timeout 60
 ```
 
-Uses hardware watchpoints while single-stepping instructions inside the range, continuing outside it. This trades speed for exact access attribution across calls, returns, and range boundaries. Hits distinguish the accessing `pc`/`asm` from GDB's observed `stop_pc`/`stop_asm`; `--max-hits` stops on the final counted access. Stepping temporarily isolates the source thread and can affect multithreaded timing. Internal breakpoints and scheduler settings are cleaned up before returning.
+Uses hardware watchpoints while single-stepping instructions inside the range, continuing outside it. Persistent entry breakpoints at every decoded instruction cover arbitrary branch re-entry and concurrent callers returning to the same address. Setup time and breakpoint storage scale with the number of instructions: use tight, stable-code ranges beginning at an instruction boundary. Hits distinguish the accessing `pc`/`asm` from GDB's observed `stop_pc`/`stop_asm`; `--max-hits` stops on the final counted access. Stepping temporarily isolates the source thread and can affect multithreaded timing. Interrupt acknowledgement waits for trace cancellation and internal-breakpoint cleanup; timeouts return partial results. Confirmed exits remain successful; remote loss is an operational error.
 
 ### Inspection
 
