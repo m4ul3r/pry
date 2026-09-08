@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from .output import write_output_result
 from .paths import (
+    agents_skills_dir,
     bridge_registry_path,
     bridge_socket_path,
     cache_home,
@@ -1486,7 +1487,7 @@ def _skill_install(args: argparse.Namespace) -> int:
 
 
 def _default_skill_install_roots() -> list[Path]:
-    roots = [claude_skills_dir()]
+    roots = [claude_skills_dir(), agents_skills_dir()]
     if codex_home().is_dir():
         roots.append(codex_skills_dir())
     return roots

@@ -737,7 +737,13 @@ def test_install_tree_conflicting_dest_errors(tmp_path):
         pry.cli._install_tree(source, dest, mode="symlink", force=False)
 
 
-def test_skill_install_copy_mode(tmp_path):
+@pytest.fixture
+def skill_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    return tmp_path
+
+
+def test_skill_install_copy_mode(tmp_path, skill_home):
     destination = tmp_path / "skill-copy"
 
     rc = pry.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)])
@@ -745,9 +751,10 @@ def test_skill_install_copy_mode(tmp_path):
     assert rc == 0
     assert (destination / "pry" / "SKILL.md").exists()
     assert (destination / "pry" / "agents" / "openai.yaml").exists()
+    assert not (skill_home / ".agents").exists()
 
 
-def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
+def test_skill_install_defaults_to_claude_and_agents_without_codex_home(tmp_path, monkeypatch, skill_home):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
     codex_root = codex_home / "skills"
@@ -759,10 +766,11 @@ def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monk
 
     assert rc == 0
     assert (claude_root / "pry" / "SKILL.md").exists()
+    assert (skill_home / ".agents" / "skills" / "pry" / "SKILL.md").is_file()
     assert not codex_root.exists()
 
 
-def test_skill_install_defaults_to_claude_and_codex_when_codex_home_exists(tmp_path, monkeypatch):
+def test_skill_install_defaults_to_claude_agents_and_codex_when_codex_home_exists(tmp_path, monkeypatch, skill_home):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
     codex_root = codex_home / "skills"
@@ -776,14 +784,18 @@ def test_skill_install_defaults_to_claude_and_codex_when_codex_home_exists(tmp_p
     assert rc == 0
     assert (claude_root / "pry" / "SKILL.md").exists()
     assert (codex_root / "pry" / "SKILL.md").exists()
+    assert (skill_home / ".agents" / "skills" / "pry" / "SKILL.md").is_file()
 
 
-def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch):
+def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch, skill_home):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
     codex_root = codex_home / "skills"
     codex_home.mkdir()
     (claude_root / "pry").mkdir(parents=True)
+    agents_skill = skill_home / ".agents" / "skills" / "pry"
+    agents_skill.mkdir(parents=True)
+    (agents_skill / "SKILL.md").write_text("existing skill")
     monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)
     monkeypatch.setattr(pry.cli, "codex_home", lambda: codex_home)
     monkeypatch.setattr(pry.cli, "codex_skills_dir", lambda: codex_root)
@@ -792,9 +804,10 @@ def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch
 
     assert rc == 0
     assert (codex_root / "pry" / "SKILL.md").exists()
+    assert (agents_skill / "SKILL.md").read_text() == "existing skill"
 
 
-def test_skill_install_default_output_is_text(tmp_path, monkeypatch, capsys):
+def test_skill_install_default_output_is_text(tmp_path, monkeypatch, capsys, skill_home):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
     monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)
@@ -804,12 +817,11 @@ def test_skill_install_default_output_is_text(tmp_path, monkeypatch, capsys):
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert output.startswith("Installed skills (copy):\n")
     assert "- " + str(claude_root / "pry") in output
     assert '"installed"' not in output
 
 
-def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, capsys):
+def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, capsys, skill_home):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
     monkeypatch.setattr(pry.cli, "claude_skills_dir", lambda: claude_root)

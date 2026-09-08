@@ -93,6 +93,10 @@ def plugin_install_dir() -> Path:
     return gdb_data_dir() / PLUGIN_NAME
 
 
+def agents_skills_dir() -> Path:
+    return Path.home() / ".agents" / "skills"
+
+
 def claude_skills_dir() -> Path:
     return claude_home() / "skills"
 

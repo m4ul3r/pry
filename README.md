@@ -37,13 +37,13 @@ pry plugin install
 
 This symlinks the bridge into `~/.gdb/pry_agent_bridge/` and prints a `source` line to add to your `~/.gdbinit`.
 
-Install the bundled Claude Code/Codex skills:
+Install the bundled agent skills:
 
 ```bash
 pry skill install
 ```
 
-That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
+That symlinks the bundled skills into `~/.claude/skills/` and `~/.agents/skills/` by default, creating those directories if needed. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--dest <path>` to install only into a custom directory, or `--mode copy` for standalone copies. Restart your agent to pick up a new or renamed skill.
 
 ## Quick start
 

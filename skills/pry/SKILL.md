@@ -9,6 +9,8 @@ Use this skill when the user wants debugging work against a running program and 
 
 ## Setup
 
+`pry skill install` symlinks this skill into `~/.claude/skills/` and `~/.agents/skills/`, plus `~/.codex/skills/` when `~/.codex/` exists. Use `--dest <path>` to override these destinations or `--mode copy` for standalone copies.
+
 ### Quick start (recommended)
 
 ```bash

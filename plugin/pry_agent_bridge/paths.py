@@ -87,6 +87,10 @@ def claude_skills_dir() -> Path:
     return claude_home() / "skills"
 
 
+def agents_skills_dir() -> Path:
+    return Path.home() / ".agents" / "skills"
+
+
 def codex_skills_dir() -> Path:
     return codex_home() / "skills"
 
