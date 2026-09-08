@@ -1107,71 +1107,64 @@ class GdbBridge:
                 # hit reports no old_value rather than one from an earlier resume.
                 self._watchpoint_values.pop(bp.number, None)
 
-    def _bp_reason(self, bp) -> dict[str, Any]:
-        """Build a stop-reason dict for a breakpoint/watchpoint."""
+    def _bp_reason(self, bp, *, enrich: bool = True) -> dict[str, Any]:
+        """Copy breakpoint metadata while the event's object is still valid."""
         reason: dict[str, Any] = {}
         if self._is_watchpoint_type(bp.type):
             reason["kind"] = "watchpoint-hit"
             reason["number"] = bp.number
-            expression = getattr(bp, "expression", None)
-            reason["expression"] = expression
-            # GDB prints "Old value = .. / New value = .." to the console but
-            # the Python event API doesn't expose it. Re-evaluate the watched
-            # expression (the inferior has already performed the write by the
-            # time the stop fires) and diff against the value snapshotted just
-            # before the inferior resumed, so the agent gets the single datum a
-            # watchpoint exists to provide. This is READ-ONLY on purpose: a
-            # single stop fires every connected stop handler, each of which
-            # builds a reason, so mutating the cache here would let the first
-            # handler advance it and make the rest see old == new.
-            if expression:
-                new_value = self._safe_eval_str(expression)
-                old_value = self._watchpoint_values.get(bp.number)
-                if new_value is not None:
-                    reason["new_value"] = new_value
-                    if old_value is not None and old_value != new_value:
-                        reason["old_value"] = old_value
-                elif old_value is not None:
-                    # The watched expression became unreadable (e.g. a pointer
-                    # was NULLed, or a local left scope). Still report the
-                    # transition the watchpoint exists for, mirroring GDB's
-                    # "Old value = .. / New value = <unreadable>".
-                    reason["old_value"] = old_value
-                    reason["new_value"] = "<unreadable>"
-            # A watchpoint on a local is auto-deleted by GDB when its scope
-            # exits; flag that so the agent knows it won't fire again.
-            if bp.number not in {b.number for b in (gdb.breakpoints() or [])}:
-                reason["deleted"] = True
+            reason["expression"] = getattr(bp, "expression", None)
         else:
             reason["kind"] = "breakpoint-hit"
             reason["number"] = bp.number
             reason["location"] = getattr(bp, "location", None)
         if bp.temporary:
             reason["temporary"] = True
+        if enrich and reason["kind"] == "watchpoint-hit":
+            self._enrich_watchpoint_reason(reason)
         return reason
 
+    def _enrich_watchpoint_reason(self, reason):
+        """Read target values after stop notification has finished."""
+        expression = reason["expression"]
+        number = reason["number"]
+        if expression:
+            new_value = self._safe_eval_str(expression)
+            old_value = self._watchpoint_values.get(number)
+            # Do not advance the cache: every consumer of this stop should
+            # observe the same old/new transition.
+            if new_value is not None:
+                reason["new_value"] = new_value
+                if old_value is not None and old_value != new_value:
+                    reason["old_value"] = old_value
+            elif old_value is not None:
+                reason["old_value"] = old_value
+                reason["new_value"] = "<unreadable>"
+        # Local watchpoints can disappear as their scope exits. Only consult
+        # the current list; the original event object may already be invalid.
+        if number not in {bp.number for bp in (gdb.breakpoints() or [])}:
+            reason["deleted"] = True
+
     def _on_stop(self, event):
-        """Record notifications without querying a target inside its callback."""
+        """Capture metadata now; defer target reads, not ephemeral GDB objects."""
         self._running = False
         self._has_run = True
         self._has_exited = False
         self._inactive_reason = None
-        self._last_stop_reason = {"kind": "step"}
-        self._pending_stop_event = (event, self._last_stop_reason)
-
-    def _resolve_pending_stop(self):
-        pending = self._pending_stop_event
-        self._pending_stop_event = None
-        if pending is None:
-            return
-        event, reason = pending
-        if self._last_stop_reason is not reason:
-            return
+        reason = {"kind": "step"}
         if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
             if event.breakpoints:
-                self._last_stop_reason = self._bp_reason(event.breakpoints[0])
+                reason = self._bp_reason(event.breakpoints[0], enrich=False)
         elif hasattr(gdb, "SignalEvent") and isinstance(event, gdb.SignalEvent):
-            self._last_stop_reason = {"kind": "signal", "signal": event.stop_signal}
+            reason = {"kind": "signal", "signal": event.stop_signal}
+        self._last_stop_reason = reason
+        self._pending_stop_event = reason if reason["kind"] == "watchpoint-hit" else None
+
+    def _resolve_pending_stop(self):
+        reason = self._pending_stop_event
+        self._pending_stop_event = None
+        if reason is not None and self._last_stop_reason is reason:
+            self._enrich_watchpoint_reason(reason)
 
     def _on_cont(self, event):
         # Existing waiters retain their own job even when new execution starts.

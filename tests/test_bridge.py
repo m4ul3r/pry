@@ -2228,6 +2228,62 @@ def test_deferred_terminal_resolution_preserves_exit_evidence(
         assert reason == ({"kind": "exited", "code": 7} if terminal == "normal" else
                           {"kind": "exited", "code": None, "signal": 15})
 
+@pytest.mark.parametrize("watchpoint", [False, True])
+def test_stop_preserves_metadata_after_gdb_invalidates_breakpoint(monkeypatch, watchpoint):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    valid = [True]
+    notifying = [False]
+    target_reads_during_notification = []
+    value = [1]
+
+    class ExpiringBreakpoint:
+        number = 17
+        type = fake_gdb.BP_WATCHPOINT if watchpoint else fake_gdb.BP_BREAKPOINT
+        location = "ready"
+        expression = "counter" if watchpoint else None
+        temporary = True
+
+        def __getattribute__(self, name):
+            if not valid[0]:
+                raise RuntimeError("Breakpoint 17 is invalid")
+            return object.__getattribute__(self, name)
+
+    breakpoint = ExpiringBreakpoint()
+    fake_gdb.breakpoints = lambda: [breakpoint] if valid[0] else []
+
+    def evaluate(expression):
+        if notifying[0]:
+            target_reads_during_notification.append(expression)
+        return value[0]
+
+    def execute(cmd, to_string=False):
+        if cmd == "continue":
+            value[0] = 2
+            notifying[0] = True
+            fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([breakpoint]))
+            notifying[0] = False
+            # GDB removes temporary breakpoints before gdb.execute returns.
+            valid[0] = False
+        return ""
+
+    fake_gdb.parse_and_eval = evaluate
+    fake_gdb.execute = execute
+    response = bridge.dispatch({"op": "continue", "params": {}})
+    assert response["ok"]
+    assert response["result"]["state"] == "stopped"
+    if watchpoint:
+        assert response["result"]["reason"] == {
+            "kind": "watchpoint-hit", "number": 17, "expression": "counter",
+            "temporary": True, "deleted": True, "old_value": "1", "new_value": "2",
+        }
+    else:
+        assert response["result"]["reason"] == {
+            "kind": "breakpoint-hit", "number": 17, "location": "ready", "temporary": True,
+        }
+    assert target_reads_during_notification == []
+
+
 
 # ---------------------------------------------------------------------------
 # Feature 4: PIE address rebasing
