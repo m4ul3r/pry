@@ -8,6 +8,7 @@ import errno
 import json
 import os
 import re
+import shlex
 import socketserver
 import struct
 import sys
@@ -557,7 +558,7 @@ def estimate_kbase_from_handler(
 
 
 _DISASM_LINE_RE = re.compile(
-    r"^\s*(?:=>\s*)?(0x[0-9a-fA-F]+)\s*(?:<([^>]+)>)?:\s*(.+?)\s*$"
+    r"^\s*(?:=>\s*)?(0x[0-9a-fA-F]+)\s*(?:<(.*?)>)?:(?!:)\s*(.+?)\s*$"
 )
 
 
@@ -566,7 +567,11 @@ def _parse_disassemble_output(output: str) -> list[dict[str, Any]]:
     architecture-based fast path: [{address, asm, symbol?}]. Returns [] if
     nothing parses (caller then falls back to the raw text)."""
     result: list[dict[str, Any]] = []
+    function: str | None = None
     for raw in output.splitlines():
+        if raw.startswith("Dump of assembler code for function ") and raw.endswith(":"):
+            function = raw[len("Dump of assembler code for function "):-1]
+            continue
         m = _DISASM_LINE_RE.match(raw)
         if not m:
             continue
@@ -574,7 +579,10 @@ def _parse_disassemble_output(output: str) -> list[dict[str, Any]]:
         sym = m.group(2)
         if sym:
             # Normalise "func+4" / "func + 4" -> "func+4".
-            entry["symbol"] = re.sub(r"\s*\+\s*", "+", sym.strip())
+            symbol = re.sub(r"\s*\+\s*", "+", sym.strip())
+            if function and symbol.startswith("+"):
+                symbol = function + symbol
+            entry["symbol"] = symbol
         result.append(entry)
     return result
 
@@ -995,8 +1003,14 @@ class GdbBridge:
         # or never exited). Surfaced by `status` so agents can read the code
         # after the process is gone.
         self._last_exit_code: int | None = None
-        self._background_completion: threading.Event | None = None
-        self._background_result: dict[str, Any] | None = None
+        self._last_exit_signal: int | None = None
+        self._has_exited = False
+        self._remote_connection = None
+        self._remote_failure: str | None = None
+        self._disconnecting = False
+        self._restarting = False
+        self._execution_lock = threading.Lock()
+        self._background_job: dict[str, Any] | None = None
         # Set by _finish just before running `finish` so the stop handler can
         # recover the return value: the frame that is finishing (to confirm it
         # actually returned vs. stopping at an intervening breakpoint) and its
@@ -1010,6 +1024,11 @@ class GdbBridge:
         gdb.events.stop.connect(self._on_stop)
         if hasattr(gdb.events, "exited"):
             gdb.events.exited.connect(self._on_exited)
+        if hasattr(gdb.events, "cont"):
+            gdb.events.cont.connect(self._on_cont)
+        if hasattr(gdb.events, "connection_removed"):
+            gdb.events.connection_removed.connect(self._on_connection_removed)
+        self._remember_remote_connection()
         # Never let a GDB command block the bridge waiting on an interactive
         # y/n prompt (e.g. remove-symbol-file), which would wedge the session.
         for _setup in ("set confirm off", "set pagination off"):
@@ -1126,6 +1145,8 @@ class GdbBridge:
     def _on_stop(self, event):
         """GDB stop-event callback — captures the stop reason."""
         self._running = False
+        self._has_run = True
+        self._has_exited = False
         reason: dict[str, Any] = {}
         if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
             bps = event.breakpoints
@@ -1139,11 +1160,63 @@ class GdbBridge:
         # answer "why is it stopped?" instead of returning nothing.
         self._last_stop_reason = reason or {"kind": "step"}
 
+    def _on_cont(self, event):
+        # A later trace or raw GDB resume supersedes the retained background
+        # result too. Existing waiters keep their own reference to that job.
+        if self._background_job is not None and self._background_job["completion"].is_set():
+            self._background_job = None
+        self._running = True
+        self._has_run = True
+        self._has_exited = False
+        self._last_exit_code = None
+        self._last_exit_signal = None
+        self._last_stop_reason = None
+
     def _on_exited(self, event):
-        """GDB exited-event callback — clears stale stop reason, records code."""
+        """An ExitedEvent also means detach/lost transport, not just exit."""
+        if self._restarting and getattr(event, "exit_code", None) is None:
+            self._restarting = False
+            return
         self._running = False
+        self._has_run = True
+        self._has_exited = True
         self._last_stop_reason = None
         self._last_exit_code = getattr(event, "exit_code", None)
+        self._last_exit_signal = None
+        # GDB sets $_exitsignal before emitting ExitedEvent for a real signal
+        # termination; ExitedEvent itself has no signal attribute.
+        if self._last_exit_code is None:
+            with contextlib.suppress(Exception):
+                signal = gdb.convenience_variable("_exitsignal")
+                if signal is not None:
+                    self._last_exit_signal = int(signal)
+        # Some remote backends remove the connection before delivering their
+        # confirmed exit event. That event supersedes the provisional loss.
+        if self._last_exit_code is not None or self._last_exit_signal is not None:
+            self._remote_failure = None
+
+    def _on_connection_removed(self, event):
+        if event.connection is not self._remote_connection:
+            return
+        self._remote_connection = None
+        if (not self._disconnecting and self._last_exit_code is None
+                and self._last_exit_signal is None):
+            self._remote_failure = (
+                "Remote connection lost without a confirmed inferior exit; "
+                "reconnect before inspecting or resuming the target"
+            )
+            self._running = False
+
+    def _remember_remote_connection(self):
+        """Record GDB's transport identity, never probe target memory for life."""
+        try:
+            connection = gdb.selected_inferior().connection
+            if connection is not None and connection.type in ("remote", "extended-remote"):
+                self._remote_connection = connection
+                return True
+        except (AttributeError, gdb.error):
+            pass
+        return self._remote_connection is not None
 
     def _exec_and_stop(self, cmd: str) -> None:
         """Execute *cmd* on the GDB thread.
@@ -1245,6 +1318,8 @@ class GdbBridge:
                 return self._dispatch_exec(op, params)
 
             gdb_timeout = params.pop("_timeout", None) or 120.0
+            if self._remote_failure and op in READ_LOCKED_OPS:
+                raise RuntimeError(self._remote_failure)
             lock = contextlib.nullcontext()
             if op in WRITE_LOCKED_OPS:
                 lock = self._lock.write()
@@ -1344,9 +1419,10 @@ class GdbBridge:
             # Don't lie about interrupting a stopped/exited inferior. Report
             # the observed state so callers can react instead of assuming a
             # running program was stopped.
-            return _json_response(
-                ok=True, result={"interrupted": False, "state": "stopped"}
-            )
+            response = self._dispatch_status()
+            if response["ok"]:
+                response["result"]["interrupted"] = False
+            return response
 
         event = threading.Event()
         holder: dict[str, Any] = {}
@@ -1378,143 +1454,123 @@ class GdbBridge:
             ok=True, result={"interrupted": True, "stopped": not self._running}
         )
 
-    def _dispatch_status(self) -> dict[str, Any]:
-        """Return the inferior's current execution state (lock-free)."""
-        result: dict[str, Any] = {}
+    def _execution_state(self) -> dict[str, Any]:
+        """Read stopped state on GDB's thread; never infer life from a frame."""
+        if self._remote_failure:
+            raise RuntimeError(self._remote_failure)
         if self._running:
-            result["state"] = "running"
-        else:
-            info = _stop_info()
-            try:
-                inf_pid = gdb.selected_inferior().pid
-            except Exception:
-                inf_pid = 0
-            if not inf_pid:
-                # pid 0 means either the inferior never started OR it has
-                # exited — both leave no thread. _has_run distinguishes them
-                # so a freshly-loaded program isn't reported as "exited".
-                result["state"] = "exited" if self._has_run else "not-started"
-            elif info.get("status") == "exited":
-                result["state"] = "exited"
-            else:
-                result["state"] = "stopped"
-            result.update(info)
-            if self._last_stop_reason:
-                result["reason"] = self._last_stop_reason
-            if result["state"] == "exited":
-                # The process is gone; surface the exit code so agents can read
-                # it after the fact (None when it exited via a signal).
+            return {"state": "running", "status": "running"}
+        if self._has_exited or not self._inferior_is_live():
+            state = "exited" if self._has_run else "not-started"
+            result = {"state": state, "status": state, "frame": None, "thread": None}
+            if state == "exited":
                 result["reason"] = {"kind": "exited", "code": self._last_exit_code}
                 if self._last_exit_code is not None:
                     result["exit_code"] = self._last_exit_code
-            if self._displays and result["state"] == "stopped":
-                result["displays"] = self._eval_displays()
-        if self._background_result is not None:
-            result["last_background_result"] = self._background_result
+                if self._last_exit_signal is not None:
+                    result["reason"]["signal"] = self._last_exit_signal
+            return result
+        result = _stop_info()
+        result["state"] = result["status"]
+        if self._last_stop_reason:
+            result["reason"] = self._last_stop_reason
+        if self._displays and result["state"] == "stopped":
+            result["displays"] = self._eval_displays()
+        return result
+
+    def _dispatch_status(self) -> dict[str, Any]:
+        """Running status needs no GDB call; all stopped reads use its thread."""
+        if self._remote_failure:
+            raise RuntimeError(self._remote_failure)
+        if self._running:
+            result = {"state": "running", "status": "running"}
+        else:
+            result = _run_on_gdb_thread(self._execution_state)
+        job = self._background_job
+        if job is not None and job["completion"].is_set():
+            response = job["response"]
+            if not response["ok"]:
+                return response
+            result["last_background_result"] = response["result"]
         return _json_response(ok=True, result=result)
 
     def _dispatch_wait(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Block until the inferior stops after a background exec (lock-free)."""
+        """Wait for a particular job's published response, not its stop event."""
         wait_timeout: float = params.pop("_timeout", 120.0)
-        completion = self._background_completion
-        if completion is None:
+        if self._remote_failure:
+            raise RuntimeError(self._remote_failure)
+        job = self._background_job
+        if job is None:
             if self._running:
                 return _json_response(
-                    ok=False,
-                    error="Inferior is running but not from a background exec",
+                    ok=False, error="Inferior is running but not from a background exec"
                 )
-            result = _stop_info()
-            result["state"] = "stopped"
-            if self._last_stop_reason:
-                result["reason"] = self._last_stop_reason
-            return _json_response(ok=True, result=result)
-
-        if not completion.wait(timeout=wait_timeout):
+            return self._dispatch_status()
+        if not job["completion"].wait(timeout=wait_timeout):
             return _json_response(
                 ok=False,
                 error=f"Timed out after {wait_timeout:.0f}s waiting for inferior to stop",
             )
-
-        result = self._background_result or _stop_info()
-        result["state"] = "stopped"
-        self._background_result = None
-        return _json_response(ok=True, result=result)
-
-    def _background_monitor(
-        self,
-        completion: threading.Event,
-        result_box: list[dict[str, Any]],
-        error_box: list[Exception],
-        on_stop,
-        on_exited,
-    ):
-        """Wait for a background exec to complete and clean up."""
-        completion.wait()  # wait indefinitely
-        with contextlib.suppress(Exception):
-            gdb.events.stop.disconnect(on_stop)
-        if hasattr(gdb.events, "exited"):
-            with contextlib.suppress(Exception):
-                gdb.events.exited.disconnect(on_exited)
-        if result_box:
-            self._background_result = result_box[0]
-        elif error_box:
-            self._background_result = {"error": str(error_box[0])}
-        self._background_completion = None
-        self._running = False
+        # Keep the terminal response until a new execution replaces it: both
+        # late waiters and waiters already holding this job see the same result.
+        return job["response"]
 
     def _dispatch_exec(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Dispatch an execution command and wait for the stop/exited event.
-
-        Unlike normal dispatch which waits for the gdb.post_event callback
-        to return, this waits for GDB's stop or exited event to fire — which
-        happens AFTER the callback returns and GDB processes the stop.
-        """
         exec_timeout: float = params.pop("_timeout", 120.0)
         background: bool = params.pop("_background", False)
-
-        if self._running:
+        if self._remote_failure:
+            raise RuntimeError(self._remote_failure)
+        if self._running or not self._execution_lock.acquire(blocking=False):
             raise RuntimeError(
-                "Inferior is already running (from a background exec). "
-                "Use 'pry wait' to wait for it to stop, "
-                "or 'pry interrupt' to interrupt it."
+                "Inferior is already running. Use 'pry wait' to wait for it "
+                "to stop, or 'pry interrupt' to interrupt it."
             )
 
-        # The inferior is about to run; mark it so `status` can tell a later
-        # pid-0 state apart as "exited" rather than "not-started". Clear any
-        # prior exit code so a new run doesn't report a stale one.
-        self._has_run = True
-        self._last_exit_code = None
-
         completion = threading.Event()
+        job: dict[str, Any] = {"completion": completion, "response": None}
         result_box: list[dict[str, Any]] = []
         error_box: list[Exception] = []
+        command_returned = [False]
+        remote = [False]
+        swallow_restart_exit = [False]
+        self._background_job = job if background else None
+        self._running = True
 
-        # A `run` that restarts a still-live inferior makes GDB kill the old
-        # process first, which fires a spurious `exited` event (carrying no
-        # exit_code) *before* the fresh run reaches its breakpoint/stop. If we
-        # let that event win the completion race we'd report the teardown of
-        # the previous inferior ("status: exited") instead of the new run's
-        # real outcome. Arm a one-shot swallow for exactly that event. Only a
-        # `run` over a live inferior triggers the kill — a first run, or a
-        # re-run after the inferior already exited (pid 0), produces no such
-        # event, so nothing is swallowed in those cases.
-        swallow_restart_exit = [op == "run" and self._inferior_is_live()]
+        def _cleanup():
+            for name, handler in (
+                ("stop", _on_exec_stop), ("exited", _on_exec_exited),
+                ("connection_removed", _on_exec_connection_removed),
+            ):
+                registry = getattr(gdb.events, name, None)
+                if registry is not None:
+                    with contextlib.suppress(Exception):
+                        registry.disconnect(handler)
+
+        def _publish():
+            # An exit event can precede both transport teardown and an error
+            # thrown by gdb.execute. Publish only once the command has returned.
+            if completion.is_set() or not command_returned[0]:
+                return
+            if not result_box and not error_box and not self._remote_failure:
+                return
+            if self._remote_failure:
+                response = _json_response(ok=False, error=self._remote_failure)
+            elif error_box:
+                response = _json_response(ok=False, error=self._augment_error(error_box[0]))
+            else:
+                response = _json_response(ok=True, result=result_box[0])
+            _cleanup()
+            self._restarting = False
+            self._running = False
+            job["response"] = response
+            # No monitor thread races a waiter or clears a later run's state.
+            self._execution_lock.release()
+            completion.set()
 
         def _on_exec_stop(event):
             result = _stop_info()
-            reason: dict[str, Any] = {}
-            if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
-                bps = event.breakpoints
-                if bps:
-                    reason = self._bp_reason(bps[0])
-            elif hasattr(gdb, "SignalEvent") and isinstance(event, gdb.SignalEvent):
-                reason = {"kind": "signal", "signal": event.stop_signal}
-            # A plain stop with no breakpoint/signal is a completed
-            # step/next/finish/until — report it as `step`, consistent with the
-            # permanent handler and what `status`/`wait` return.
-            result["reason"] = reason or {"kind": "step"}
-            # For `finish`, recover the function's return value now that the
-            # inferior is genuinely stopped (reading registers mid-run fails).
+            result["state"] = result["status"]
+            result["reason"] = self._last_stop_reason or {"kind": "step"}
             if op == "finish":
                 rv = self._finish_return_value()
                 if rv is not None:
@@ -1522,88 +1578,81 @@ class GdbBridge:
             if self._displays:
                 result["displays"] = self._eval_displays()
             result_box.append(result)
-            completion.set()
+            _publish()
 
         def _on_exec_exited(event):
             code = getattr(event, "exit_code", None)
             if code is None and swallow_restart_exit[0]:
-                # GDB killing the previous inferior to restart it — not the
-                # new run's outcome. Ignore it (once) and keep waiting for the
-                # real stop/exit event.
                 swallow_restart_exit[0] = False
                 return
-            result: dict[str, Any] = {"status": "exited", "frame": None, "thread": None}
-            if code is not None:
-                result["reason"] = {"kind": "exited", "code": code}
-            result_box.append(result)
-            completion.set()
+            if remote[0] and code is None and self._last_exit_signal is None:
+                # Older GDBs may lack connection_removed. An unconfirmed
+                # remote disappearance is not evidence of a normal exit.
+                self._remote_failure = (
+                    "Remote target disappeared without an exit code or termination "
+                    "signal; reconnect before inspecting or resuming the target"
+                )
+            result_box.append(self._execution_state() if not self._remote_failure else {})
+            # Let GDB finish notifying connection removal before publishing.
+            gdb.post_event(_publish)
+
+        def _on_exec_connection_removed(event):
+            if self._remote_failure:
+                gdb.post_event(_publish)
 
         def _do_execute():
             try:
-                # Snapshot watchpoint values before resuming so a watchpoint
-                # hit during this run can report old -> new.
+                remote[0] = self._remember_remote_connection()
+                swallow_restart_exit[0] = op == "run" and self._inferior_is_live()
+                self._restarting = swallow_restart_exit[0]
+                # Never mistake a convenience variable from a previous run
+                # for evidence that this remote disappearance was a signal.
+                if hasattr(gdb, "set_convenience_variable"):
+                    gdb.set_convenience_variable("_exitsignal", None)
+                self._last_exit_signal = None
+                self._last_exit_code = None
+                gdb.events.stop.connect(_on_exec_stop)
+                if hasattr(gdb.events, "exited"):
+                    gdb.events.exited.connect(_on_exec_exited)
+                if hasattr(gdb.events, "connection_removed"):
+                    gdb.events.connection_removed.connect(_on_exec_connection_removed)
                 self._snapshot_watchpoints()
                 self._dispatch_op(op, params)
             except Exception as exc:
                 error_box.append(exc)
-                completion.set()
+            finally:
+                command_returned[0] = True
+                _publish()
 
         if background:
-            # Background mode: set up event handlers, post the command,
-            # start a monitor thread, and return immediately.
-            self._running = True
-            self._background_completion = completion
-            self._background_result = None
-            gdb.events.stop.connect(_on_exec_stop)
-            if hasattr(gdb.events, "exited"):
-                gdb.events.exited.connect(_on_exec_exited)
-            gdb.post_event(_do_execute)
-            threading.Thread(
-                target=self._background_monitor,
-                args=(completion, result_box, error_box,
-                      _on_exec_stop, _on_exec_exited),
-                daemon=True,
-            ).start()
-            return _json_response(ok=True, result={"status": "running"})
-
-        with self._lock.write():
-            self._running = True
-            gdb.events.stop.connect(_on_exec_stop)
-            if hasattr(gdb.events, "exited"):
-                gdb.events.exited.connect(_on_exec_exited)
             try:
                 gdb.post_event(_do_execute)
-                if not completion.wait(timeout=exec_timeout):
-                    # Auto-interrupt the inferior and give it a short grace
-                    # period to stop so we can return a usable response
-                    # instead of leaving the bridge deadlocked.
-                    gdb.post_event(
-                        lambda: gdb.execute("interrupt", to_string=True)
-                    )
-                    if not completion.wait(timeout=5.0):
-                        raise RuntimeError(
-                            "Timed out waiting for inferior to stop, "
-                            "and auto-interrupt did not succeed"
-                        )
-                    if result_box:
-                        result_box[0]["timeout_interrupt"] = True
-            finally:
-                gdb.events.stop.disconnect(_on_exec_stop)
-                if hasattr(gdb.events, "exited"):
-                    gdb.events.exited.disconnect(_on_exec_exited)
-                # Reset _running regardless of outcome: the global _on_stop /
-                # _on_exited handlers only clear it when a stop/exit event
-                # fires, so a command that fails before the inferior runs
-                # (e.g. "continue" past exit) would otherwise leak True and
-                # wedge the next exec with a spurious "already running".
+            except Exception:
                 self._running = False
+                self._background_job = None
+                self._execution_lock.release()
+                raise
+            if completion.is_set():
+                return job["response"]
+            return _json_response(ok=True, result={"state": "running", "status": "running"})
 
-        if error_box:
-            raise error_box[0]
-        if not result_box:
-            raise RuntimeError("Execution completed without stop or exit event")
-
-        return _json_response(ok=True, result=result_box[0])
+        with self._lock.write():
+            try:
+                gdb.post_event(_do_execute)
+            except Exception:
+                self._running = False
+                self._execution_lock.release()
+                raise
+            if not completion.wait(timeout=exec_timeout):
+                gdb.post_event(lambda: gdb.execute("interrupt", to_string=True))
+                if not completion.wait(timeout=5.0):
+                    raise RuntimeError(
+                        "Timed out waiting for inferior to stop, "
+                        "and auto-interrupt did not succeed"
+                    )
+                if job["response"]["ok"]:
+                    job["response"]["result"]["timeout_interrupt"] = True
+        return job["response"]
 
     @staticmethod
     def _parse_addr(addr) -> int:
@@ -1631,207 +1680,306 @@ class GdbBridge:
         return int(addr) & mask
 
     def _dispatch_trace(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Trace memory accesses within a code range using hardware watchpoints.
+        """Watch single instructions in [START, END), continuing outside it.
 
-        Sets up a hardware watchpoint that is active only while execution is
-        within [range_start, range_end): range_start enables it, range_end
-        disables it (without stopping), and it is also enabled up front if the
-        inferior is already stopped inside the range. The watchpoint stays
-        armed/disarmed across repeated passes, so hits accumulate over multiple
-        loop iterations up to max_hits. Each watchpoint hit records the PC and
-        instruction. All automation runs inside GDB via ``Breakpoint.stop()``
-        callbacks at native speed.
+        The pre-step PC identifies the executing instruction, independently of
+        whether the architecture reports a watchpoint before or after access.
+        In particular, returns/branches do not need to visit an END breakpoint.
+        Scheduler locking during steps prevents another thread's watchpoint
+        from being attributed to the selected thread's instruction.
         """
+        def _positive_int(name, default):
+            value = params.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                raise ValueError(f"{name} must be a positive integer")
+            try:
+                value = int(value)
+            except ValueError:
+                raise ValueError(f"{name} must be a positive integer") from None
+            if value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            return value
+
         watch_addr = self._parse_addr(params["watch_addr"])
-        watch_size = int(params.get("watch_size", 4))
+        watch_size = _positive_int("watch_size", 4)
         range_start = self._parse_addr(params["range_start"])
         range_end = self._parse_addr(params["range_end"])
+        if watch_addr < 0 or range_start < 0 or range_end <= range_start:
+            raise ValueError("trace requires nonnegative addresses and range_start < range_end")
+        if watch_addr + watch_size > 1 << 64:
+            raise ValueError("watched byte range exceeds the address space")
         watch_type = params.get("watch_type", "access")
-        max_hits = int(params.get("max_hits", 10000))
-        trace_timeout: float = params.pop("_timeout", 120.0)
+        if watch_type not in {"write", "read", "access"}:
+            raise ValueError("watch_type must be write, read, or access")
+        max_hits = _positive_int("max_hits", 10000)
+        trace_timeout = float(params.get("_timeout", 120.0))
+        if not 0 < trace_timeout < float("inf"):
+            raise ValueError("trace timeout must be positive and finite")
 
         hits: list[dict[str, Any]] = []
         completion = threading.Event()
-        result_box: list[dict[str, Any]] = []
+        cancelled = threading.Event()
         error_box: list[Exception] = []
-        cleanup_bps: list[Any] = []
-
-        # We build the custom Breakpoint subclasses inside a GDB-thread
-        # callback so that gdb.Breakpoint() calls happen on the main thread.
-        # A mutable holder lets the start-BP reference the watchpoint that
-        # is created after it.
-        wp_holder: list[Any] = []
-        # Tracks whether the watchpoint was ever enabled during the trace. A
-        # `0 hits` result with armed=False means the trace window never opened
-        # (range_start never reached and execution never started inside the
-        # range) — a false negative, distinct from "armed but no accesses".
-        armed_holder: list[bool] = [False]
-
-        def _setup_and_continue():
-            try:
-                wp_class_map = {
-                    "write": getattr(gdb, "WP_WRITE", 0),
-                    "read": getattr(gdb, "WP_READ", 1),
-                    "access": getattr(gdb, "WP_ACCESS", 2),
-                }
-                wp_class = wp_class_map.get(watch_type, wp_class_map["access"])
-                watch_expr = f"*(char(*)[{watch_size}]){hex(watch_addr)}"
-
-                class _RangeStartBP(gdb.Breakpoint):
-                    def stop(self_bp):  # noqa: N805
-                        if wp_holder:
-                            wp_holder[0].enabled = True
-                            armed_holder[0] = True
-                        return False  # auto-continue
-
-                class _RangeEndBP(gdb.Breakpoint):
-                    def stop(self_bp):  # noqa: N805
-                        # Disarm on the way out of the range, but keep running:
-                        # range_start re-arms on the next pass, so the trace
-                        # accumulates across loop iterations up to max_hits.
-                        # (Previously this returned True and stopped the whole
-                        # trace at the first range_end, capping it at one pass
-                        # and making max_hits unreachable.)
-                        if wp_holder:
-                            wp_holder[0].enabled = False
-                        return False  # auto-continue
-
-                class _TraceWatchBP(gdb.Breakpoint):
-                    def stop(self_bp):  # noqa: N805
-                        if len(hits) >= max_hits:
-                            return True  # stop, limit reached
-                        try:
-                            frame = gdb.selected_frame()
-                            pc = hex(frame.pc())
-                            arch = frame.architecture()
-                            insns = arch.disassemble(frame.pc(), count=1)
-                            asm = insns[0]["asm"] if insns else "<unknown>"
-                        except Exception:
-                            pc = "<unknown>"
-                            asm = "<unknown>"
-                        hits.append({"pc": pc, "asm": asm})
-                        return False  # auto-continue
-
-                start_bp = _RangeStartBP(f"*{hex(range_start)}")
-                start_bp.silent = True
-                cleanup_bps.append(start_bp)
-
-                end_bp = _RangeEndBP(f"*{hex(range_end)}")
-                end_bp.silent = True
-                cleanup_bps.append(end_bp)
-
-                trace_wp = _TraceWatchBP(
-                    watch_expr,
-                    type=gdb.BP_WATCHPOINT,
-                    wp_class=wp_class,
-                )
-                trace_wp.silent = True
-                trace_wp.enabled = False
-                cleanup_bps.append(trace_wp)
-                wp_holder.append(trace_wp)
-
-                # If the inferior is already stopped inside the range, arm the
-                # watchpoint now. Otherwise a trace started mid-range (e.g.
-                # after `pry interrupt`) would silently record nothing whenever
-                # range_start is a one-shot address (like a function entry) that
-                # won't be reached again.
-                try:
-                    cur_pc = int(gdb.selected_frame().pc())
-                    if range_start <= cur_pc < range_end:
-                        trace_wp.enabled = True
-                        armed_holder[0] = True
-                except Exception:
-                    pass
-
-                gdb.execute("continue", to_string=True)
-            except Exception as exc:
-                error_box.append(exc)
-                completion.set()
-
-        def _on_trace_stop(event):
-            result = _stop_info()
-            reason: dict[str, Any] = {}
-            if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
-                bps = event.breakpoints
-                if bps:
-                    reason = self._bp_reason(bps[0])
-            elif hasattr(gdb, "SignalEvent") and isinstance(event, gdb.SignalEvent):
-                reason = {"kind": "signal", "signal": event.stop_signal}
-            if reason:
-                result["reason"] = reason
-            result_box.append(result)
-            completion.set()
-
-        def _on_trace_exited(event):
-            result: dict[str, Any] = {"status": "exited", "frame": None, "thread": None}
-            code = getattr(event, "exit_code", None)
-            if code is not None:
-                result["reason"] = {"kind": "exited", "code": code}
-            result_box.append(result)
-            completion.set()
-
-        with self._lock.write():
-            gdb.events.stop.connect(_on_trace_stop)
-            if hasattr(gdb.events, "exited"):
-                gdb.events.exited.connect(_on_trace_exited)
-            try:
-                gdb.post_event(_setup_and_continue)
-                if not completion.wait(timeout=trace_timeout):
-                    gdb.post_event(
-                        lambda: gdb.execute("interrupt", to_string=True)
-                    )
-                    completion.wait(timeout=5.0)
-            finally:
-                gdb.events.stop.disconnect(_on_trace_stop)
-                if hasattr(gdb.events, "exited"):
-                    gdb.events.exited.disconnect(_on_trace_exited)
-                # Clean up internal breakpoints.
-                def _cleanup():
-                    boundary_nums = set()
-                    for bp in cleanup_bps:
-                        with contextlib.suppress(Exception):
-                            boundary_nums.add(bp.number)
-                        with contextlib.suppress(Exception):
-                            bp.delete()
-                    # The permanent stop handler may have recorded one of these
-                    # now-deleted internal objects (a boundary breakpoint or the
-                    # trace watchpoint) as the last stop reason. Clear it so a
-                    # later `status` doesn't report a "breakpoint/watchpoint #N
-                    # hit" for something that no longer exists.
-                    lsr = self._last_stop_reason
-                    if (isinstance(lsr, dict)
-                            and lsr.get("number") is not None
-                            and lsr.get("number") in boundary_nums):
-                        self._last_stop_reason = None
-                gdb.post_event(_cleanup)
-
-        if error_box:
-            raise error_box[0]
-
         trace_result: dict[str, Any] = {
             "hits": hits,
-            "hit_count": len(hits),
-            "truncated": len(hits) >= max_hits,
-            "armed": armed_holder[0],
+            "armed": False,
             "watch_addr": hex(watch_addr),
             "watch_size": watch_size,
             "range_start": hex(range_start),
             "range_end": hex(range_end),
+            "attribution": "instruction-step",
+            "unattributed_count": 0,
         }
-        if not hits and not armed_holder[0]:
-            # Distinguish a false negative (window never opened) from a genuine
-            # "no accesses occurred in range" so an agent doesn't read 0 hits as
-            # proof the address is untouched.
-            trace_result["note"] = (
-                f"watchpoint never armed: execution never entered the code range "
-                f"[{hex(range_start)}, {hex(range_end)}) during the trace, so no "
-                f"accesses could be recorded. Pick a range_start that lies on the "
-                f"execution path (e.g. inside the loop body), or start the trace "
-                f"with the inferior already stopped inside the range."
-            )
-        if result_box:
-            trace_result["stop_info"] = result_box[0]
 
+        def _instruction(frame):
+            pc = int(frame.pc())
+            asm = None
+            successor = None
+            with contextlib.suppress(Exception):
+                instructions = frame.architecture().disassemble(pc, count=1)
+                if instructions and int(instructions[0]["addr"]) == pc:
+                    asm = instructions[0]["asm"]
+                    length = int(instructions[0]["length"])
+                    if length > 0:
+                        successor = pc + length
+            return pc, asm, successor
+
+        cleanup_bps = []
+        internal_numbers = set()
+        reentry_bps = {}
+        start_bp = None
+        trace_wp = None
+        source = None
+        inside = False
+        running = False
+        finishing = False
+
+        def _cleanup():
+            try:
+                with contextlib.suppress(Exception):
+                    gdb.events.stop.disconnect(_on_trace_stop)
+                with contextlib.suppress(Exception):
+                    gdb.events.exited.disconnect(_on_trace_exit)
+                for bp in cleanup_bps:
+                    try:
+                        bp.delete()
+                    except Exception as exc:
+                        error_box.append(exc)
+                reason = self._last_stop_reason
+                if isinstance(reason, dict) and reason.get("number") in internal_numbers:
+                    self._last_stop_reason = None
+            finally:
+                # Completion includes cleanup, not just the terminal event.
+                completion.set()
+
+        def _stop_trace():
+            nonlocal finishing
+            if not finishing:
+                finishing = True
+                gdb.post_event(_cleanup)
+
+        def _fail(exc):
+            error_box.append(exc)
+            _stop_trace()
+
+        def _advance():
+            nonlocal source, inside, running
+            if finishing:
+                return
+            if cancelled.is_set():
+                _stop_trace()
+                return
+            try:
+                frame = gdb.newest_frame()
+                pc = int(frame.pc())
+                inside = range_start <= pc < range_end
+                trace_wp.enabled = inside
+                source = None
+                if inside:
+                    step_thread = gdb.selected_thread()
+                    if step_thread is None or not step_thread.is_stopped():
+                        raise RuntimeError("trace requires a live stopped thread before stepping")
+                    trace_result["armed"] = True
+                    source_pc, source_asm, successor = _instruction(frame)
+                    source = (source_pc, source_asm, step_thread, successor)
+                running = True
+                # In posted callbacks GDB can return before delivering the stop.
+                # Only the event handler may decide to issue the next command.
+                if inside:
+                    scheduler_locking = gdb.parameter("scheduler-locking")
+                    gdb.execute("set scheduler-locking step", to_string=True)
+                    try:
+                        gdb.execute("stepi", to_string=True)
+                    finally:
+                        # GDB chooses the thread schedule when resuming. Restore
+                        # now, before its queued stop/exit event: after exit the
+                        # target no longer supports changing scheduler-locking.
+                        gdb.execute(f"set scheduler-locking {scheduler_locking}", to_string=True)
+                else:
+                    gdb.execute("continue", to_string=True)
+            except Exception as exc:
+                running = False
+                _fail(exc)
+
+        def _on_trace_exit(event):
+            nonlocal running
+            running = False
+            if finishing:
+                return
+            stop = {"status": "exited", "frame": None, "thread": None}
+            code = getattr(event, "exit_code", None)
+            if code is not None:
+                stop["reason"] = {"kind": "exited", "code": code}
+            trace_result["stop_info"] = stop
+            _stop_trace()
+
+        def _on_trace_stop(event):
+            nonlocal running
+            running = False
+            if finishing:
+                return
+            try:
+                stop = _stop_info()
+                trace_result["stop_info"] = stop
+                bps = tuple(getattr(event, "breakpoints", ()))
+                if trace_wp in bps:
+                    stop_pc, stop_asm, _ = _instruction(gdb.newest_frame())
+                    hit = {
+                        "pc": None,
+                        "asm": None,
+                        "stop_pc": hex(stop_pc),
+                        "stop_asm": stop_asm,
+                        "attribution": "unavailable",
+                    }
+                    event_thread = getattr(event, "inferior_thread", None)
+                    stopped_thread = event_thread or gdb.selected_thread()
+                    if source is not None and stopped_thread == source[2]:
+                        hit.update(
+                            pc=hex(source[0]),
+                            asm=source[1],
+                            attribution="instruction-step",
+                        )
+                        hits.append(hit)
+                    else:
+                        hit["note"] = "watchpoint did not belong to the isolated instruction step"
+                        trace_result["unattributed_count"] += 1
+                        trace_result["last_unattributed"] = hit
+                    if len(hits) >= max_hits or trace_result["unattributed_count"]:
+                        # Never resume to observe an N+1th write.
+                        stop["reason"] = {
+                            "kind": "trace-limit" if len(hits) >= max_hits else "trace-unattributed",
+                        }
+                        self._last_stop_reason = stop["reason"]
+                        _stop_trace()
+                        return
+                user_bps = [bp for bp in bps if bp not in cleanup_bps]
+                if user_bps:
+                    stop["reason"] = self._bp_reason(user_bps[0])
+                    _stop_trace()
+                    return
+                if hasattr(event, "stop_signal"):
+                    stop["reason"] = {"kind": "signal", "signal": event.stop_signal}
+                    _stop_trace()
+                    return
+                if cancelled.is_set():
+                    _stop_trace()
+                    return
+                reentered = [addr for addr, bp in reentry_bps.items() if bp in bps]
+                if not inside and start_bp not in bps and not reentered:
+                    # A user stop outside a known entry is not permission to
+                    # resume the inferior again.
+                    _stop_trace()
+                    return
+                for addr in reentered:
+                    bp = reentry_bps.pop(addr)
+                    bp.delete()
+                    cleanup_bps.remove(bp)
+                current_pc = int(gdb.newest_frame().pc())
+                if source is not None and not range_start <= current_pc < range_end:
+                    successor = source[3]
+                    if successor is None:
+                        trace_result["note"] = (
+                            "Trace stopped at a range exit because the instruction "
+                            "length was unavailable; a possible call return could "
+                            "not be monitored. Collected hits are incomplete."
+                        )
+                        stop["reason"] = {"kind": "trace-unattributed"}
+                        self._last_stop_reason = stop["reason"]
+                        _stop_trace()
+                        return
+                    if range_start <= successor < range_end and successor not in reentry_bps:
+                        # Preserve a possible call return into the middle of
+                        # the window without architecture opcode guessing.
+                        bp = gdb.Breakpoint(f"*{hex(successor)}")
+                        cleanup_bps.append(bp)
+                        internal_numbers.add(bp.number)
+                        bp.silent = True
+                        reentry_bps[successor] = bp
+                stop["reason"] = {"kind": "step"}
+                gdb.post_event(_advance)
+            except Exception as exc:
+                _fail(exc)
+
+        def _trace():
+            nonlocal start_bp, trace_wp
+            try:
+                start_bp = gdb.Breakpoint(f"*{hex(range_start)}")
+                cleanup_bps.append(start_bp)
+                internal_numbers.add(start_bp.number)
+                start_bp.silent = True
+                trace_wp = gdb.Breakpoint(
+                    f"*(char(*)[{watch_size}]){hex(watch_addr)}",
+                    type=gdb.BP_WATCHPOINT,
+                    wp_class={
+                        "write": gdb.WP_WRITE,
+                        "read": gdb.WP_READ,
+                        "access": gdb.WP_ACCESS,
+                    }[watch_type],
+                )
+                cleanup_bps.append(trace_wp)
+                internal_numbers.add(trace_wp.number)
+                trace_wp.silent = True
+                trace_wp.enabled = False
+                gdb.events.stop.connect(_on_trace_stop)
+                gdb.events.exited.connect(_on_trace_exit)
+                _advance()
+            except Exception as exc:
+                _fail(exc)
+
+        def _interrupt_trace():
+            if finishing:
+                return
+            if running:
+                try:
+                    gdb.execute("interrupt", to_string=True)
+                except Exception as exc:
+                    _fail(exc)
+            else:
+                _stop_trace()
+
+        with self._lock.write():
+            gdb.post_event(_trace)
+            if not completion.wait(timeout=trace_timeout):
+                cancelled.set()
+                trace_result["timeout_interrupt"] = True
+                gdb.post_event(_interrupt_trace)
+                # Do not release the mutation lock or return live internal
+                # breakpoints while GDB is still processing the interrupt.
+                completion.wait()
+        if error_box:
+            raise error_box[0]
+        trace_result["hit_count"] = len(hits)
+        trace_result["truncated"] = len(hits) >= max_hits
+        if trace_result["unattributed_count"]:
+            trace_result["note"] = (
+                "Trace stopped because an access could not be attributed; "
+                "hit_count is incomplete. See last_unattributed."
+            )
+        elif not trace_result["armed"]:
+            trace_result["note"] = (
+                "watchpoint never armed: execution did not reach range_start or "
+                "start inside the code range. This is not proof of no accesses."
+            )
         return _json_response(ok=True, result=trace_result)
 
     # ------------------------------------------------------------------
@@ -2242,6 +2390,11 @@ class GdbBridge:
             raise RuntimeError(f"no such process: pid {pid} is not running")
         self._last_stop_reason = None
         gdb.execute(f"attach {pid}", to_string=True)
+        self._has_run = True
+        self._has_exited = False
+        self._remote_failure = None
+        self._remote_connection = None
+        self._background_job = None
         info = self._stop_info()
         info["attached"] = pid
         return info
@@ -2267,6 +2420,13 @@ class GdbBridge:
         self._last_stop_reason = None
         gdb.execute(f"set tcp connect-timeout {timeout}", to_string=True)
         gdb.execute(f"target remote {target}", to_string=True)
+        self._has_run = True
+        self._has_exited = False
+        self._remote_failure = None
+        self._last_exit_code = None
+        self._last_exit_signal = None
+        self._background_job = None
+        self._remember_remote_connection()
         info = self._stop_info()
         info["connected"] = target
         return info
@@ -2287,7 +2447,13 @@ class GdbBridge:
                 f"{conn_type}); `disconnect` is for remote/gdbserver targets — "
                 f"use `pry kill` to end a local session"
             )
-        gdb.execute("disconnect", to_string=True)
+        self._disconnecting = True
+        try:
+            gdb.execute("disconnect", to_string=True)
+        finally:
+            self._disconnecting = False
+        self._remote_connection = None
+        self._background_job = None
         return {"disconnected": True}
 
     def _target_info(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -2305,29 +2471,62 @@ class GdbBridge:
 
     def _run(self, params: dict[str, Any]) -> dict[str, Any]:
         args = params.get("args")
+        inferior = gdb.selected_inferior()
         if args:
-            if isinstance(args, list):
-                arg_str = " ".join(str(a) for a in args)
+            values = [str(a) for a in args] if isinstance(args, list) else shlex.split(str(args))
+        else:
+            # No new args means rerun with GDB's existing arguments, not clear
+            # them. Pry stores these in the same POSIX-shell syntax every time.
+            current = (inferior.arguments if hasattr(inferior, "arguments")
+                       else gdb.parameter("args"))
+            values = shlex.split(current or "")
+        if any("\0" in value for value in values):
+            raise RuntimeError("Program arguments cannot contain NUL bytes")
+        arg_str = shlex.join(values)
+        startup_with_shell = gdb.parameter("startup-with-shell")
+        previous_shell = os.environ.get("SHELL")
+        try:
+            # GDB <=15's no-shell parser only splits whitespace; quoting
+            # cannot represent even an empty argument there. Use a known
+            # POSIX shell with every argument quoted, never shell expansion.
+            # GDB's get_shell() reads the debugger's host SHELL environment,
+            # not `set environment SHELL` (which controls the inferior).
+            os.environ["SHELL"] = "/bin/sh"
+            gdb.execute("set startup-with-shell on", to_string=True)
+            if hasattr(inferior, "arguments"):
+                inferior.arguments = arg_str
+            elif "\n" in arg_str:
+                # gdb.execute parses newlines as separate CLI commands. The
+                # MI console interpreter accepts one C-escaped command instead.
+                command = "-interpreter-exec console " + json.dumps("set args " + arg_str)
+                output = gdb.execute("interpreter-exec mi " + json.dumps(command), to_string=True)
+                if any(line.startswith("^error") for line in output.splitlines()):
+                    raise RuntimeError(f"Could not set program arguments: {output.strip()}")
             else:
-                arg_str = str(args)
-            gdb.execute(f"set args {arg_str}", to_string=True)
-
-        stdin_file = params.get("stdin_file")
-        if stdin_file:
-            return self._run_with_stdin_file(str(stdin_file))
-        return self._exec_and_stop("run")
+                gdb.execute(f"set args {arg_str}", to_string=True)
+            stdin_file = params.get("stdin_file")
+            if stdin_file:
+                return self._run_with_stdin_file(str(stdin_file))
+            return self._exec_and_stop("run")
+        finally:
+            try:
+                gdb.execute(
+                    "set startup-with-shell " + ("on" if startup_with_shell else "off"),
+                    to_string=True,
+                )
+            finally:
+                if previous_shell is None:
+                    os.environ.pop("SHELL", None)
+                else:
+                    os.environ["SHELL"] = previous_shell
 
     def _run_with_stdin_file(self, stdin_file: str) -> Any:
         """Run the inferior with *stdin_file* as its real stdin (fd 0).
 
         Opens the file and temporarily dup2's it onto GDB's stdin so the
-        inferior inherits a direct file descriptor at fork/exec. This keeps
-        ``startup-with-shell off`` (byte-precise argv), feeds raw bytes
-        without a PTY (no cooked-mode XON/XOFF footguns), and restores GDB's
-        original stdin afterwards (the keepalive pipe under ``pry launch``).
-
-        Shell-style ``run < file`` remains unsupported under pry because
-        launch disables startup-with-shell; use ``pry run --stdin-file``.
+        inferior inherits a direct file descriptor through the shell's exec.
+        Bytes stay raw, without a PTY or shell redirection, and GDB's original
+        stdin is restored afterwards (the keepalive pipe under ``pry launch``).
         """
         path = Path(stdin_file).expanduser()
         try:
@@ -2882,11 +3081,22 @@ class GdbBridge:
         show_all = params.get("all", False)
         cmd = "info all-registers" if show_all else "info registers"
         output = gdb.execute(cmd, to_string=True)
-        result = []
-        for line in output.strip().splitlines():
-            parts = line.split()
-            if len(parts) >= 2:
-                result.append({"name": parts[0], "value": " ".join(parts[1:])})
+        result: list[dict[str, Any]] = []
+        name: str | None = None
+        value_lines: list[str] = []
+        for line in output.splitlines():
+            # Register rows start in column zero. Pretty-printed vector fields
+            # are indented continuations, not registers of their own.
+            parts = line.split(None, 1)
+            if line and not line[0].isspace() and len(parts) == 2:
+                if name is not None:
+                    result.append({"name": name, "value": "\n".join(value_lines)})
+                name, value = parts
+                value_lines = [value.rstrip()]
+            elif name is not None:
+                value_lines.append(line.rstrip())
+        if name is not None:
+            result.append({"name": name, "value": "\n".join(value_lines)})
         return result
 
     def _register_write(self, params: dict[str, Any]) -> dict[str, Any]:
