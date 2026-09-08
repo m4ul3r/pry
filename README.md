@@ -98,9 +98,17 @@ Every command accepts `--format [text|json|ndjson]`, `--out <path>`, and `--inst
 | `pry disconnect` | Disconnect from the remote target |
 | `pry inferior list` | List inferiors |
 
+Some `gdbserver` builds ignore the HOST in `127.0.0.1:PORT` and bind all interfaces. Verify the listener with `ss -ltnp`; use stdio or an isolated/verified loopback-only transport rather than assuming HOST restricts access. Once GDB observes transport loss, pry returns an operational error until reconnect instead of reporting successful execution or serving known-stale inspection data.
+
+Idle remote inspection refreshes GDB's register/frame caches to avoid GDB 15's stale-cache abort during lazy unwind-data fetching. Frame selection is preserved, but Python scripts must reacquire `gdb.Frame` objects after another command. Once transport loss is known, raw GDB commands are restricted to target-recovery operations.
+
 ### Execution control
 
 All execution commands block until the inferior stops or exits, returning structured stop info (reason, frame, thread). Use `--timeout N` to auto-interrupt after N seconds. Use `--background` to return immediately while the inferior keeps running.
+
+`pry run` preserves literal argv, including empty and whitespace-containing arguments, by temporarily using a safely quoted `/bin/sh` launch. It restores the debugger's launch settings afterward; `--stdin-file` still delivers raw bytes without shell redirection.
+
+Loading or clearing the executable resets prior exit/background history. Intentional detach/disconnect reports `not-started` with a `detached`/`disconnected` reason; it does not claim that the target process exited.
 
 | Command | Description |
 |---------|-------------|
@@ -114,7 +122,7 @@ All execution commands block until the inferior stops or exits, returning struct
 | `pry until <location>` | Run until location (`--timeout`, `--background`) |
 | `pry jump <location>` | Resume execution at a location (GDB `jump`) |
 | `pry interrupt` | Interrupt running inferior (always works, even during background exec) |
-| `pry status` | Show inferior execution state (running/stopped) |
+| `pry status` | Show running/stopped/exited/not-started state; JSON `state` and `status` agree |
 | `pry wait` | Wait for running inferior to stop (`--timeout`) |
 | `pry threads` | List threads with selected frame info (`--pc`, `--function`) |
 
@@ -154,7 +162,7 @@ pry trace --watch 0x7fffffffd5d4 --range 0x404610-0x405e30
 pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type access --timeout 60
 ```
 
-Uses hardware watchpoints gated by range boundary breakpoints for native-speed tracing. Reports every instruction within the range that touches the watched memory.
+Uses hardware watchpoints while single-stepping instructions inside the range, continuing outside it. Persistent entry breakpoints at every decoded instruction cover arbitrary branch re-entry and concurrent callers returning to the same address. Setup time and breakpoint storage scale with the number of instructions: use tight, stable-code ranges beginning at an instruction boundary. Hits distinguish the accessing `pc`/`asm` from GDB's observed `stop_pc`/`stop_asm`; `--max-hits` stops on the final counted access. Stepping temporarily isolates the source thread and can affect multithreaded timing. Interrupt acknowledgement waits for trace cancellation and internal-breakpoint cleanup; timeouts return partial results. Confirmed exits remain successful; remote loss is an operational error.
 
 ### Inspection
 
@@ -233,7 +241,7 @@ pry --instance web break set handle_request      # by name
 
 ## Output spilling
 
-When output exceeds 10,000 tokens (measured with the `o200k_base` tokenizer), pry automatically spills under the pry cache (`~/.cache/pry/spills/` by default, or `$PRY_CACHE_DIR/spills`) and prints an artifact envelope to stderr with the path, byte count, token count, and SHA-256. This prevents blowing agent context windows. Use `--out <path>` to always write to a file.
+When output exceeds 10,000 tokens (measured with the `o200k_base` tokenizer), pry automatically spills under the pry cache (`~/.cache/pry/spills/` by default, or `$PRY_CACHE_DIR/spills`). The artifact envelope goes to stdout; a short warning goes to stderr. It contains the path, byte count, token count, and SHA-256, without an `ok` field on success. Automatic spill files are exclusively created with unique names, so concurrent results remain independently retrievable. Use `--out <path>` to deliberately overwrite a chosen output file.
 
 ## Wire protocol
 

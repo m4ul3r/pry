@@ -46,17 +46,18 @@ If you need interactive GDB access or a custom setup:
 1. **Installed plugin (recommended, persistent):**
    ```bash
    pry plugin install        # symlinks the bridge into GDB's data dir (~/.gdb/pry_agent_bridge)
-   # It prints the exact `python ... import pry_agent_bridge` snippet to add to ~/.gdbinit.
+   # Add its generated Python snippet verbatim to ~/.gdbinit.
    ```
 
-2. **Manual source** — use the path `pry plugin install` printed (its parent of `pry_agent_bridge`, e.g. `~/.gdb`), not a hardcoded one:
+2. **Manual source** — save the generated snippet to a GDB command file and load it:
    ```bash
-   gdb -q ./binary -ex "python import sys; sys.path.insert(0, '$HOME/.gdb'); import pry_agent_bridge"
+   gdb -q ./binary -x /path/to/bridge.gdb
    ```
+   The snippet loads the installed package directly, including custom destinations with arbitrary basenames, spaces, or quotes.
 
 For headless/agent contexts without `pry launch`, keep GDB's stdin open:
 ```bash
-sleep 99999 | gdb -q ./binary -ex "python import sys; sys.path.insert(0, '$HOME/.gdb'); import pry_agent_bridge"
+sleep 99999 | gdb -q ./binary -x /path/to/bridge.gdb
 ```
 
 ## Remote Debugging (QEMU / gdbserver)
@@ -68,6 +69,8 @@ pry launch --symbols ./vmlinux --connect localhost:1234
 ```
 
 This launches GDB, loads the symbol file, and connects to the remote target in one step.
+
+**Server binding:** some `gdbserver` builds ignore the HOST in `127.0.0.1:PORT` and listen on all interfaces. Verify the actual listener with `ss -ltnp`; do not treat the supplied HOST as an access restriction. Use a stdio transport, a verified loopback-only adapter, or an isolated network when exposing a debugger is not intended.
 
 ### Step-by-step
 
@@ -145,6 +148,8 @@ pry run
 
 Outputs above 10,000 `o200k_base` tokens auto-spill to disk. When that happens, **stdout carries the artifact envelope** (a JSON object with `artifact_path`, `bytes`, `tokens`, `sha256`, `summary`) and stderr gets a one-line `warning: ... spilled to <path>` note. Read `artifact_path` from the stdout envelope to retrieve the full data.
 
+Automatic spills use exclusively created unique files, so concurrent commands cannot overwrite one another's artifacts. An explicit `--out PATH` deliberately overwrites that path. Artifact success envelopes, like ordinary success values, have no `ok` field.
+
 4. **Output/exit-code contract** (important for programmatic use): on **success** a command exits **0** and the result goes to **stdout** — in JSON mode a bare value/object (NOT wrapped in `{"ok":true}`). On **failure** the command exits **non-zero** and the error goes to **stderr** (`--format json` makes it `{"ok": false, "error": "..."}`); nothing goes to stdout. So you can gate on `$?`, and a success result never carries an `ok` field.
 
 5. **Parallel calls are safe.** Read-only inspection commands (`backtrace`, `registers`, `locals`, `memory read`, `disasm`, `print`, etc.) take only a read lock and can be batched in parallel freely. Avoid parallelising execution/mutation commands (`run`, `continue`, `step`, `break set`, `memory write`) as they acquire an exclusive lock and will serialise anyway.
@@ -175,9 +180,15 @@ pry thread select 3          # Make thread 3 the persistently selected one
 
 Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
 
-**Stdin for the inferior:** use `pry run --stdin-file PATH` to open `PATH` as the inferior's real stdin (fd 0). Bytes are delivered raw — no PTY, so cooked-mode XON/XOFF cannot eat payload bytes (e.g. `0x11` in addresses). Program args stay separate (`pry run --stdin-file payload.bin arg1 arg2`). Shell-style redirection via `pry gdb 'run < file'` is **not** supported: `pry launch` sets `startup-with-shell off` for byte-precise argv, so `<` and the path become argv tokens. Prefer `--stdin-file`.
+**Stdin for the inferior:** use `pry run --stdin-file PATH` to open `PATH` as the inferior's real stdin (fd 0). Bytes are delivered raw — no PTY, so cooked-mode XON/XOFF cannot eat control bytes. Program args stay separate (`pry run --stdin-file payload.bin arg1 arg2`); use `--` before leading-dash program arguments.
 
-`pry status` reports one of: `running`, `stopped`, `exited`, or `not-started`.
+**Exact argv:** `pry run` preserves empty arguments, whitespace, quotes, backslashes, and literal shell metacharacters. It temporarily uses `/bin/sh` with each argument safely quoted, then restores GDB's `startup-with-shell` and the debugger's `SHELL`. This avoids old GDB no-shell parsers that split on whitespace regardless of quoting. Rerunning without new arguments reuses the previous vector. Raw `pry gdb 'run ...'` remains a GDB command and does not use pry's argv handling; the default launch setting is still `startup-with-shell off`, so use `--stdin-file` rather than raw shell redirection.
+
+`pry status` reports `running`, `stopped`, `exited`, or `not-started`; `state` and `status` agree. `wait` returns the same terminal state rather than calling an exited inferior stopped. Once GDB reports a remote transport loss, execution, status/wait, and inspection return an operational error until reconnect/attach succeeds. A normal exit or confirmed signal termination remains a successful debugger operation. GDB may retain cached frames before it observes the loss; cached data alone cannot establish remote liveness.
+
+Idle remote inspection refreshes GDB's register/frame caches before reading target state. This prevents the observed GDB 15 native abort when stale registers meet a failed lazy unwind-data fetch; it is not a separate liveness-probe packet. The selected frame level is preserved, but externally retained Python `gdb.Frame` objects can be invalidated: reacquire them in each `pry py exec` command. Active execution/trace bookkeeping is excluded from this refresh. After known transport loss, raw GDB permits only recovery commands (`target`, `attach`, `file`/`exec-file`, `detach`, `disconnect`) until the target is re-established.
+
+Loading or clearing an executable discards prior exit codes and retained background results. Failed loads preserve the existing context. Intentional detach/disconnect leaves `state`/`status: "not-started"` with a `detached`/`disconnected` reason, not a fabricated process exit; the detached process may still be alive. This also applies to raw GDB lifecycle commands.
 
 ### Seeing the program's output
 
@@ -271,18 +282,22 @@ Breakpoints and watchpoints share the same number space in GDB. `pry watch delet
 
 ## Memory Tracing
 
-Trace every instruction within a code range that touches a specific memory address:
+Record hardware-watchpoint hits attributed to instructions within a code range:
 
 ```bash
 pry trace --watch 0x7fffffffd5d4 --range 0x404610-0x405e30
 pry trace --watch 0x7fffffffd5d4 --watch-size 4 --range 0x404610-0x405e30 --type access --timeout 60 --max-hits 1000
 ```
 
-Uses a hardware watchpoint gated by the code range: it's armed while the PC is in `[START, END)` and disarmed outside it, and hits **accumulate across repeated passes** (e.g. every loop iteration) up to `--max-hits`. All automation runs inside GDB at native speed via `Breakpoint.stop()` callbacks — no socket round-trips for intermediate hits.
+The bridge single-steps instructions inside `[START, END)` with a hardware watchpoint enabled, and continues outside with that watchpoint disabled. It installs **persistent entry breakpoints at every decoded instruction**, so arbitrary branches into the middle and concurrent callers returning to the same address remain covered. Hits accumulate across repeated passes, and execution stops on the `--max-hits`th access rather than one access later.
 
-**Pick `START` so it lies on the execution path** (typically the loop body), or start the trace with the inferior already stopped inside the range. If execution never enters the range during the trace, nothing is recorded and the result reports `armed: false` with an explanatory `note` — that is a "the window never opened" false negative, **not** proof the address was untouched. A plain `0 hits` with `armed: true` does mean no accesses occurred in range.
+This is **instruction-stepped, not native-speed tracing**. Setup time and breakpoint storage scale with the number of decoded instructions; use tight ranges. Each step temporarily isolates the source thread through GDB's scheduler locking, which can change multithreaded timing. The target must support the requested hardware watchpoint, software entry breakpoints, and scheduler-locking operations.
 
-If `--timeout` fires before `--max-hits`, the bridge auto-interrupts and returns the partial hits collected so far — the bridge stays usable, no relaunch needed.
+Each hit's `pc`/`asm` identifies the isolated accessing instruction; `stop_pc`/`stop_asm` separately records where GDB stopped. They need not be the same, and a hardware watchpoint can trap before instruction completion on some targets. `attribution: "instruction-step"` describes the method. An unidentifiable access stops tracing with an explicit incomplete `note` and `last_unattributed`, not a guessed instruction.
+
+**Pick `START` on a valid instruction boundary in stable code.** Execution may enter at any decoded instruction in the range; it need not visit `START`. The range selects instruction start PCs, so the final instruction may extend past `END`. Decode/setup failures and observed PCs inconsistent with decoded boundaries are explicit errors. `armed: false` means no in-range instruction was stepped, not proof of no accesses elsewhere. `armed: true` with zero hits and no incomplete note means no watched hits were observed in the range.
+
+If `--timeout` fires first, the bridge interrupts and returns partial hits with `timeout_interrupt: true`. `pry interrupt` cancels an active trace even between its internal steps, waits for internal-breakpoint cleanup, and marks the trace result `interrupted: true`. The prior scheduler setting is preserved, including after normal exit. Remote loss returns an operational error rather than a successful `exited` trace; confirmed normal and signal exits retain their terminal details.
 
 Options:
 - `--watch ADDR` — memory address to watch (required)

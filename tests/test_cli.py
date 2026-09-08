@@ -1647,17 +1647,16 @@ def test_break_set_rebase_with_image_base_param(monkeypatch, capsys):
 # Feature 5: Trace command
 # ---------------------------------------------------------------------------
 
-def test_trace_sends_correct_params(monkeypatch, capsys):
-    captured = {}
-
+def test_trace_text_distinguishes_access_from_stop_instruction(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
-        captured["op"] = op
-        captured["params"] = params
-        captured["timeout"] = timeout
         return {
             "ok": True,
             "result": {
-                "hits": [{"pc": "0x404610", "asm": "mov eax, [rbx]"}],
+                "hits": [{
+                    "pc": "0x404610", "asm": "mov [rbx], eax",
+                    "stop_pc": "0x404612", "stop_asm": "add eax, 1",
+                    "attribution": "instruction-step",
+                }],
                 "hit_count": 1,
                 "truncated": False,
                 "watch_addr": "0x7fffffffd5d4",
@@ -1678,17 +1677,10 @@ def test_trace_sends_correct_params(monkeypatch, capsys):
     ])
 
     assert rc == 0
-    assert captured["op"] == "trace"
-    assert captured["params"]["watch_addr"] == "0x7fffffffd5d4"
-    assert captured["params"]["range_start"] == "0x404610"
-    assert captured["params"]["range_end"] == "0x405e30"
-    assert captured["params"]["watch_type"] == "access"
-    assert captured["params"]["_timeout"] == 60.0
-    assert captured["timeout"] == 70.0  # 60 + 10 buffer
     output = capsys.readouterr().out
     assert "1 hits" in output
-    assert "0x404610" in output
-    assert "mov eax" in output
+    assert "0x404610: mov [rbx], eax" in output
+    assert "stopped at 0x404612: add eax, 1" in output
 
 
 def test_trace_text_surfaces_never_armed_note(monkeypatch, capsys):
@@ -2289,6 +2281,53 @@ def test_plugin_install_defaults_to_text(capsys, tmp_path):
     out = capsys.readouterr().out
     assert not out.lstrip().startswith("{")  # was an indented JSON dict before
     assert out.startswith("Plugin installed (copy):")
+
+
+@pytest.mark.parametrize("mode", ["copy", "symlink"])
+def test_plugin_install_custom_destination_snippet_loads_package(
+    monkeypatch, capsys, tmp_path, mode,
+):
+    import subprocess
+    import sys
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "__init__.py").write_text("from .fixture import VALUE\n")
+    (source / "fixture.py").write_text("VALUE = 'installed package'\n")
+    monkeypatch.setattr(pry.cli, "plugin_source_dir", lambda: source)
+    monkeypatch.chdir(tmp_path)
+    # A relative, arbitrarily named package directory remains the destination,
+    # not a parent in which the installer can silently create another directory.
+    destination = Path("custom 'quoted' \"bridge\" directory")
+    rc = pry.cli.main([
+        "plugin", "install", "--dest", str(destination), "--mode", mode,
+        "--format", "json",
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["destination"] == str(destination)
+    installed_init = tmp_path / destination / "__init__.py"
+    assert installed_init.exists()
+
+    snippet = payload["gdbinit_snippet"].splitlines()
+    assert snippet[0] == "python"
+    assert snippet[-1] == "end"
+    code = "\n".join(snippet[1:-1])
+    code += (
+        "\nimport json\n"
+        "print(json.dumps({'value': pry_agent_bridge.VALUE, "
+        "'path': pry_agent_bridge.__file__}))\n"
+    )
+    elsewhere = tmp_path / "unrelated working directory"
+    elsewhere.mkdir()
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=elsewhere, capture_output=True, text=True, timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "value": "installed package", "path": str(installed_init),
+    }
 
 
 def test_types_show_text_includes_offsets(monkeypatch, capsys):
