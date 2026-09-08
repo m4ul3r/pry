@@ -82,6 +82,12 @@ def _load_bridge(monkeypatch):
             self._pc = pc
             self._older = older
             self._symbols = []
+            self._level = 0
+            if older is not None:
+                older._level = 1
+
+        def level(self):
+            return self._level
 
         def pc(self):
             return self._pc
@@ -2270,6 +2276,156 @@ def test_stop_preserves_metadata_after_gdb_invalidates_breakpoint(monkeypatch, w
             "kind": "breakpoint-hit", "number": 17, "location": "ready", "temporary": True,
         }
     assert target_reads_during_notification == []
+
+
+@pytest.mark.parametrize("operation, failing_method", [
+    ({"op": "backtrace", "params": {}}, "name"),
+    ({"op": "backtrace", "params": {"full": True}}, "block"),
+    ({"op": "frame_info", "params": {}}, "find_sal"),
+    ({"op": "locals", "params": {}}, "read_var"),
+    ({"op": "args", "params": {}}, "read_var"),
+])
+def test_remote_metadata_loss_aborts_before_reusing_frame(monkeypatch, operation, failing_method):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    connection = types.SimpleNamespace(type="remote")
+    inferior.connection = connection
+    bridge = bridge_mod.GdbBridge()
+    monkeypatch.setattr(bridge_mod, "_bridge", bridge)
+    original = fake_gdb.selected_frame()
+    lost = [False]
+    unsafe_reads = []
+
+    class Frame:
+        def __getattr__(self, name):
+            method = getattr(original, name)
+
+            def invoke(*args):
+                if lost[0]:
+                    unsafe_reads.append(name)
+                    raise RuntimeError("GDB would reinflate an invalid frame")
+                if name == failing_method:
+                    lost[0] = True
+                    inferior.connection = None
+                    inferior.pid = 0
+                    fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=connection))
+                    fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+                    raise fake_gdb.error("Remote connection closed")
+                return method(*args)
+            return invoke
+
+    frame = Frame()
+    fake_gdb.selected_frame = lambda: frame
+    fake_gdb.newest_frame = lambda: frame
+    response = bridge.dispatch(operation)
+    assert not response["ok"]
+    assert "Remote" in response["error"]
+    assert response["result"] is None
+    assert unsafe_reads == []
+
+
+def test_remote_refresh_returns_fresh_frame_without_changing_selection(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    inferior.connection = types.SimpleNamespace(type="remote")
+    bridge = bridge_mod.GdbBridge()
+    stale = [True]
+    selected_level = [1]
+    base = fake_gdb.selected_frame()
+
+    class Frame:
+        def level(self):
+            return selected_level[0]
+
+        def pc(self):
+            return 0xDEAD if stale[0] else 0x401234
+
+        def name(self):
+            return "caller" if selected_level[0] else "callee"
+
+        def find_sal(self):
+            return base.find_sal()
+
+    def execute(command, to_string=False):
+        if command == "maintenance flush register-cache":
+            stale[0] = False
+            selected_level[0] = 0
+        elif command.startswith("select-frame "):
+            selected_level[0] = int(command.split()[1])
+        return ""
+
+    fake_gdb.selected_frame = Frame
+    fake_gdb.execute = execute
+    response = bridge.dispatch({"op": "frame_info", "params": {}})
+    assert response["ok"]
+    assert response["result"]["address"] == "0x401234"
+    assert response["result"]["level"] == 1
+    assert response["result"]["function"] == "caller"
+
+
+@pytest.mark.parametrize("command", ["bt", "info registers", "x/4gx $sp", "custom-inspection"])
+def test_known_remote_loss_rejects_raw_inspection_but_allows_recovery(monkeypatch, command):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    connection = types.SimpleNamespace(type="remote")
+    inferior.connection = connection
+    bridge = bridge_mod.GdbBridge()
+    inferior.pid = 0
+    inferior.connection = None
+    fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=connection))
+    unsafe_commands = []
+
+    def execute(cmd, to_string=False):
+        if cmd == command:
+            unsafe_commands.append(cmd)
+            raise RuntimeError("GDB would use a lost target")
+        if cmd.startswith("target remote "):
+            inferior.pid = 12345
+            inferior.connection = types.SimpleNamespace(type="remote")
+        return ""
+
+    fake_gdb.execute = execute
+    response = bridge.dispatch({"op": "gdb_exec", "params": {"command": command}})
+    assert not response["ok"]
+    assert "Remote connection lost" in response["error"]
+    assert unsafe_commands == []
+    assert bridge.dispatch({"op": "gdb_exec", "params": {"command": "file /bin/new"}})["ok"]
+    assert bridge.dispatch({"op": "gdb_exec", "params": {"command": "target remote localhost:1234"}})["ok"]
+    assert bridge.dispatch({"op": "backtrace", "params": {}})["ok"]
+
+
+@pytest.mark.parametrize("active", ["finish", "trace"])
+def test_status_does_not_invalidate_inflight_execution_frames(monkeypatch, active):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior().connection = types.SimpleNamespace(type="remote")
+    bridge = bridge_mod.GdbBridge()
+    frame = fake_gdb.selected_frame()
+    valid = [True]
+    pc = frame.pc
+
+    def read_pc():
+        if not valid[0]:
+            raise fake_gdb.error("Frame invalidated while execution owns it")
+        return pc()
+
+    def execute(command, to_string=False):
+        if command == "maintenance flush register-cache":
+            valid[0] = False
+        return ""
+
+    frame.pc = read_pc
+    fake_gdb.execute = execute
+    if active == "finish":
+        bridge._execution_lock.acquire()
+    else:
+        bridge._active_trace = object()
+    try:
+        response = bridge.dispatch({"op": "status", "params": {}})
+        assert response["ok"]
+        assert response["result"]["frame"]["address"] == "0x401000"
+    finally:
+        if active == "finish":
+            bridge._execution_lock.release()
 
 
 

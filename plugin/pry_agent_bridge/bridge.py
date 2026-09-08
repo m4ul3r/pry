@@ -811,17 +811,38 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
 # Helpers for extracting GDB state
 # ---------------------------------------------------------------------------
 
+def _raise_if_remote_lost(bridge=None):
+    """Do not reuse GDB objects invalidated by transport teardown.
+
+    Missing symbols and optimized-out values remain best-effort. A remote
+    failure is different: swallowing it can leave a Frame whose next method
+    aborts GDB itself, so fallback handlers must propagate that terminal state.
+    The module singleton covers shared serializers and static value helpers.
+    """
+    if bridge is None:
+        bridge = _bridge
+    if bridge is None:
+        return
+    if bridge._remote_failure:
+        raise RuntimeError(bridge._remote_failure)
+    pending = bridge._pending_exit
+    if pending is not None and pending["remote"]:
+        raise RuntimeError("Remote inferior became unavailable during inspection")
+
+
 def _frame_to_dict(frame) -> dict[str, Any]:
     """Convert a gdb.Frame to a JSON-friendly dict."""
     result: dict[str, Any] = {}
     try:
         result["address"] = hex(frame.pc())
     except Exception:
+        _raise_if_remote_lost()
         result["address"] = None
     try:
         name = frame.name()
         result["function"] = str(name) if name is not None else None
     except Exception:
+        _raise_if_remote_lost()
         result["function"] = None
     try:
         sal = frame.find_sal()
@@ -829,6 +850,7 @@ def _frame_to_dict(frame) -> dict[str, Any]:
             result["file"] = sal.symtab.filename
             result["line"] = sal.line
     except Exception:
+        _raise_if_remote_lost()
         pass
     return result
 
@@ -845,6 +867,7 @@ def _stop_info() -> dict[str, Any]:
         frame = gdb.selected_frame()
         result["frame"] = _frame_to_dict(frame)
     except gdb.error:
+        _raise_if_remote_lost()
         result["frame"] = None
 
     try:
@@ -863,6 +886,7 @@ def _stop_info() -> dict[str, Any]:
             result["status"] = "exited"
             result["thread"] = None
     except Exception:
+        _raise_if_remote_lost()
         result["status"] = "unknown"
         result["thread"] = None
 
@@ -1083,6 +1107,7 @@ class GdbBridge:
         try:
             return str(gdb.parse_and_eval(expression))
         except Exception:
+            _raise_if_remote_lost()
             return None
 
     def _snapshot_watchpoints(self) -> None:
@@ -1378,6 +1403,10 @@ class GdbBridge:
                 lock = self._lock.read()
             def _invoke():
                 try:
+                    if op in READ_LOCKED_OPS or op in {
+                        "register_write", "thread_select", "call", "display_add", "py_exec",
+                    }:
+                        self._refresh_remote_inspection_state()
                     result = self._dispatch_op(op, params)
                     self._resolve_pending_exit()
                     if self._remote_failure and op in READ_LOCKED_OPS:
@@ -1557,6 +1586,30 @@ class GdbBridge:
             return _cancel_trace(holder["trace"])
         return holder["response"]
 
+    def _refresh_remote_inspection_state(self):
+        """Drop stale remote register/frame caches at idle request boundaries.
+
+        A Python Frame read at the previous stop can leave registers cached
+        while unwind sections are still lazy remote files. On GDB 15, losing
+        that transport while constructing the next frame can abort inside
+        frame_info_ptr::reinflate before Python can receive an exception.
+        Flushing only Frame objects is insufficient; invalidate registers too.
+        Never invalidate the frame retained by an in-flight `finish` or trace.
+        """
+        self._resolve_pending_exit()
+        _raise_if_remote_lost(self)
+        if (self._remote_connection is not None and not self._running
+                and not self._has_exited and not self._execution_lock.locked()
+                and getattr(self, "_active_trace", None) is None):
+            selected_level = None
+            try:
+                selected_level = gdb.selected_frame().level()
+            except gdb.error:
+                _raise_if_remote_lost(self)
+            gdb.execute("maintenance flush register-cache", to_string=True)
+            if selected_level:
+                gdb.execute(f"select-frame {selected_level}", to_string=True)
+
     def _execution_state(self) -> dict[str, Any]:
         """Read stopped state on GDB's thread; never infer life from a frame."""
         self._resolve_pending_exit()
@@ -1580,6 +1633,7 @@ class GdbBridge:
                 if self._last_exit_signal is not None:
                     result["reason"]["signal"] = self._last_exit_signal
             return result
+        self._refresh_remote_inspection_state()
         self._resolve_pending_stop()
         result = _stop_info()
         result["state"] = result["status"]
@@ -2182,11 +2236,13 @@ class GdbBridge:
             # clobbers a prior `pry frame select`.
             prev_frame = gdb.selected_frame()
         except Exception:
+            _raise_if_remote_lost(self)
             pass
         gdb.execute(f"thread {int(tid)}", to_string=True)
         try:
             return self._run_op(op, params)
         finally:
+            _raise_if_remote_lost(self)
             if prev is not None:
                 with contextlib.suppress(Exception):
                     prev.switch()
@@ -2366,6 +2422,7 @@ class GdbBridge:
         try:
             result["inferior_num"] = thread.inferior.num
         except Exception:
+            _raise_if_remote_lost(self)
             result["inferior_num"] = None
         try:
             result["status"] = (
@@ -2375,6 +2432,7 @@ class GdbBridge:
                 else "unknown"
             )
         except Exception:
+            _raise_if_remote_lost(self)
             result["status"] = "unknown"
 
         frame = None
@@ -2382,6 +2440,7 @@ class GdbBridge:
             thread.switch()
             frame = gdb.selected_frame()
         except Exception:
+            _raise_if_remote_lost(self)
             frame = None
         result["frame"] = _frame_to_dict(frame) if frame is not None else None
         return result
@@ -2393,6 +2452,7 @@ class GdbBridge:
         try:
             selected_thread = gdb.selected_thread()
         except Exception:
+            _raise_if_remote_lost(self)
             pass
 
         threads: list[dict[str, Any]] = []
@@ -2400,6 +2460,7 @@ class GdbBridge:
             try:
                 inf_threads = inf.threads()
             except Exception:
+                _raise_if_remote_lost(self)
                 continue
             for thread in inf_threads:
                 entry = self._thread_dict(thread, selected_thread=selected_thread)
@@ -2416,6 +2477,7 @@ class GdbBridge:
             try:
                 selected_thread.switch()
             except Exception:
+                _raise_if_remote_lost(self)
                 pass
         return threads
 
@@ -2427,6 +2489,7 @@ class GdbBridge:
         try:
             selected = gdb.selected_thread()
         except Exception:
+            _raise_if_remote_lost(self)
             selected = None
         if selected is None:
             return {"selected": num}
@@ -2810,6 +2873,7 @@ class GdbBridge:
             if frame.is_valid():
                 return None
         except Exception:
+            _raise_if_remote_lost(self)
             return None
         try:
             stripped = ret_type.strip_typedefs()
@@ -2823,6 +2887,7 @@ class GdbBridge:
             val = gdb.parse_and_eval("$rax").cast(ret_type)
             return str(val)
         except Exception:
+            _raise_if_remote_lost(self)
             return None
 
     def _until(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -3071,6 +3136,7 @@ class GdbBridge:
                                 try:
                                     val = _truncate_value(str(frame.read_var(sym)))
                                 except Exception:
+                                    _raise_if_remote_lost(self)
                                     val = "<unavailable>"
                                 local_vars.append({
                                     "name": sym.name,
@@ -3082,6 +3148,7 @@ class GdbBridge:
                         block = block.superblock
                     entry["locals"] = local_vars
                 except Exception:
+                    _raise_if_remote_lost(self)
                     entry["locals"] = []
 
             # Collect argument values for the frame
@@ -3094,6 +3161,7 @@ class GdbBridge:
                             try:
                                 val = _truncate_value(str(frame.read_var(sym)))
                             except Exception:
+                                _raise_if_remote_lost(self)
                                 val = "<unavailable>"
                             arg_list.append({"name": sym.name, "value": val})
                     if block.function is not None:
@@ -3101,12 +3169,14 @@ class GdbBridge:
                     block = block.superblock
                 entry["args"] = arg_list
             except Exception:
+                _raise_if_remote_lost(self)
                 entry["args"] = []
 
             frames.append(entry)
             try:
                 frame = frame.older()
             except gdb.error:
+                _raise_if_remote_lost(self)
                 break
             level += 1
         return frames
@@ -3114,16 +3184,7 @@ class GdbBridge:
     def _frame_info(self, params: dict[str, Any]) -> dict[str, Any]:
         frame = gdb.selected_frame()
         result = _frame_to_dict(frame)
-        # Find the level by walking from newest
-        level = 0
-        try:
-            f = gdb.newest_frame()
-            while f is not None and f != frame:
-                f = f.older()
-                level += 1
-        except gdb.error:
-            pass
-        result["level"] = level
+        result["level"] = frame.level()
         return result
 
     def _frame_select(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -3152,6 +3213,7 @@ class GdbBridge:
                         try:
                             val = _truncate_value(str(frame.read_var(sym)))
                         except Exception:
+                            _raise_if_remote_lost(self)
                             val = "<unavailable>"
                         entry: dict[str, Any] = {
                             "name": sym.name,
@@ -3160,12 +3222,14 @@ class GdbBridge:
                         try:
                             entry["type"] = str(sym.type)
                         except Exception:
+                            _raise_if_remote_lost(self)
                             pass
                         result.append(entry)
                 if block.function is not None:
                     break
                 block = block.superblock
         except Exception:
+            _raise_if_remote_lost(self)
             pass
         return result
 
@@ -3180,6 +3244,7 @@ class GdbBridge:
                         try:
                             val = _truncate_value(str(frame.read_var(sym)))
                         except Exception:
+                            _raise_if_remote_lost(self)
                             val = "<unavailable>"
                         entry: dict[str, Any] = {
                             "name": sym.name,
@@ -3188,12 +3253,14 @@ class GdbBridge:
                         try:
                             entry["type"] = str(sym.type)
                         except Exception:
+                            _raise_if_remote_lost(self)
                             pass
                         result.append(entry)
                 if block.function is not None:
                     break
                 block = block.superblock
         except Exception:
+            _raise_if_remote_lost(self)
             pass
         return result
 
@@ -3224,6 +3291,7 @@ class GdbBridge:
             try:
                 rendered = val.format_string(format=fmt)
             except Exception:
+                _raise_if_remote_lost(self)
                 rendered = str(val)
         else:
             rendered = str(val)
@@ -3231,6 +3299,7 @@ class GdbBridge:
         try:
             result["type"] = str(val.type)
         except Exception:
+            _raise_if_remote_lost(self)
             pass
         # Without a live inferior, a variable read comes from the static image
         # (e.g. a global's initializer), which can silently contradict the
@@ -3257,6 +3326,7 @@ class GdbBridge:
         try:
             result["type"] = str(val.type)
         except Exception:
+            _raise_if_remote_lost(self)
             pass
         return result
 
@@ -3622,6 +3692,7 @@ class GdbBridge:
                 val = gdb.parse_and_eval(d["expr"])
                 entry["value"] = val.format_string(format=fmt) if fmt else str(val)
             except Exception as exc:
+                _raise_if_remote_lost(self)
                 # Surface *why* it couldn't be evaluated (typically out of scope
                 # in the current frame) instead of a bare "<error>", so an agent
                 # can tell an out-of-frame display from a typo.
@@ -3807,6 +3878,10 @@ class GdbBridge:
             "target".startswith(head) or "attach".startswith(head)
         )
         self._resolve_pending_exit()
+        if self._remote_failure and not (disconnect or load or connect):
+            raise RuntimeError(self._remote_failure)
+        if not (disconnect or load or connect):
+            self._refresh_remote_inspection_state()
         self._disconnecting = disconnect
         self._changing_executable = True
         try:
