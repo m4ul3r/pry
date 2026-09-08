@@ -310,6 +310,7 @@ def _load_bridge(monkeypatch):
     fake_gdb.events = types.SimpleNamespace(
         stop=_stop_registry, exited=_exited_registry,
         cont=_FakeEventRegistry(), connection_removed=_FakeEventRegistry(),
+        executable_changed=_FakeEventRegistry(),
     )
     fake_gdb.BreakpointEvent = _FakeBreakpointEvent
     fake_gdb.SignalEvent = _FakeSignalEvent
@@ -1955,6 +1956,278 @@ def test_local_signal_exit_is_not_remote_failure(monkeypatch):
     assert response["result"]["reason"] == {"kind": "exited", "code": None, "signal": 9}
 
 
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("operation", [
+    {"op": "load", "params": {"path": "/bin/new"}},
+    {"op": "gdb_exec", "params": {"command": "file /bin/new"}},
+    {"op": "gdb_exec", "params": {"command": "file"}},
+    {"op": "gdb_exec", "params": {"command": "fil /bin/new"}},
+    {"op": "gdb_exec", "params": {"command": "exec-file /bin/new"}},
+    {"op": "gdb_exec", "params": {"command": "reload-alias"}},
+])
+def test_new_executable_discards_previous_execution(monkeypatch, background, operation):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    bridge = bridge_mod.GdbBridge()
+
+    def execute(cmd, to_string=False):
+        if cmd == "continue":
+            inferior.pid = 0
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(23))
+        elif cmd == "reload-alias":
+            fake_gdb.events.executable_changed.fire(types.SimpleNamespace(progspace=inferior.progspace))
+        return ""
+
+    fake_gdb.execute = execute
+    assert bridge.dispatch({"op": "continue", "params": {"_background": background}})["ok"]
+    assert bridge.dispatch(operation)["ok"]
+    for op in ("status", "wait", "interrupt"):
+        response = bridge.dispatch({"op": op, "params": {}})
+        assert response["ok"]
+        assert response["result"]["state"] == "not-started"
+        assert "reason" not in response["result"]
+        assert "last_background_result" not in response["result"]
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("changed_event", [False, True])
+def test_failed_file_keeps_exit_history(monkeypatch, background, changed_event):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    bridge = bridge_mod.GdbBridge()
+
+    def execute(cmd, to_string=False):
+        if cmd == "continue":
+            inferior.pid = 0
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(23))
+        elif cmd.startswith("file "):
+            if changed_event:
+                fake_gdb.events.executable_changed.fire(types.SimpleNamespace(progspace=inferior.progspace))
+            raise fake_gdb.error("Cannot open executable")
+        return ""
+
+    fake_gdb.execute = execute
+    bridge.dispatch({"op": "continue", "params": {"_background": background}})
+    assert not bridge.dispatch({"op": "load", "params": {"path": "/missing"}})["ok"]
+    for op in ("wait", "status"):
+        response = bridge.dispatch({"op": op, "params": {}})
+        assert response["ok"]
+        assert response["result"]["reason"] == {"kind": "exited", "code": 23}
+
+
+def test_file_change_does_not_rewrite_existing_waiter_job(monkeypatch):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    bridge = bridge_mod.GdbBridge()
+    bridge.dispatch({"op": "continue", "params": {"_background": True}})
+    completion = bridge._background_job["completion"]
+
+    def finish_and_load(timeout=None):
+        inferior.pid = 0
+        fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(23))
+        assert bridge.dispatch({"op": "load", "params": {"path": "/bin/new"}})["ok"]
+        return True
+
+    monkeypatch.setattr(completion, "wait", finish_and_load)
+    result = bridge.dispatch({"op": "wait", "params": {}})
+    assert result["result"]["reason"] == {"kind": "exited", "code": 23}
+    assert bridge.dispatch({"op": "wait", "params": {}})["result"]["state"] == "not-started"
+
+
+@pytest.mark.parametrize("command,reason", [
+    (None, "disconnected"), ("disconnect", "disconnected"),
+    ("disco", "disconnected"), ("detach", "detached"), ("det", "detached"),
+])
+@pytest.mark.parametrize("removed_first", [False, True])
+def test_intentional_remote_disconnect_and_recovery(monkeypatch, command, reason, removed_first):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    connection = types.SimpleNamespace(type="remote")
+    inferior.connection = connection
+    bridge = bridge_mod.GdbBridge()
+
+    def execute(cmd, to_string=False):
+        if cmd.startswith(("det", "disco")):
+            inferior.pid = 0
+            inferior.connection = None
+            if removed_first:
+                fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=connection))
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+            if not removed_first:
+                fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=connection))
+        elif cmd.startswith("tar rem "):
+            inferior.pid = 12345
+            inferior.connection = types.SimpleNamespace(type="remote")
+        return ""
+
+    fake_gdb.execute = execute
+    operation = ({"op": "disconnect", "params": {}} if command is None else
+                 {"op": "gdb_exec", "params": {"command": command}})
+    assert bridge.dispatch(operation)["ok"]
+    for op in ("status", "wait", "interrupt"):
+        response = bridge.dispatch({"op": op, "params": {}})
+        assert response["ok"]
+        assert response["result"]["state"] == "not-started"
+        assert response["result"]["reason"] == {"kind": reason}
+    assert bridge.dispatch({"op": "gdb_exec", "params": {"command": "tar rem localhost:1234"}})["ok"]
+    assert bridge.dispatch({"op": "status", "params": {}})["result"]["state"] == "stopped"
+    assert bridge.dispatch({"op": "backtrace", "params": {}})["ok"]
+
+
+@pytest.mark.parametrize("command", ["f", "dis", "t"])
+def test_non_lifecycle_gdb_alias_preserves_exit(monkeypatch, command):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior().pid = 0
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(23))
+    bridge.dispatch({"op": "gdb_exec", "params": {"command": command}})
+    assert bridge.dispatch({"op": "status", "params": {}})["result"]["exit_code"] == 23
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_failed_continue_hint_uses_actual_inferior_state(monkeypatch, background):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior().pid = 0
+    bridge = bridge_mod.GdbBridge()
+
+    def execute(cmd, to_string=False):
+        if cmd == "continue":
+            raise fake_gdb.error("The program is not being run.")
+        return ""
+
+    fake_gdb.execute = execute
+    response = bridge.dispatch({"op": "continue", "params": {"_background": background}})
+    assert not response["ok"]
+    assert "not running" in response["error"]
+    assert "pry run" in response["error"]
+    assert "interrupt" not in response["error"]
+    assert "pry wait" not in response["error"]
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_idle_remote_loss_never_reenters_gdb_from_exit_or_socket_thread(monkeypatch, raw):
+    import queue
+    import threading
+
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    connection = types.SimpleNamespace(type="remote")
+    inferior.connection = connection
+    bridge = bridge_mod.GdbBridge()
+    callbacks = queue.Queue()
+    fake_gdb.post_event = callbacks.put
+    main_thread = threading.get_ident()
+    in_teardown = [False]
+    unsafe_calls = []
+
+    def guard():
+        if in_teardown[0] or threading.get_ident() != main_thread:
+            unsafe_calls.append((in_teardown[0], threading.get_ident()))
+
+    def selected_inferior():
+        guard()
+        return inferior
+
+    def convenience_variable(name):
+        guard()
+        return None
+
+    def lost_frame():
+        guard()
+        in_teardown[0] = True
+        try:
+            fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+            inferior.pid = 0
+            inferior.connection = None
+            fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=connection))
+        finally:
+            in_teardown[0] = False
+        raise fake_gdb.error("No registers.")
+
+    fake_gdb.selected_inferior = selected_inferior
+    fake_gdb.convenience_variable = convenience_variable
+    fake_gdb.newest_frame = lost_frame
+    fake_gdb.execute = lambda cmd, to_string=False: lost_frame()
+    response = []
+    operation = ({"op": "gdb_exec", "params": {"command": "bt"}} if raw else
+                 {"op": "backtrace", "params": {}})
+    worker = threading.Thread(target=lambda: response.append(bridge.dispatch(operation)))
+    worker.start()
+    callbacks.get(timeout=2)()
+    while not callbacks.empty():
+        callbacks.get_nowait()()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert not response[0]["ok"]
+    assert "Remote" in response[0]["error"]
+    assert unsafe_calls == []
+
+
+
+@pytest.mark.parametrize("terminal", ["lost", "normal", "signal"])
+@pytest.mark.parametrize("removed_first", [False, True])
+@pytest.mark.parametrize("command_error", [False, True])
+def test_deferred_terminal_resolution_preserves_exit_evidence(
+    monkeypatch, terminal, removed_first, command_error,
+):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    inferior = fake_gdb.selected_inferior()
+    connection = types.SimpleNamespace(type="remote")
+    inferior.connection = connection
+    bridge = bridge_mod.GdbBridge()
+    pending = []
+    fake_gdb.post_event = pending.append
+    in_command = [False]
+    unsafe_reads = []
+    original_convenience = fake_gdb.convenience_variable
+
+    def convenience_variable(name):
+        if in_command[0]:
+            unsafe_reads.append(name)
+        return original_convenience(name)
+
+    def execute(cmd, to_string=False):
+        if cmd != "continue":
+            return ""
+        in_command[0] = True
+        try:
+            if terminal == "signal":
+                fake_gdb.set_convenience_variable("_exitsignal", 15)
+            if removed_first:
+                fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=connection))
+            fake_gdb.events.exited.fire(
+                fake_gdb._FakeExitedEvent(7 if terminal == "normal" else None)
+            )
+            inferior.pid = 0
+            inferior.connection = None
+            if not removed_first:
+                fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=connection))
+            if command_error:
+                raise fake_gdb.error("command failed after terminal notification")
+        finally:
+            in_command[0] = False
+        return ""
+
+    fake_gdb.convenience_variable = convenience_variable
+    fake_gdb.execute = execute
+    bridge.dispatch({"op": "continue", "params": {"_background": True}})
+    while pending:
+        pending.pop(0)()
+    response = bridge.dispatch({"op": "wait", "params": {"_timeout": 0}})
+    assert unsafe_reads == []
+    if terminal == "lost":
+        assert not response["ok"]
+        assert "Remote" in response["error"]
+    elif command_error:
+        assert not response["ok"]
+        assert "command failed after terminal notification" in response["error"]
+    else:
+        assert response["ok"]
+        assert response["result"]["state"] == "exited"
+        reason = response["result"]["reason"]
+        assert reason == ({"kind": "exited", "code": 7} if terminal == "normal" else
+                          {"kind": "exited", "code": None, "signal": 15})
+
 
 # ---------------------------------------------------------------------------
 # Feature 4: PIE address rebasing
@@ -2205,20 +2478,6 @@ def test_disasm_explicit_count_is_not_clamped(monkeypatch):
     assert all(e["asm"] == "nop" for e in result)  # the arch fast path, not disassemble
 
 
-def test_is_bare_symbol_name(monkeypatch):
-    bridge_mod, _ = _load_bridge(monkeypatch)
-    f = bridge_mod.GdbBridge._is_bare_symbol_name
-    assert f("main") is True
-    assert f("crash_path") is True
-    assert f("_start") is True
-    assert f("0x401000") is False      # address
-    assert f("$pc") is False           # register
-    assert f("*0x401000") is False     # deref expression
-    assert f("main,+8") is False       # start,+len range
-    assert f("a.c:42") is False        # file:line
-    assert f("Animal::speak") is False # qualified name (falls back to count path)
-    assert f("42") is False            # bare line number
-    assert f("") is False
 
 
 @pytest.mark.parametrize("gdb_msg", ["No registers.", "No stack."])
