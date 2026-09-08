@@ -1411,9 +1411,12 @@ def _plugin_install(args: argparse.Namespace) -> int:
 
     gdbinit_snippet = (
         "python\n"
-        "import sys\n"
-        f"sys.path.insert(0, {str(dest.parent)!r})\n"
-        "import pry_agent_bridge\n"
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location("
+        f"'pry_agent_bridge', {str(dest.absolute() / '__init__.py')!r})\n"
+        "pry_agent_bridge = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['pry_agent_bridge'] = pry_agent_bridge\n"
+        "spec.loader.exec_module(pry_agent_bridge)\n"
         "end\n"
     )
 
@@ -1677,12 +1680,9 @@ def _launch(args: argparse.Namespace) -> int:
     bridge_ex = (
         f"python import sys; sys.path.insert(0, {str(plugin_parent)!r}); import pry_agent_bridge"
     )
-    # Disable GDB's default behaviour of spawning the inferior via /bin/sh.
-    # Programmatic debuggers want byte-precise argv: shell-routing mangles
-    # quotes, backslashes, NULs, etc., and the inferior may never reach
-    # the entry point (e.g. /bin/sh -c with unmatched quote → exit 1).
-    # Anyone needing shell expansion can `set startup-with-shell on` from
-    # their own session.
+    # Keep raw GDB passthrough free of implicit shell expansion. The bridge's
+    # `run` operation temporarily enables a safely quoted POSIX-shell launch
+    # to preserve argv on GDB versions whose no-shell parser splits whitespace.
     shell_off_ex = "set startup-with-shell off"
     gdb_cmd.extend(["-ex", shell_off_ex, "-ex", keepalive_ex, "-ex", bridge_ex])
 
@@ -2846,6 +2846,10 @@ def _render_trace_text(value: Any) -> str:
     lines = [f"trace: {hit_count} hits on {watch} in range {rng}"]
     if value.get("truncated"):
         lines.append("warning: hit limit reached, trace may be incomplete")
+    if value.get("timeout_interrupt"):
+        lines.append("warning: trace timeout reached; results are partial")
+    if value.get("interrupted"):
+        lines.append("warning: trace interrupted; results are partial")
     note = value.get("note")
     if note:
         lines.append(f"warning: {note}")
@@ -2853,6 +2857,9 @@ def _render_trace_text(value: Any) -> str:
         pc = h.get("pc", "?")
         asm = h.get("asm", "?")
         lines.append(f"  {pc}: {asm}")
+        stop_pc = h.get("stop_pc")
+        if stop_pc and stop_pc != pc:
+            lines.append(f"    stopped at {stop_pc}: {h.get('stop_asm', '?')}")
     stop = value.get("stop_info")
     if isinstance(stop, dict):
         status = stop.get("status", "unknown")
@@ -3454,7 +3461,12 @@ def build_parser() -> argparse.ArgumentParser:
     kbase_cmd.set_defaults(handler=_kbase)
 
     # --- trace ---
-    trace_cmd = subparsers.add_parser("trace", help="Trace memory accesses within a code range")
+    trace_cmd = subparsers.add_parser(
+        "trace", help="Trace memory accesses within a code range",
+        description="Attribute hardware-watchpoint hits by single-stepping instructions "
+                    "inside the range. Slower than free-running execution; "
+                    "source-thread isolation can affect multithreaded timing.",
+    )
     _common_io_options(trace_cmd)
     _add_timeout_arg(trace_cmd)
     trace_cmd.add_argument("--watch", required=True, metavar="ADDR",
@@ -3463,10 +3475,10 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Number of bytes to watch (default: 4)")
     trace_cmd.add_argument("--range", required=True, metavar="START-END",
                            help="Code range that gates recording (e.g., 0x404610-0x405e30): "
-                                "the watch is active only while the PC is in [START, END). START "
-                                "must lie on the execution path (e.g. inside the loop body) — or "
-                                "the inferior must already be stopped inside the range — or nothing "
-                                "is recorded (the result reports armed=false)")
+                                "instruction start PCs must be in [START, END). START must be an "
+                                "instruction boundary in stable code. Persistent entry breakpoints "
+                                "cover every decoded instruction, including arbitrary branch re-entry. "
+                                "Setup/storage scale with instruction count; prefer tight ranges")
     trace_cmd.add_argument("--type", choices=("write", "read", "access"), default="access",
                            dest="watch_type", help="Watch type (default: access)")
     trace_cmd.add_argument("--max-hits", type=_positive_int, default=10000, metavar="N",

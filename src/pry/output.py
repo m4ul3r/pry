@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,11 +64,25 @@ def _summary(value: Any) -> dict[str, Any]:
     return {"kind": type(value).__name__}
 
 
-def _spill_path(stem: str, suffix: str) -> Path:
+def _write_spill(stem: str, suffix: str, encoded: bytes) -> Path:
     now = datetime.now(timezone.utc)
     directory = spill_root() / now.strftime("%Y%m%d")
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
+    artifact_file = tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix=f"{stem}-{now.strftime('%H%M%S')}-",
+        suffix=suffix,
+        dir=directory,
+        delete=False,
+    )
+    path = Path(artifact_file.name)
+    try:
+        with artifact_file:
+            artifact_file.write(encoded)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 @functools.cache
@@ -84,7 +99,6 @@ def _artifact_payload(
     value: Any,
 ) -> dict[str, Any]:
     return {
-        "ok": True,
         "artifact_path": str(artifact_path),
         "format": fmt,
         "bytes": len(encoded),
@@ -131,8 +145,7 @@ def write_output_result(
         return OutputWriteResult(rendered=rendered)
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
-    spill_path = _spill_path(stem, suffix)
-    spill_path.write_bytes(encoded)
+    spill_path = _write_spill(stem, suffix, encoded)
     artifact = _artifact_payload(
         artifact_path=spill_path,
         fmt=fmt,
