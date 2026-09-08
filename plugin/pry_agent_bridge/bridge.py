@@ -3326,16 +3326,12 @@ class GdbBridge:
         if count is not None and count <= 0:
             return []
 
-        # A bare function/symbol name with no --count (and no range) means
-        # "disassemble this whole function". Defer to GDB's `disassemble <fn>`,
-        # which stops at the function's real end. The fixed-count architecture
-        # path below would otherwise run a default 20 instructions straight past
-        # `ret` into the following function(s), annotating the overflow with the
-        # next symbol so it looks legitimate. (--source already routes through
-        # GDB's `disassemble /s`, so it was never affected.)
-        if count is None and location and self._is_bare_symbol_name(location):
+        # No count on a function name means its complete extent, including
+        # qualified C++ names whose spaces/operators are not address syntax.
+        function = self._function_designator(location) if count is None and location else None
+        if function is not None:
             parsed = _parse_disassemble_output(
-                gdb.execute(f"disassemble {location}", to_string=True)
+                gdb.execute(f"disassemble {function}", to_string=True)
             )
             if parsed:
                 return parsed
@@ -3538,25 +3534,24 @@ class GdbBridge:
         return not loc.lstrip("+-").isdigit()
 
     @staticmethod
-    def _is_bare_symbol_name(loc: str) -> bool:
-        """True for a plain function/symbol name (``main``, ``crash_path``),
-        as opposed to an address (``0x401000``), register (``$pc``), ``*expr``,
-        a file:line, a range (``a,b`` / ``a,+n``), or a bare number/offset.
-
-        Used to decide when a no-``--count`` ``disasm`` should cover the whole
-        function (like GDB's ``disassemble <fn>``) rather than a fixed
-        instruction count that would bleed past ``ret`` into the next function.
-        """
-        loc = loc.strip()
-        if not loc:
-            return False
-        # Must start like an identifier; this rejects 0x.. addresses, $regs,
-        # *deref, numbers, and +/-offsets in one shot.
-        if loc[0] != "_" and not loc[0].isalpha():
-            return False
-        # Reject anything carrying a separator that makes it a range / file:line
-        # / qualified or dotted expression rather than a single bare name.
-        return not any(c in loc for c in ":,. \t")
+    def _function_designator(loc: str) -> str | None:
+        """Return a GDB function designator, not an address/range expression."""
+        name = loc.strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
+            return name
+        # Resolve the entire name as a quoted symbol. Parsing the unquoted
+        # spelling would interpret operator/template punctuation as an
+        # expression, and could even call a function rather than name it.
+        quoted = name if name.startswith("'") and name.endswith("'") else (
+            "'" + name.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        )
+        try:
+            value_type = gdb.parse_and_eval(quoted).type.strip_typedefs()
+            if value_type.code in (gdb.TYPE_CODE_FUNC, gdb.TYPE_CODE_METHOD):
+                return quoted
+        except (gdb.error, AttributeError):
+            pass
+        return None
 
     def _function_line_range(self, name: str):
         """Resolve a function name to (filename, start_line, end_line), or None.

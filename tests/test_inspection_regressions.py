@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from tests.test_bridge import _load_bridge
 
 
@@ -75,3 +79,39 @@ def test_range_disassembly_preserves_each_function_symbol(monkeypatch):
     )
     assert [row["symbol"] for row in result] == ["Box<int>::call()+4", "second+0"]
     assert result[0]["asm"] == "call 0x402000 <Box<int>::get()>"
+
+
+@pytest.mark.parametrize("name", ["Box::operator+(Box const&) const", "Pair<int, long>::get() const"])
+def test_qualified_function_disassembly_stops_before_neighbor(monkeypatch, name):
+    bridge_mod, gdb = _load_bridge(monkeypatch)
+    execute = gdb.execute
+    parse = gdb.parse_and_eval
+    monkeypatch.setattr(gdb, "TYPE_CODE_FUNC", 7, raising=False)
+    monkeypatch.setattr(gdb, "TYPE_CODE_METHOD", 16, raising=False)
+    function_type = SimpleNamespace(code=7)
+    function_type.strip_typedefs = lambda: function_type
+    value = SimpleNamespace(type=function_type, address=0x401000)
+
+    def evaluate(expression):
+        if expression in (name, f"'{name}'"):
+            return value
+        return parse(expression)
+
+    def disassemble(command, to_string=False):
+        if command == f"disassemble '{name}'":
+            return (
+                f"Dump of assembler code for function {name}:\n"
+                "   0x00401000 <+0>:\tmov %edi,%eax\n"
+                "   0x00401004 <+4>:\tret\n"
+                "End of assembler dump.\n"
+            )
+        return execute(command, to_string=to_string)
+
+    monkeypatch.setattr(gdb, "parse_and_eval", evaluate)
+    monkeypatch.setattr(gdb, "execute", disassemble)
+    bridge = bridge_mod.GdbBridge()
+    whole = bridge._dispatch_op("disasm", {"location": name})
+    assert [row["address"] for row in whole] == ["0x401000", "0x401004"]
+    assert whole[-1]["asm"] == "ret"
+    counted = bridge._dispatch_op("disasm", {"location": name, "count": 3})
+    assert [row["address"] for row in counted] == ["0x401000", "0x401004", "0x401008"]
