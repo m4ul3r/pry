@@ -1636,6 +1636,54 @@ def test_kbase_vbar_reports_unstopped_target(monkeypatch):
 # Feature 1: Lock-free interrupt
 # ---------------------------------------------------------------------------
 
+def test_interrupt_bypasses_exec_ops(monkeypatch):
+    """Public interrupt stops a running inferior while execution holds both locks."""
+    from threading import Event, Thread
+
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    running = True
+    for thread in fake_gdb.selected_inferior().threads():
+        monkeypatch.setattr(thread, "is_running", lambda: running)
+        monkeypatch.setattr(thread, "is_stopped", lambda: not running)
+    fake_gdb.events.cont.fire(None)
+    original_execute = fake_gdb.execute
+
+    def execute(cmd, to_string=False):
+        nonlocal running
+        if cmd.strip() == "interrupt":
+            running = False
+            fake_gdb.events.stop.fire(fake_gdb._FakeSignalEvent("SIGINT"))
+        return original_execute(cmd, to_string=to_string)
+
+    monkeypatch.setattr(fake_gdb, "execute", execute)
+    assert bridge.dispatch({"op": "status"})["result"]["status"] == "running"
+    completed = Event()
+    responses = []
+
+    def interrupt():
+        try:
+            responses.append(bridge.dispatch({"op": "interrupt"}))
+        finally:
+            completed.set()
+
+    worker = Thread(target=interrupt, daemon=True)
+    try:
+        with bridge._lock.write(), bridge._execution_lock:
+            worker.start()
+            assert completed.wait(2), "interrupt waited for the execution locks"
+            response = responses[0]
+            assert response["ok"] is True, response
+            assert response["result"]["interrupted"] is True
+            assert response["result"]["stopped"] is True
+            assert response["result"]["reason"] == {"kind": "signal", "signal": "SIGINT"}
+    finally:
+        # Release held locks before joining, including when a regression blocks dispatch.
+        worker.join(timeout=12)
+    assert not worker.is_alive()
+    assert bridge.dispatch({"op": "status"})["result"]["status"] == "stopped"
+
+
 def test_interrupt_when_idle_is_noop(monkeypatch):
     """interrupt on a stopped/exited inferior reports rather than lying."""
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
