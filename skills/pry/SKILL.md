@@ -186,6 +186,8 @@ Execution commands block until the inferior stops or exits. Use `--timeout N` to
 
 `pry status` reports `running`, `stopped`, `exited`, or `not-started`; `state` and `status` agree. `wait` returns the same terminal state rather than calling an exited inferior stopped. Once GDB reports a remote transport loss, execution, status/wait, and inspection return an operational error until reconnect/attach succeeds. A normal exit or confirmed signal termination remains a successful debugger operation. GDB may retain cached frames before it observes the loss; cached data alone cannot establish remote liveness.
 
+Idle remote inspection refreshes GDB's register/frame caches before reading target state. This prevents the observed GDB 15 native abort when stale registers meet a failed lazy unwind-data fetch; it is not a separate liveness-probe packet. The selected frame level is preserved, but externally retained Python `gdb.Frame` objects can be invalidated: reacquire them in each `pry py exec` command. Active execution/trace bookkeeping is excluded from this refresh. After known transport loss, raw GDB permits only recovery commands (`target`, `attach`, `file`/`exec-file`, `detach`, `disconnect`) until the target is re-established.
+
 Loading or clearing an executable discards prior exit codes and retained background results. Failed loads preserve the existing context. Intentional detach/disconnect leaves `state`/`status: "not-started"` with a `detached`/`disconnected` reason, not a fabricated process exit; the detached process may still be alive. This also applies to raw GDB lifecycle commands.
 
 ### Seeing the program's output

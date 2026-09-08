@@ -100,6 +100,8 @@ Every command accepts `--format [text|json|ndjson]`, `--out <path>`, and `--inst
 
 Some `gdbserver` builds ignore the HOST in `127.0.0.1:PORT` and bind all interfaces. Verify the listener with `ss -ltnp`; use stdio or an isolated/verified loopback-only transport rather than assuming HOST restricts access. Once GDB observes transport loss, pry returns an operational error until reconnect instead of reporting successful execution or serving known-stale inspection data.
 
+Idle remote inspection refreshes GDB's register/frame caches to avoid GDB 15's stale-cache abort during lazy unwind-data fetching. Frame selection is preserved, but Python scripts must reacquire `gdb.Frame` objects after another command. Once transport loss is known, raw GDB commands are restricted to target-recovery operations.
+
 ### Execution control
 
 All execution commands block until the inferior stops or exits, returning structured stop info (reason, frame, thread). Use `--timeout N` to auto-interrupt after N seconds. Use `--background` to return immediately while the inferior keeps running.
