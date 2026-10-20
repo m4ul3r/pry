@@ -4,15 +4,14 @@ pwndbg is a GDB plugin loaded alongside the pry bridge. All pwndbg commands are 
 
 ### KASLR / Kernel Symbols
 
-When connected to a QEMU kernel with KASLR enabled, vmlinux symbols are at link-time addresses and won't match the running kernel. **Use `pry load --base` to rebase them — do NOT pre-load symbols and then `kbase -r`** (see the pitfall below).
+When connected to a QEMU kernel with KASLR enabled, vmlinux symbols are at link-time addresses and won't match the running kernel. **Use `pry kbase` (or `pry load --base`) to rebase them — do NOT `kbase -r`** (see the pitfall below).
 
-**Recommended KASLR workflow** (verified: both function *and* data symbols resolve):
+**Recommended KASLR workflow** (verified: function, data *and* per-CPU symbols resolve):
 ```bash
-pry launch --connect localhost:1234   # connect WITHOUT --symbols (no link-time copy)
-                                      # (with qmu: `qmu gdb --vm <id>` and DON'T pass --symbols)
-pry kbase                             # preferred over `pry gdb kbase` — has IDT fallback
-pry load ./vmlinux --base 0x<kbase> --src /path/to/linux-src --gdb-scripts
-# one clean copy; offsets ALL sections; maps source; sources vmlinux-gdb.py (lx-*)
+pry launch --symbols ./vmlinux --connect localhost:1234   # link-time copy is fine: kbase replaces it
+                                      # (with qmu: `qmu gdb --vm <id> --symbols ./vmlinux`)
+pry kbase                             # validated base; rebases the loaded vmlinux in place
+pry load ./vmlinux --base 0x<kbase> --src /path/to/linux-src --gdb-scripts   # only for --src/--gdb-scripts
 pry break set commit_creds            # symbol breakpoints, print, disasm now resolve correctly
 pry print "init_task.comm"            # data symbols work too
 pry source list commit_creds          # needs --src when DWARF paths are relative / under /src
@@ -20,12 +19,15 @@ pry gdb 'p $lx_current()->pid'        # needs --gdb-scripts (Linux lx helpers)
 pry continue
 ```
 
-`pry load --base` reads vmlinux's link-time `.text` address, computes `slide = base - .text`, and runs `add-symbol-file vmlinux -o <slide>` after dropping any prior copy — so there is exactly one symbol table and every section (text + data) lands at its runtime address.
+`pry load --base` reads vmlinux's link-time `_text`, computes `slide = base - _text`, and runs `add-symbol-file vmlinux -o <slide>` after dropping any prior copy — so there is exactly one symbol table and every image section (text + data) lands at its runtime address. Zero-based per-CPU sections (`.data..percpu` on x86-64 6.x) are pinned at their link address with `-s .data..percpu 0x0`: they hold per-CPU offsets (kallsyms lists them as `A`), which KASLR does not move.
 
-**Prefer `pry kbase` over `pry gdb kbase`.** The first-class command returns structured `{base, method, ...}` and hard-fails (non-zero) when discovery fails. Method chain:
+**Prefer `pry kbase` over `pry gdb kbase`.** The first-class command reports a base only after validating it against the kernel's symbol file (the loaded one, or `--symbols PATH`): the guest's `linux_banner` bytes at its link address plus the slide must equal the file's. Otherwise it exits 1 (`could not determine the kernel base`) with the unvalidated hints. Candidates:
 
-1. **pwndbg** — same as `pry gdb kbase`. On x86-64 it reads the IDT, parses entry 0 for a `.text` address, then walks page tables (gdb-pt-dump / `kernel-vmmap page-tables`) to find the mapping base. On AArch64 it uses VBAR_EL1.
-2. **IDT fallback (pry-owned)** — if pwndbg fails, pry reads IDTR via QEMU `monitor info registers` (or GDB `idtr`), reads IDT[0] through the **remote** target memory API (`inferior.read_memory` — not host `/proc/$qemu/mem`), then rounds the handler down to the 2 MiB KASLR alignment (exact for the IDT[0] path, which sits within the first alignment window of `_text`).
+1. **IDT[0] / VBAR through the symbol table (pry-owned)** — pry reads IDTR via QEMU `monitor info registers` (or GDB `idtr`) and IDT[0] through the **remote** target memory API (not host `/proc/$qemu/mem`), or VBAR on arm64, and subtracts the handler symbol's link-time offset from `_text` (`asm_exc_divide_error`/`divide_error`, `vectors`). Exact on every layout.
+2. **pwndbg** — same as `pry gdb kbase`: walks the guest page tables (gdb-pt-dump / `kernel-vmmap page-tables`).
+3. **The handler rounded down to 2 MiB** — an upper bound only: on x86-64 5.11–6.6 `.entry.text` sits 14–24 MiB above `_text`, where this lands on `int3` padding.
+
+When the validated slide differs from the loaded vmlinux's, `pry kbase` rebases it (`apply.applied`); a `--symbols` file that is not loaded gets the `pry load ... --base ...` command instead.
 
 **Yama / ptrace footgun:** pwndbg's page-table walk needs host ptrace of QEMU's `/proc/$pid/mem`. With `kernel.yama.ptrace_scope=1` (default on many distros) and GDB **not** an ancestor of QEMU (the common `qmu`/shell spawns QEMU, `pry launch` spawns separate GDB layout), that read is denied and raw `pry gdb kbase` prints `Permission error when attempting to parse page tables...` / `Unable to locate the kernel base`. `pry kbase`'s IDT path does **not** need host ptrace of QEMU — only the remote GDB stub.
 
@@ -34,7 +36,7 @@ pry continue
 ### Kernel Inspection
 
 ```bash
-pry kbase                             # Kernel virtual base (prefer this; IDT fallback without host ptrace)
+pry kbase                             # Validated kernel base; rebases the loaded vmlinux (IDT/VBAR without host ptrace)
 pry gdb kbase                         # Raw pwndbg only (no pry IDT fallback)
 pry gdb "klookup commit_creds"        # Symbol lookup via in-memory kallsyms (no debug syms needed)
 pry gdb "klookup 0xffffffff81234567"  # Reverse lookup: address → symbol name

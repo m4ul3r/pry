@@ -84,17 +84,20 @@ pry break set commit_creds          # Set kernel breakpoint
 pry continue                        # Continue execution
 ```
 
-> **KASLR kernels:** loading vmlinux at its link-time base (via `--symbols`/`pry load`) leaves symbols at the wrong addresses, so `pry break set <fn>` / `pry print <global>` won't resolve. Connect **without** symbols, read the base, then rebase in one clean step:
+> **KASLR kernels:** a vmlinux loaded at its link-time base (via `--symbols`/`pry load`) leaves symbols at the wrong addresses, so `pry break set <fn>` / `pry print <global>` won't resolve. `pry kbase` finds the runtime `_text` and rebases the loaded vmlinux to it:
 > ```bash
-> pry launch --connect localhost:1234
-> pry kbase                           # preferred — pwndbg, then IDT remote-memory fallback
-> pry load ./vmlinux --base 0x<kbase> # offsets ALL sections; text + data resolve
+> pry launch --symbols ./vmlinux --connect localhost:1234   # or `pry load ./vmlinux` after connecting
+> pry kbase                     # validates the base against ./vmlinux, then rebases it (symbols: rebased ...)
 > ```
-> Prefer `pry kbase` over `pry gdb kbase`. The first-class command falls back to an IDT-based discovery over the **remote** GDB stub when pwndbg's page-table walk fails under `kernel.yama.ptrace_scope=1` (common when `qmu`/shell spawns QEMU and pry spawns a separate GDB). Do **not** use `kbase -r` for rebasing — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
+> **What `pry kbase` guarantees:** exit 0 only with a **validated** base: the guest's bytes at `linux_banner`'s link address plus the slide equal the symbol file's. Candidates, most specific first: the IDT[0] (x86-64) or VBAR (arm64) handler mapped back through the symbol table (exact on any layout), pwndbg's page-table walk, the handler rounded down to 2 MiB (only an upper bound: on x86-64 5.11–6.6 the handler is 14–24 MiB above `_text`). With no kernel symbol file, or a vmlinux that is not the running kernel's, it exits 1 with `could not determine the kernel base` and lists the unvalidated hints; it never prints an unchecked number as the base. `--symbols PATH` validates against a file that is not loaded and prints the `pry load PATH --base ...` that applies it. Like `load`, it stops a running remote target and resumes it afterwards. JSON: `base`, `slide`, `method` (`idt`/`vbar`/`pwndbg`), `derivation` (`symbol`/`page-tables`/`rounded`), `validated{symbols, symbol, address, text}`, `apply{path, applied, previous_slide, reason, command, load}`.
+>
+> Base from elsewhere (`qmu kbase`, kallsyms `_text`)? `pry load ./vmlinux --base 0x<kbase>` offsets every image section by one slide, so text and data resolve. Zero-based per-CPU sections (`.data..percpu` on x86-64 6.x: `current_task`, …) hold per-CPU offsets that KASLR does not move, so they stay at their link address (`unslid_sections`): read one as `*(unsigned long *)($gs_base + (unsigned long)&current_task)` while stopped in the kernel.
+>
+> Prefer `pry kbase` over `pry gdb kbase` (raw pwndbg, which fails under `kernel.yama.ptrace_scope=1` when pry's GDB is not QEMU's parent). Do **not** use `kbase -r` for rebasing — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
 
 > **Kernel source + lx scripts:** DWARF often has relative paths (`kernel/sys.c`) or absolute Docker kbuild paths (`/src/...`), so `pry source list` fails until GDB knows where the tree is. Linux also ships `scripts/gdb/vmlinux-gdb.py` (`lx-ps`, `$lx_current()`, …) that is **not** auto-loaded from a cached vmlinux alone:
 > ```bash
-> # After connect + kbase (see KASLR above):
+> # KBASE: `pry kbase`'s `base`, or `qmu kbase`
 > pry load $VMLINUX --base $KBASE --src /path/to/linux-src --gdb-scripts
 > # --src         → `directory DIR` + `set substitute-path /src DIR`
 > # --gdb-scripts → auto-find DIR/scripts/gdb/vmlinux-gdb.py (or sibling of vmlinux)
@@ -459,12 +462,12 @@ pwndbg is loaded alongside the bridge, so **any** pwndbg command runs verbatim t
 
 ```bash
 pry gdb "pwndbg"                      # Full list of pwndbg commands (--list-categories for groups)
-pry kbase                             # Kernel virtual base (KASLR) — prefer over `pry gdb kbase`
+pry kbase                             # Validated kernel base (KASLR); rebases the loaded vmlinux — prefer over `pry gdb kbase`
 pry gdb checksec                      # Binary security (NX, PIE, RELRO, canary)
 pry gdb vmmap                         # Virtual memory map
 ```
 
-For KASLR symbol rebasing use `pry kbase` then `pry load vmlinux --base <kbase>` — see **Remote Debugging → KASLR kernels** above for the recipe and [reference/pwndbg.md](reference/pwndbg.md) for why not `kbase -r` and for the yama/ptrace_scope footgun.
+For KASLR symbol rebasing load the vmlinux, then run `pry kbase` (it validates the base and rebases the loaded file) — see **Remote Debugging → KASLR kernels** above for the guarantee and the recipe, and [reference/pwndbg.md](reference/pwndbg.md) for why not `kbase -r` and for the yama/ptrace_scope footgun.
 
 Prefer the first-class structured commands where they exist — `pry kbase` (over `pry gdb kbase`), `pry mappings` (over `vmmap`), `pry registers` / `pry registers write`, `pry disasm` (symbol-annotated), `pry backtrace` — and drop to `pry gdb` for everything else.
 

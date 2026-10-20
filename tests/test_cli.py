@@ -1312,36 +1312,24 @@ def test_gdb_exec_json_format(monkeypatch, capsys):
     assert payload["output"] == "KBASE: 0xffffffff81000000\n"
 
 
-def test_kbase_sends_correct_op(monkeypatch, capsys):
+def test_kbase_sends_absolute_symbols_path(monkeypatch, capsys, tmp_path):
+    """The bridge runs in GDB's cwd: a relative --symbols must arrive absolute."""
     captured = {}
 
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         captured["op"] = op
         captured["params"] = params
-        return {
-            "ok": True,
-            "result": {
-                "base": "0xffffffffb0200000",
-                "method": "idt",
-                "handler": "0xffffffffb0201030",
-                "note": "IDT-derived base",
-                "attempts": [
-                    {"method": "pwndbg", "error": "Unable to locate the kernel base"},
-                    {"method": "idt", "ok": True},
-                ],
-            },
-        }
+        return {"ok": True, "result": {"base": "0xffffffff88a00000", "slide": "0x7a00000"}}
 
     monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    monkeypatch.chdir(tmp_path)
 
-    rc = pry.cli.main(["kbase"])
+    rc = pry.cli.main(["kbase", "--symbols", "vmlinux"])
 
     assert rc == 0
     assert captured["op"] == "kbase"
-    out = capsys.readouterr().out
-    assert "0xffffffffb0200000" in out
-    assert "method=idt" in out
-    assert "handler: 0xffffffffb0201030" in out
+    assert captured["params"] == {"symbols": str(tmp_path / "vmlinux")}
+    assert "0xffffffff88a00000" in capsys.readouterr().out
 
 
 def test_kbase_json_format(monkeypatch, capsys):

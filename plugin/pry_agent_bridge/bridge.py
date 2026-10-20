@@ -97,7 +97,6 @@ READ_LOCKED_OPS = {
     "target_info",
     "mappings",
     "display_list",
-    "kbase",
 }
 
 EXEC_OPS = {
@@ -140,6 +139,7 @@ WRITE_LOCKED_OPS = {
     "py_exec",
     "gdb_exec",
     "resync",
+    "kbase",
 }
 
 # Ops that make GDB insert or remove breakpoints in the target. An all-stop
@@ -156,6 +156,8 @@ BREAKPOINT_OPS = {
     "break_disable",
     "watch_set",
     "resync",
+    # Applies the slide it finds to the loaded symbol file, like `load`.
+    "kbase",
 }
 
 
@@ -428,7 +430,7 @@ def _elf_symbol_vaddrs(path: str, names) -> dict:
     return result
 
 
-def _elf_reloc_reference(path: str):
+def _elf_reloc_reference(path: str, syms: dict | None = None):
     """Link-time vaddr to subtract from a runtime ``--base`` for the slide.
 
     Returns ``(vaddr, name)`` where ``name`` labels the reference point, or
@@ -440,7 +442,8 @@ def _elf_reloc_reference(path: str):
     rebased every symbol that far too low. Falls back to ``_stext`` then the
     ``.text`` section vaddr; on x86 all three coincide, so x86 is unchanged.
     """
-    syms = _elf_symbol_vaddrs(path, ("_text", "_stext"))
+    if syms is None:
+        syms = _elf_symbol_vaddrs(path, ("_text", "_stext"))
     if "_text" in syms:
         return syms["_text"], "_text"
     if "_stext" in syms:
@@ -452,8 +455,38 @@ def _elf_reloc_reference(path: str):
 
 
 _ELF_SHF_ALLOC = 0x2
+_ELF_SHF_EXECINSTR = 0x4
 _ELF_SHT_NOBITS = 8
 _ELF_ET_EXEC = 2
+
+
+def _elf_zero_based_percpu_sections(path: str) -> dict[str, int]:
+    """``{name: link address}`` of the per-CPU sections a KASLR slide must not move.
+
+    x86-64 SMP kernels up to 6.x link ``.data..percpu`` at address 0: its
+    symbols (``current_task``, ...) are offsets added to a CPU's per-CPU base
+    (``%gs``), not addresses in the image, and KASLR leaves them alone
+    (kallsyms lists them as absolute, ``A``). Such a section lies below every
+    executable section of the image. Per-CPU sections linked inside the image
+    (arm64, arm32, newer x86-64 such as 7.0) move with it and are not returned.
+    """
+    parsed = _elf_sections(path)
+    if parsed is None:
+        return {}
+    _hdr, sections = parsed
+    exec_addrs = [
+        s["addr"] for s in sections
+        if s["flags"] & _ELF_SHF_ALLOC and s["flags"] & _ELF_SHF_EXECINSTR and s["size"]
+    ]
+    if not exec_addrs:
+        return {}
+    image_start = min(exec_addrs)
+    return {
+        s["name"].decode("ascii", "replace"): s["addr"] for s in sections
+        if s["flags"] & _ELF_SHF_ALLOC
+        and s["name"].startswith(b".data..percpu")
+        and s["addr"] < image_start
+    }
 
 
 def _elf_file_bytes(path: str, link_addr: int, length: int) -> bytes | None:
@@ -534,15 +567,91 @@ def classify_trap_site(guest: bytes | None, elf: bytes | None, trap: bytes) -> d
 # Kernel base (KASLR) discovery helpers — pure/logic side unit-tested
 # ---------------------------------------------------------------------------
 
-# Linux x86-64 KASLR places the kernel image on a 2 MiB boundary
-# (CONFIG_PHYSICAL_ALIGN / PMD). IDT entry 0 points at asm_exc_divide_error,
-# which sits a few KB after _text, so rounding that handler down to 2 MiB
-# recovers the virtual text base without page-table walks.
+# Linux x86-64 and arm64 KASLR place the kernel image on a 2 MiB boundary
+# (CONFIG_PHYSICAL_ALIGN / PMD). IDT entry 0 (asm_exc_divide_error) and VBAR
+# (vectors) point into the image, so rounding them down to 2 MiB gives an
+# upper bound for _text. It equals _text only when the handler lies in the
+# image's first 2 MiB: true for 7.0 and arm64, false for x86-64 5.11-6.6, whose
+# .entry.text sits 14-24 MiB above _text. Only the symbol file tells which.
 _KBASE_ALIGN_2M = 0x200000
-_KBASE_ALIGN_1G = 0x40000000
-# Floor of the high canonical kernel range (covers classic __START_KERNEL_map
-# and typical KASLR slides). Used only to bound downward walks.
-_KERNEL_VA_FLOOR = 0xFFFF800000000000
+
+# What IDT[0] / VBAR point at, per probe. With the kernel's symbol file the
+# handler gives _text exactly: handler - (symbol - _text), all at link time.
+_KBASE_HANDLER_SYMBOLS = {
+    "idt": ("asm_exc_divide_error", "divide_error"),  # x86-64 5.8+ / older
+    "vbar": ("vectors",),                              # arm64
+}
+# A read-only string in every Linux image. Its bytes in guest memory at its
+# link address plus a candidate slide match the symbol file only when the slide
+# is right (and the file is the running kernel's).
+_KBASE_CHECK_SYMBOL = "linux_banner"
+_KBASE_CHECK_MAX = 256
+
+
+def kbase_symbol_info(path: str) -> dict[str, Any]:
+    """What validating a kernel base against *path* needs, read from its ELF.
+
+    Returns ``reference`` (``(vaddr, name)`` as :func:`_elf_reloc_reference`),
+    ``symbols`` (link-time values of the handler and check symbols) and
+    ``banner`` (the file's ``linux_banner`` bytes up to its NUL). Raises
+    ValueError when *path* is not a readable kernel image.
+    """
+    names = {"_text", "_stext", _KBASE_CHECK_SYMBOL}
+    for handler_names in _KBASE_HANDLER_SYMBOLS.values():
+        names.update(handler_names)
+    syms = _elf_symbol_vaddrs(path, names)
+    ref = _elf_reloc_reference(path, syms)
+    if ref is None or _KBASE_CHECK_SYMBOL not in syms:
+        raise ValueError(
+            f"{path} is not a Linux kernel image with a symbol table "
+            f"(no {_KBASE_CHECK_SYMBOL}/_text symbols)"
+        )
+    banner = _elf_file_bytes(path, syms[_KBASE_CHECK_SYMBOL], _KBASE_CHECK_MAX)
+    if not banner:
+        raise ValueError(f"{path}: cannot read the bytes of {_KBASE_CHECK_SYMBOL}")
+    end = banner.find(b"\x00")
+    return {"reference": ref, "symbols": syms, "banner": banner[:end] if end > 0 else banner}
+
+
+def kbase_candidates(
+    *,
+    method: str | None,
+    handler: int | None,
+    pwndbg_base: int | None,
+    info: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Candidate runtime ``_text`` values, most specific first, deduplicated.
+
+    1. ``symbol``: the handler minus its symbol's link-time offset from ``_text``.
+    2. ``page-tables``: what pwndbg read from the guest page tables.
+    3. ``rounded``: the handler rounded down to 2 MiB (an upper bound).
+    """
+    ref_vaddr = info["reference"][0]
+    syms = info["symbols"]
+    out: list[dict[str, Any]] = []
+    if handler is not None and method in _KBASE_HANDLER_SYMBOLS:
+        for name in _KBASE_HANDLER_SYMBOLS[method]:
+            if name in syms:
+                out.append({
+                    "base": (handler - (syms[name] - ref_vaddr)) & _ADDR_MASK,
+                    "method": method, "derivation": "symbol", "handler_symbol": name,
+                })
+                break
+    if pwndbg_base is not None:
+        out.append({"base": pwndbg_base, "method": "pwndbg", "derivation": "page-tables"})
+    if handler is not None:
+        out.append({
+            "base": align_down(handler, _KBASE_ALIGN_2M),
+            "method": method, "derivation": "rounded",
+        })
+    seen: set[int] = set()
+    unique = []
+    for cand in out:
+        if cand["base"] not in seen:
+            seen.add(cand["base"])
+            unique.append(cand)
+    return unique
+
 
 _PWNDBG_KBASE_RE = re.compile(
     r"Found virtual text base address:\s*(0x[0-9a-fA-F]+)",
@@ -613,47 +722,6 @@ def parse_idt_entry_offset(entry: bytes) -> int:
 def align_down(addr: int, align: int) -> int:
     """Round ``addr`` down to a multiple of ``align`` (power-of-two)."""
     return addr & ~(align - 1)
-
-
-def estimate_kbase_from_handler(
-    handler: int,
-    *,
-    align: int = _KBASE_ALIGN_2M,
-    readable: Any | None = None,
-    max_steps: int = 256,
-) -> int:
-    """Estimate kernel ``_text`` from an in-``.text`` handler address.
-
-    Primary rule: round down to ``align`` (default 2 MiB — Linux KASLR).
-    When ``readable(addr) -> bool`` is provided, walk further down while pages
-    remain readable to approximate the mapping base (pwndbg's page-table
-    approach without host ``/proc/$qemu/mem``).
-    """
-    if handler <= 0:
-        raise ValueError(f"invalid handler address: {handler:#x}")
-    base = align_down(handler, align)
-    if readable is None:
-        return base
-    # Confirm the aligned candidate itself is mapped before walking.
-    try:
-        if not readable(base):
-            return base
-    except Exception:
-        return base
-    last = base
-    floor = max(_KERNEL_VA_FLOOR, 0)
-    for _ in range(max_steps):
-        nxt = last - align
-        if nxt < floor:
-            break
-        try:
-            ok = readable(nxt)
-        except Exception:
-            break
-        if not ok:
-            break
-        last = nxt
-    return last
 
 
 _DISASM_LINE_RE = re.compile(
@@ -1642,7 +1710,7 @@ class GdbBridge:
         """Run one op on GDB's thread and wrap its result or error."""
         try:
             if op in READ_LOCKED_OPS or op in {
-                "register_write", "thread_select", "call", "display_add", "py_exec",
+                "register_write", "thread_select", "call", "display_add", "py_exec", "kbase",
             }:
                 self._refresh_remote_inspection_state()
             result = self._dispatch_op(op, params)
@@ -3060,8 +3128,9 @@ class GdbBridge:
         # the link-time one, so name->address resolves to the stale (unmapped)
         # copy; (2) `add-symbol-file FILE ADDR` only relocates .text, leaving
         # data symbols (jiffies, init_task, ...) at link addresses. So: drop any
-        # prior copy, then add the file with ALL sections offset by a uniform
+        # prior copy, then add the file with every image section offset by one
         # slide, giving exactly one table where both text AND data resolve.
+        # Zero-based per-CPU sections are not part of the image and stay put.
         reference: str | None = None
         if slide is not None:
             slide_int = self._parse_addr(slide)
@@ -3075,12 +3144,15 @@ class GdbBridge:
                 )
             ref_vaddr, reference = ref
             # --base is the runtime _text (what qmu kbase / kallsyms report);
-            # subtract the matching link-time reference so ALL sections shift by
+            # subtract the matching link-time reference so the image shifts by
             # one uniform slide. Using _text (not the .text section base) lands
             # correctly where _text != _stext (arm), and is identical on x86.
             slide_int = self._parse_addr(base) - ref_vaddr
-        self._add_symbols_at(path, slide_int)
+        unslid = self._add_symbols_at(path, slide_int)
         result: dict[str, Any] = {"loaded": path, "slide": hex(slide_int)}
+        if unslid:
+            # Per-CPU offsets: KASLR does not move them, so neither does pry.
+            result["unslid_sections"] = unslid
         if base is not None:
             result["base"] = hex(self._parse_addr(base))
         if reference is not None:
@@ -3089,8 +3161,13 @@ class GdbBridge:
             result["reference"] = reference
         return self._apply_src_and_scripts(result, params)
 
-    def _add_symbols_at(self, path: str, slide_int: int) -> None:
-        """Make *path* the only symbol table for itself, every section offset by *slide_int*."""
+    def _add_symbols_at(self, path: str, slide_int: int) -> list[str]:
+        """Make *path* the only symbol table for itself, offset by *slide_int*.
+
+        Every section moves by the slide except zero-based per-CPU sections
+        (see :func:`_elf_zero_based_percpu_sections`), which stay at their link
+        address; their names are returned.
+        """
         # Drop any existing copy so the relocated table is authoritative.
         # remove-symbol-file only removes add-symbol-file'd copies and fails
         # (raises or prints "No symbol file found") on the *primary* objfile
@@ -3108,8 +3185,11 @@ class GdbBridge:
             with contextlib.suppress(gdb.error):
                 gdb.execute("symbol-file", to_string=True)  # discard primary symbols
         offset = f"-0x{-slide_int:x}" if slide_int < 0 else hex(slide_int)
+        unslid = _elf_zero_based_percpu_sections(path)
+        # `-s SECTION ADDR` pins a section; GDB applies `-o` to the others only.
+        pinned = "".join(f" -s {name} {addr:#x}" for name, addr in unslid.items())
         try:
-            gdb.execute(f"add-symbol-file {path} -o {offset}", to_string=True)
+            gdb.execute(f"add-symbol-file {path} -o {offset}{pinned}", to_string=True)
         finally:
             for bp in enabled:
                 with contextlib.suppress(Exception):
@@ -3117,6 +3197,7 @@ class GdbBridge:
                         bp.enabled = True
         self._symbol_loads[os.path.realpath(path)] = {"path": path, "slide": slide_int}
         self._symbol_file = path
+        return list(unslid)
 
     @staticmethod
     def _pid_exists(pid: int) -> bool:
@@ -4909,92 +4990,194 @@ class GdbBridge:
         return {"output": output}
 
     # ------------------------------------------------------------------
-    # Kernel base (KASLR) — pwndbg first, then remote-memory IDT fallback
+    # Kernel base (KASLR): candidates from pwndbg / IDT / VBAR, validated
+    # against the kernel's symbol file, then applied to it
     # ------------------------------------------------------------------
 
     def _kbase(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Locate the kernel virtual text base (KASLR).
+        """Find the runtime kernel ``_text`` and prove it before reporting it.
 
-        Fallback chain (agent-first; no host ptrace of QEMU required for the
-        IDT path):
+        Guarantee: a returned ``base`` is validated. The guest's bytes at
+        ``linux_banner``'s link address plus the slide match the kernel's
+        symbol file (``symbols`` param, else the loaded one). Candidates, most
+        specific first:
 
-        1. **pwndbg** ``kbase`` — exact mapping base when page tables work
-           (needs ``/proc/$qemu/mem`` under ``kernel-vmmap page-tables``).
-        2. **IDT** (x86/x86-64) — read IDTR via QEMU monitor / GDB registers,
-           parse IDT[0] through the remote target memory API, round down to
-           the 2 MiB KASLR alignment (optionally walk down while readable).
-        3. **VBAR** (AArch64) — same idea using ``vbar_el1``.
+        1. the IDT[0] (x86-64) or VBAR (arm64) handler minus its symbol's
+           link-time offset from ``_text``;
+        2. pwndbg ``kbase`` (guest page tables; needs host ptrace of QEMU);
+        3. the handler rounded down to 2 MiB.
 
-        Raises if every method fails, with an actionable yama/kallsyms note.
+        With no kernel symbol file, or when no candidate validates, it raises
+        instead: an unvalidated number is never reported as the base. The
+        validated slide is then applied to that symbol file when GDB has it
+        loaded at another slide; ``apply`` says what happened and, when the
+        file is not loaded, gives the ``pry load`` command that applies it.
         """
         attempts: list[dict[str, Any]] = []
-
         pwndbg = self._kbase_via_pwndbg()
         attempts.append(pwndbg["attempt"])
-        if pwndbg.get("base") is not None:
-            return self._kbase_result(
-                base=pwndbg["base"],
-                method="pwndbg",
-                attempts=attempts,
-                extra=pwndbg.get("extra"),
+        probe = self._kbase_via_idt()
+        attempts.append(probe["attempt"])
+        if probe.get("handler") is None:
+            probe = self._kbase_via_vbar()
+            attempts.append(probe["attempt"])
+        handler = probe.get("handler")
+        method = probe["attempt"]["method"] if handler is not None else None
+        if pwndbg.get("base") is None and handler is None:
+            detail = "; ".join(
+                f"{a.get('method')}: {a['error']}" for a in attempts if a.get("error")
+            ) or "no methods available"
+            raise RuntimeError(
+                "unable to locate kernel base — "
+                f"{detail}. "
+                "pwndbg kbase needs host ptrace of QEMU (/proc/$pid/mem) which "
+                "fails when kernel.yama.ptrace_scope>=1 and GDB is not QEMU's "
+                "parent; the IDT fallback needs a stopped x86-64 QEMU remote and "
+                "the VBAR fallback a stopped aarch64 remote, both with readable "
+                "guest memory. Proven fallback: use `qmu kbase` (kallsyms `_text`), "
+                "or resume the guest and read the runtime base directly — "
+                "`grep 'T _text$' /proc/kallsyms` (after `echo 0 > "
+                "/proc/sys/kernel/kptr_restrict`). Then rebase with "
+                "`pry load vmlinux --base 0x...` using that runtime `_text` — it is "
+                "the correct base on both x86-64 and arm64."
             )
 
-        idt = self._kbase_via_idt()
-        attempts.append(idt["attempt"])
-        if idt.get("base") is not None:
-            return self._kbase_result(
-                base=idt["base"],
-                method="idt",
-                attempts=attempts,
-                extra=idt.get("extra"),
-            )
-
-        vbar = self._kbase_via_vbar()
-        attempts.append(vbar["attempt"])
-        if vbar.get("base") is not None:
-            return self._kbase_result(
-                base=vbar["base"],
-                method="vbar",
-                attempts=attempts,
-                extra=vbar.get("extra"),
-            )
-
-        detail_parts = []
-        for a in attempts:
-            err = a.get("error")
-            if err:
-                detail_parts.append(f"{a.get('method')}: {err}")
-        detail = "; ".join(detail_parts) if detail_parts else "no methods available"
-        raise RuntimeError(
-            "unable to locate kernel base — "
-            f"{detail}. "
-            "pwndbg kbase needs host ptrace of QEMU (/proc/$pid/mem) which "
-            "fails when kernel.yama.ptrace_scope>=1 and GDB is not QEMU's "
-            "parent; the IDT fallback needs a stopped x86-64 QEMU remote and "
-            "the VBAR fallback a stopped aarch64 remote, both with readable "
-            "guest memory. Proven fallback: use `qmu kbase` (kallsyms `_text`), "
-            "or resume the guest and read the runtime base directly — "
-            "`grep 'T _text$' /proc/kallsyms` (after `echo 0 > "
-            "/proc/sys/kernel/kptr_restrict`). Then rebase with "
-            "`pry load vmlinux --base 0x...` using that runtime `_text` — it is "
-            "the correct base on both x86-64 and arm64."
+        path, info = self._kbase_symbol_file(params.get("symbols"))
+        if info is None:
+            raise RuntimeError(self._kbase_unvalidated_message(path, pwndbg, probe))
+        candidates = kbase_candidates(
+            method=method, handler=handler, pwndbg_base=pwndbg.get("base"), info=info,
         )
+        ref_vaddr, reference = info["reference"]
+        banner = info["banner"]
+        banner_link = info["symbols"][_KBASE_CHECK_SYMBOL]
+        chosen = None
+        for cand in candidates:
+            addr = (banner_link + cand["base"] - ref_vaddr) & _ADDR_MASK
+            try:
+                guest = self._read_remote_memory(addr, len(banner))
+            except Exception:
+                guest = None
+            cand["check"] = {"address": hex(addr), "match": guest == banner}
+            if guest is None:
+                cand["check"]["error"] = "unreadable"
+            elif guest != banner:
+                cand["check"]["guest_bytes"] = guest[:16].hex()
+            if guest == banner:
+                chosen = cand
+                break
+        report = [{**c, "base": hex(c["base"])} for c in candidates]
+        if chosen is None:
+            tried = "; ".join(
+                f"{c['base']} ({c['method']}, {c['derivation']}): {_KBASE_CHECK_SYMBOL} at "
+                f"{c['check']['address']} "
+                f"{'is unreadable' if c['check'].get('error') else 'differs'}"
+                for c in report
+            )
+            raise RuntimeError(
+                f"could not determine the kernel base: no candidate matches {path} "
+                f"({tried}). Is {path} the running kernel's vmlinux? Get the base "
+                "from the guest instead (`qmu kbase`, or kallsyms `_text`) and "
+                "rebase with `pry load vmlinux --base 0x...`"
+            )
+
+        base = chosen["base"]
+        slide = base - ref_vaddr  # same arithmetic as `load --base`
+        result: dict[str, Any] = {
+            "base": hex(base),
+            "slide": hex(slide),
+            "reference": reference,
+            "method": chosen["method"],
+            "derivation": chosen["derivation"],
+            "validated": {
+                "symbols": path,
+                "symbol": _KBASE_CHECK_SYMBOL,
+                "address": chosen["check"]["address"],
+                "length": len(banner),
+                "text": banner.decode("utf-8", "replace").strip(),
+            },
+        }
+        if handler is not None:
+            result["handler"] = hex(handler)
+        if chosen.get("handler_symbol"):
+            result["handler_symbol"] = chosen["handler_symbol"]
+        result["candidates"] = report
+        result["attempts"] = attempts
+        result["apply"] = self._kbase_apply(path, base, slide)
+        return result
+
+    def _kbase_symbol_file(self, explicit: str | None):
+        """``(path, kbase_symbol_info)`` for validation; info is None without one.
+
+        An explicit path must be a kernel image. Otherwise the loaded symbol
+        file is used when it is one (the last `pry load`, else GDB's main file).
+        """
+        if explicit:
+            return explicit, kbase_symbol_info(explicit)
+        loaded = None
+        if self._symbol_file and self._file_is_loaded(self._symbol_file):
+            loaded = self._symbol_file
+        else:
+            with contextlib.suppress(Exception):
+                loaded = gdb.current_progspace().filename
+        if not loaded:
+            return None, None
+        try:
+            return loaded, kbase_symbol_info(loaded)
+        except ValueError:
+            return loaded, None
 
     @staticmethod
-    def _kbase_result(
-        *,
-        base: int,
-        method: str,
-        attempts: list[dict[str, Any]],
-        extra: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "base": hex(base),
-            "method": method,
-            "attempts": attempts,
-        }
-        if extra:
-            out.update(extra)
+    def _kbase_unvalidated_message(
+        loaded: str | None, pwndbg: dict[str, Any], probe: dict[str, Any]
+    ) -> str:
+        why = (
+            f"the loaded symbol file {loaded} is not a Linux kernel image"
+            if loaded else "no kernel symbol file is loaded"
+        )
+        hints = []
+        handler = probe.get("handler")
+        if handler is not None:
+            name = "IDT[0]" if probe["attempt"]["method"] == "idt" else "VBAR"
+            hints.append(
+                f"{name} handler {handler:#x} puts _text at or below "
+                f"{align_down(handler, _KBASE_ALIGN_2M):#x} (equal only when the "
+                "handler lies in the image's first 2 MiB, which is false on many "
+                "x86-64 kernels)"
+            )
+        if pwndbg.get("base") is not None:
+            hints.append(f"pwndbg page tables give {pwndbg['base']:#x}")
+        return (
+            f"could not determine the kernel base: {why}, so no candidate can be "
+            f"validated. Unvalidated: {'; '.join(hints)}. Name the running "
+            "kernel's vmlinux: `pry kbase --symbols ./vmlinux` (or `pry load "
+            "./vmlinux`, then `pry kbase` also rebases it)"
+        )
+
+    def _kbase_apply(self, path: str, base: int, slide: int) -> dict[str, Any]:
+        """Rebase the loaded symbol file *path* to the validated slide."""
+        out: dict[str, Any] = {"path": path}
+        if not self._file_is_loaded(path):
+            out.update(
+                applied=False,
+                reason="not loaded in GDB",
+                command=f"pry load {shlex.quote(path)} --base {base:#x}",
+            )
+            return out
+        record = self._symbol_loads.get(os.path.realpath(path))
+        if record is not None:
+            current = record["slide"]
+        else:
+            # Loaded with `file`: link addresses, i.e. slide 0 for a kernel.
+            parsed = _elf_sections(path)
+            current = 0 if parsed is not None and parsed[0]["type"] == _ELF_ET_EXEC else None
+        if current is not None:
+            out["previous_slide"] = hex(current)
+        if current == slide:
+            out.update(applied=False, reason="already loaded at this slide")
+            return out
+        out["applied"] = True
+        out["load"] = self._load({"path": path, "base": hex(base)})
         return out
 
     def _kbase_via_pwndbg(self) -> dict[str, Any]:
@@ -5018,13 +5201,6 @@ class GdbBridge:
         """Read guest memory via the selected inferior (remote GDB stub OK)."""
         inf = gdb.selected_inferior()
         return bytes(inf.read_memory(addr, length))
-
-    def _memory_readable(self, addr: int, length: int = 1) -> bool:
-        try:
-            self._read_remote_memory(addr, length)
-            return True
-        except Exception:
-            return False
 
     def _idt_base_from_qemu_monitor(self) -> tuple[int, int] | None:
         try:
@@ -5113,50 +5289,11 @@ class GdbBridge:
                 return {"attempt": attempt}
 
         attempt["handler"] = hex(handler)
-        # IDT[0] (asm_exc_divide_error) sits within the first 2 MiB window of
-        # _text on Linux, so rounding the handler down to the KASLR alignment is
-        # already exact. Do NOT pass a `readable` walk-down here: the walk can
-        # only move the estimate *below* the true base (and would silently do so
-        # if any 2 MiB page under _text happens to be mapped), which mis-rebases
-        # every symbol. Round-down only.
-        base = estimate_kbase_from_handler(handler, align=_KBASE_ALIGN_2M)
-        # If 2 MiB walk didn't move and the handler is far above, also try 1 GiB
-        # only when the 2 MiB candidate is unreadable (unlikely); keep 2 MiB.
-        if not self._memory_readable(base, 1):
-            base_1g = estimate_kbase_from_handler(handler, align=_KBASE_ALIGN_1G)
-            if self._memory_readable(base_1g, 1):
-                base = base_1g
-                attempt["align"] = hex(_KBASE_ALIGN_1G)
-            else:
-                attempt["error"] = (
-                    f"estimated base {base:#x} (from handler {handler:#x}) "
-                    "is not readable via remote memory"
-                )
-                return {"attempt": attempt}
-        else:
-            attempt["align"] = hex(_KBASE_ALIGN_2M)
-
         attempt["ok"] = True
-        extra = {
-            "handler": hex(handler),
-            "idt_base": hex(idt_base),
-            "note": (
-                "IDT-derived base: rounded down to KASLR alignment from "
-                "IDT[0] handler via remote target memory (no host "
-                "/proc/$qemu/mem). Exact when exception stubs sit within "
-                "the first alignment window of _text (typical Linux)."
-            ),
-        }
-        return {"attempt": attempt, "base": base, "extra": extra}
+        return {"attempt": attempt, "handler": handler}
 
     def _kbase_via_vbar(self) -> dict[str, Any]:
-        """AArch64: VBAR_EL1 points into kernel vectors; align like IDT path.
-
-        On a stopped arm64 target VBAR_EL1 holds the address of the ``vectors``
-        exception table, which lives within the first 2 MiB window of ``_text``
-        (a few tens of KiB above it: ``_text`` → head → ``_stext`` → vectors).
-        Rounding the vector base down to the 2 MiB KASLR alignment therefore
-        lands exactly on ``_text`` — matching ``qmu kbase`` / kallsyms ``_text``.
+        """AArch64: VBAR_EL1 holds the address of the kernel's ``vectors``.
 
         QEMU's gdbstub does not expose this in ``monitor info registers`` and
         names the register bare ``VBAR`` (convenience ``$VBAR``) rather than the
@@ -5198,31 +5335,8 @@ class GdbBridge:
             return {"attempt": attempt}
 
         attempt["vbar"] = hex(vbar)
-        # Round-down ONLY. Like the IDT path, a downward readability walk can
-        # only move the estimate *below* the true base (mis-rebasing every
-        # symbol) if any lower 2 MiB page happens to be mapped; the vector base
-        # already sits inside _text's first 2 MiB window, so round-down is exact.
-        base = estimate_kbase_from_handler(vbar, align=_KBASE_ALIGN_2M)
-        if not self._memory_readable(base, 1):
-            attempt["error"] = (
-                f"estimated base {base:#x} (from VBAR {vbar:#x}) is not readable "
-                "via remote memory"
-            )
-            return {"attempt": attempt}
-        attempt["align"] = hex(_KBASE_ALIGN_2M)
         attempt["ok"] = True
-        return {
-            "attempt": attempt,
-            "base": base,
-            "extra": {
-                "handler": hex(vbar),
-                "note": (
-                    "VBAR-derived base: arm64 exception vector base "
-                    "(vectors, in _text) rounded down to the 2 MiB KASLR "
-                    "alignment. Matches kallsyms _text."
-                ),
-            },
-        }
+        return {"attempt": attempt, "handler": vbar}
 
     # ------------------------------------------------------------------
     # Python escape hatch
