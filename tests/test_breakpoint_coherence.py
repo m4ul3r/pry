@@ -22,9 +22,11 @@ class _Stub:
     GDB inserts its breakpoints when the target resumes and removes them at
     every stop; with ``breakpoint always-inserted`` on it inserts them as soon
     as the table changes. Insertion saves the byte and writes int3, like
-    QEMU's KVM gdbstub, except where the stub still holds a stale record for
-    the address (it then accepts the insert and writes nothing, until a raw
-    ``z0`` drops the record), or when it keeps traps out of memory (TCG).
+    QEMU's KVM gdbstub. Like QEMU it keeps records GDB may not know about:
+    an orphan (its int3 still in memory) or a stale record (a removal that
+    failed). With either, an insert at that address writes nothing until a
+    raw ``z0`` drops the record (an orphan's saved byte is written back). A
+    TCG-like stub (``writes=False``) never puts traps in memory.
     """
 
     type = "remote"
@@ -35,13 +37,27 @@ class _Stub:
         self.always_inserted = False
         self.inserted: dict[int, int] = {}
         self.stale: set[int] = set()
+        self.orphans: dict[int, int] = {}
         self.bps: list[_Bp] = []
+
+    def orphan(self, addr: int):
+        """An int3 GDB lost track of: the stub still records it."""
+        self.orphans[addr] = self.mem[addr]
+        self.mem[addr] = 0xCC
 
     def send_packet(self, packet: str) -> bytes:
         z = re.fullmatch(r"z0,([0-9a-f]+),1", packet)
         if z:
-            self.stale.discard(int(z[1], 16))
-            return b"OK"
+            addr = int(z[1], 16)
+            if addr in self.orphans:
+                saved = self.orphans.pop(addr)
+                if self.mem.get(addr) == 0xCC:
+                    self.mem[addr] = saved
+                return b"OK"
+            if addr in self.stale:
+                self.stale.discard(addr)
+                return b"OK"
+            return b"E22"
         m = re.fullmatch(r"m([0-9a-f]+),([0-9a-f]+)", packet)
         assert m, packet
         addr, length = int(m[1], 16), int(m[2], 16)
@@ -59,13 +75,16 @@ class _Stub:
                     if loc.address not in self.mem:
                         raise _Stub.error(f"Cannot insert breakpoint {bp.number}.")
                     self.inserted[loc.address] = self.mem[loc.address]
-                    if self.writes and loc.address not in self.stale:
+                    recorded = loc.address in self.stale or loc.address in self.orphans
+                    if self.writes and not recorded:
                         self.mem[loc.address] = 0xCC
 
     def resume(self):
         self.always_inserted, saved = True, self.always_inserted
-        self.update()
-        self.always_inserted = saved
+        try:
+            self.update()
+        finally:
+            self.always_inserted = saved
 
 
 class _Loc:
@@ -136,7 +155,7 @@ def _remote_target(monkeypatch, memory, *, maint_rows="", writes=True):
             stub.always_inserted = cmd.endswith(" on")
             return ""
         if cmd == "maint info breakpoints":
-            return maint_rows
+            return maint_rows() if callable(maint_rows) else maint_rows
         if cmd == "monitor info kvm":
             return f"kvm support: {'enabled' if stub.writes else 'disabled'}\n"
         return execute(cmd, to_string=to_string)
@@ -157,7 +176,11 @@ def _start_background(bridge, fake_gdb, stub):
 
     def execute(cmd, to_string=False):
         if cmd == "continue":
-            stub.resume()
+            try:
+                stub.resume()
+            except fake_gdb.error:
+                # GDB prints the cause to its console and raises only this.
+                raise fake_gdb.error("Command aborted.") from None
         if cmd == "interrupt":
             # GDB removes its breakpoints at the stop.
             for bp in stub.bps:
@@ -556,11 +579,11 @@ def test_resync_reports_unreadable_and_pending_locations_as_not_armed(monkeypatc
     assert unreadable.locations[0].enabled is True
 
 
-def test_resync_reseats_a_breakpoint_over_a_stale_stub_record(monkeypatch):
+def test_resync_drops_a_stale_stub_record_before_arming(monkeypatch):
     _, _, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
     _Bp(stub, 1, TRAP_SITE)
     # The stub's removal failed at the first stop after a reset; its record
-    # outlived it, so an insert at this address writes nothing.
+    # outlived it, so an insert at this address would write nothing.
     stub.stale.add(TRAP_SITE)
 
     result = bridge.dispatch({"op": "resync", "params": {}})["result"]
@@ -568,8 +591,137 @@ def test_resync_reseats_a_breakpoint_over_a_stale_stub_record(monkeypatch):
     [entry] = result["breakpoints"]
     assert entry["status"] == "armed"
     assert entry["trap_resident"] is True
-    assert entry["reseated"] is True
+    assert entry["stub_record"] is True
     assert stub.stale == set()
+
+
+def test_resync_reseats_a_trap_the_stub_accepted_but_never_wrote(monkeypatch):
+    _, _, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    stub.stale.add(TRAP_SITE)
+    # With the user's always-inserted mode GDB may hold its breakpoints at a
+    # stop, so sites are not cleaned up front; the read-back catches it.
+    stub.always_inserted = True
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    [entry] = result["breakpoints"]
+    assert entry["status"] == "armed"
+    assert entry["trap_resident"] is True
+    assert entry["reseated"] is True
+    assert stub.mem[TRAP_SITE] == 0xCC
+
+
+def test_resync_never_calls_a_watchpoint_armed(monkeypatch):
+    _, _, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    for with_code_breakpoint in (False, True):
+        stub.bps.clear()
+        watch = _Bp(stub, 5, TRAP_SITE + 4, bp_type=8)  # read watchpoint
+        watch.locations = []
+        watch.expression = "jiffies"
+        if with_code_breakpoint:
+            _Bp(stub, 6, TRAP_SITE)
+
+        result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+        statuses = {e["number"]: e["status"] for e in result["breakpoints"]}
+        assert statuses[5] == "unverified"
+
+
+def test_wait_after_resync_reports_the_reread_state(monkeypatch):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    hit = _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([hit]))
+    assert bridge.dispatch({"op": "wait", "params": {}})["result"]["reason"]["kind"] == "breakpoint-hit"
+    # A snapshot load replaced the machine; resync re-reads it.
+    assert bridge.dispatch({"op": "resync", "params": {}})["result"]["reason"] == {"kind": "resynced"}
+
+    for op in ("wait", "status"):
+        response = bridge.dispatch({"op": op, "params": {}})
+        assert response["result"]["reason"] == {"kind": "resynced"}, op
+        assert "last_background_result" not in response["result"]
+
+
+def test_arming_over_an_orphan_trap_drops_the_stub_record(monkeypatch):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    # An int3 the stub still records but GDB does not own.
+    stub.orphan(TRAP_SITE)
+    _Bp(stub, 1, TRAP_SITE)
+
+    result = bridge.dispatch({"op": "break_enable", "params": {"number": 1}})["result"]
+
+    [trap] = result["baked_traps"]
+    assert trap["stub_record"] is True and trap["repaired"] is True
+    assert stub.orphans == {}
+    assert stub.mem[TRAP_SITE] == ELF_WINDOW[0]
+    _start_background(bridge, fake_gdb, stub)
+    assert stub.mem[TRAP_SITE] == 0xCC  # GDB's insert really wrote its trap
+
+
+@pytest.mark.parametrize("op", ["break_enable", "break_delete"])
+def test_breakpoint_ops_drop_a_stale_stub_record(monkeypatch, op):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _Bp(stub, 2, TRAP_SITE)
+    stub.stale.add(TRAP_SITE)
+
+    response = bridge.dispatch({"op": op, "params": {"number": 1}})
+
+    assert response["ok"] is True
+    assert "baked_traps" not in response["result"]  # nothing was in memory
+    assert stub.stale == set()
+    _start_background(bridge, fake_gdb, stub)
+    assert stub.mem[TRAP_SITE] == 0xCC
+
+
+@pytest.mark.parametrize("op", ["load", "break_enable"])
+def test_locations_gdb_gives_up_on_at_the_resume_are_reported(monkeypatch, tmp_path, op):
+    rows = {"now": ""}
+    _, fake_gdb, bridge, stub = _remote_target(
+        monkeypatch, _memory(ELF_WINDOW), maint_rows=lambda: rows["now"]
+    )
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    execute = fake_gdb.execute
+
+    def give_up_at_resume(cmd, to_string=False):
+        if cmd == "continue":
+            rows["now"] = "1.1                         y   <PENDING>          f inf 1\n"
+        return execute(cmd, to_string=to_string)
+
+    fake_gdb.execute = give_up_at_resume
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_bytes(b"")
+    params = {"path": str(vmlinux), "slide": "0x0"} if op == "load" else {"number": 1}
+
+    response = bridge.dispatch({"op": op, "params": params})
+
+    result = response["result"]
+    assert result["run_state"]["resumed"] is True
+    assert result["run_state"]["pending_after_resume"] == ["1.1"]
+    if op == "load":
+        assert result["pending_breakpoints"] == [1]
+    else:
+        assert result["pending"] is True
+        assert "address" not in result
+
+
+def test_failed_resume_names_the_location_gdb_could_not_insert(monkeypatch):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    unmapped = _Bp(stub, 2, 0xFFFFFFFF91000000)
+    unmapped.enabled = False
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    response = bridge.dispatch({"op": "break_enable", "params": {"number": 2}})
+
+    run_state = response["result"]["run_state"]
+    assert run_state["resumed"] is False
+    assert "Cannot insert breakpoint 2" in run_state["error"]
+    assert stub.inserted == {}
 
 
 def test_resync_reports_a_trap_that_never_lands_as_not_armed(monkeypatch):

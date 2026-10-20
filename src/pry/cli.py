@@ -526,18 +526,24 @@ def _breakpoint_op_notes(value: dict) -> list[str]:
         where = trap.get("address", "?")
         if trap.get("function"):
             where += f" ({trap['function']})"
-        held = (f"guest memory held a trap ({trap.get('guest_bytes')}) where the "
-                f"symbol file has {trap.get('elf_bytes')}")
+        held = f"guest memory held a trap ({trap.get('guest_bytes')})"
+        if trap.get("elf_bytes"):
+            held += f" where the symbol file has {trap['elf_bytes']}"
+        origin = ("an orphan the stub still recorded for nobody" if trap.get("stub_record")
+                  else "most likely baked in by a snapshot")
         if trap.get("repaired"):
-            lines.append(f"warning: {where}: {held}, most likely baked in by a snapshot; "
-                         "restored the original byte(s)")
+            lines.append(f"warning: {where}: {held}, {origin}; restored the original byte(s)")
         else:
-            lines.append(f"warning: {where}: {held}, most likely baked in by a snapshot; "
-                         "could NOT restore it, so the target traps there with no "
-                         "breakpoint to catch it")
+            lines.append(f"warning: {where}: {held}, {origin}; could NOT restore it, so the "
+                         "target traps there with no breakpoint to catch it")
     run_state = value.get("run_state")
     if isinstance(run_state, dict) and run_state.get("was_running"):
         lines.append(f"note: {_run_state_text(run_state)}")
+        gave_up = run_state.get("pending_after_resume")
+        if gave_up and not value.get("pending_breakpoints"):
+            lines.append("warning: GDB could not insert location(s) "
+                         f"{', '.join('#' + str(g) for g in gave_up)} when it resumed the "
+                         "target: they are pending and will not fire")
     return lines
 
 
@@ -2367,6 +2373,8 @@ def _format_resync_entry(entry: dict) -> str:
         tags.append("no trap byte in memory")
     if entry.get("reseated"):
         tags.append("re-inserted over a stale stub record")
+    if entry.get("stub_record"):
+        tags.append("dropped a stub record nobody owned")
     if entry.get("baked_trap"):
         fix = "restored" if entry.get("repaired") else "NOT restored"
         tags.append(f"baked trap {entry.get('guest_bytes')} over {entry.get('elf_bytes')}: {fix}")

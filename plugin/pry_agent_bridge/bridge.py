@@ -1180,6 +1180,20 @@ def _mark_gave_up(entries: list[dict[str, Any]], pending: set[tuple[int, int]]) 
                                "now shows it <PENDING>; it will not fire")
 
 
+def _mark_locations_pending(bp: dict[str, Any], pending: set[tuple[int, int]]) -> None:
+    """Mark a serialized breakpoint's locations GDB now shows <PENDING>."""
+    locations = bp.get("locations") or []
+    for index, loc in enumerate(locations, 1):
+        if (bp.get("number"), index) in pending:
+            for key in ("address", "file", "line"):
+                loc.pop(key, None)
+            loc["pending"] = True
+    if locations and all(loc.get("pending") for loc in locations):
+        bp["pending"] = True
+        for key in ("address", "file", "line"):
+            bp.pop(key, None)
+
+
 # ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
@@ -1672,18 +1686,29 @@ class GdbBridge:
                 ) from exc
             if pause is None:
                 return response
+            pending_before = _run_on_gdb_thread(_pending_locations) if response["ok"] else set()
             run_state = self._finish_pause(pause)
             pending_now = None
-            if op == "resync" and response["ok"] and run_state["resumed"]:
-                # Held-out (unreadable) locations are only tried at the resume;
-                # GDB's table, readable while running, says if it gave up.
+            if response["ok"] and run_state["resumed"]:
+                # GDB inserts breakpoints only when it resumes the target. A
+                # location it fails to insert in a rebased objfile turns
+                # <PENDING> then; its table, readable while running, says so.
                 pending_now = _run_on_gdb_thread(_pending_locations)
         if not response["ok"]:
             response["error"] = f"{response['error']} ({_run_state_note(run_state)})"
             return response
+        gave_up = sorted(pending_now - pending_before) if pending_now else []
+        if gave_up:
+            run_state["pending_after_resume"] = [f"{n}.{i}" for n, i in gave_up]
         result = response["result"]
         if isinstance(result, dict):
             result["run_state"] = run_state
+            if gave_up and op == "load":
+                result["pending_breakpoints"] = sorted(
+                    set(result.get("pending_breakpoints") or []) | {n for n, _ in gave_up}
+                )
+            elif gave_up and isinstance(result.get("locations"), list):
+                _mark_locations_pending(result, pending_now)
             if op == "resync" and run_state["resumed"]:
                 # resync verified the target at the stop; report where it is now.
                 for key in ("reason", "frame", "thread", "displays"):
@@ -1787,7 +1812,12 @@ class GdbBridge:
             if job is not None and pause["job"] is not None:
                 pause["job"]["superseded_by"] = job
             if not response["ok"]:
-                run_state["error"] = response["error"]
+                # GDB prints why it could not resume to its console and only
+                # raises "Command aborted."; a trial insertion names the cause.
+                cause = None
+                with contextlib.suppress(Exception):
+                    cause = _run_on_gdb_thread(self._insertion_errors)
+                run_state["error"] = cause or response["error"]
                 # This op reports the failure; `pry status` should show the
                 # stopped target, not replay an execution the user never ran.
                 if job is not None and self._background_job is job:
@@ -1819,6 +1849,14 @@ class GdbBridge:
                 with contextlib.suppress(gdb.error):
                     bp.enabled = False
                     bp.enabled = True
+
+    def _insertion_errors(self) -> str | None:
+        """GDB thread, at a stop: GDB's own reasons for refusing to insert."""
+        errors = self._verify_insertion(
+            list(gdb.breakpoints() or []), set(), keep_inserted=False
+        )["errors"]
+        messages = dict.fromkeys(" ".join(m.split()) for m in errors.values())
+        return "; ".join(messages) or None
 
     @staticmethod
     def _ptrace_hint() -> str:
@@ -3708,10 +3746,18 @@ class GdbBridge:
     ) -> list[dict[str, Any]]:
         """Classify every software-breakpoint site of *bps* (see classify_trap_site).
 
-        Empty unless :meth:`_trap_sites_checkable`. With *repair*, a baked trap
-        is overwritten with the ELF bytes, so the breakpoint GDB inserts next
-        saves the real instruction as its original and its removal leaves no
-        trap behind. *skip* holds ``(number, index)`` locations to leave alone.
+        Empty unless :meth:`_trap_sites_checkable`. *skip* holds
+        ``(number, index)`` locations to leave alone. With *repair*:
+
+        - any record the stub keeps for the address is dropped first. GDB
+          holds none of its breakpoints at this stop, so such a record belongs
+          to nobody: an orphan whose trap is still in memory, or a stale one
+          left by a failed removal. Either turns GDB's next insert into a
+          no-op (QEMU's KVM gdbstub only bumps its count). Dropping an orphan
+          makes QEMU write its saved byte back.
+        - a trap still there that the ELF does not have is overwritten with
+          the ELF bytes, so the breakpoint GDB inserts next saves the real
+          instruction as its original and its removal leaves no trap behind.
         """
         if not self._trap_sites_checkable():
             return []
@@ -3733,13 +3779,39 @@ class GdbBridge:
                 fn = getattr(loc, "function", None)
                 if fn:
                     site["function"] = fn
-                site.update(classify_trap_site(
-                    self._raw_read(addr, window), self._elf_bytes_at(addr, window), trap
-                ))
-                if site.get("baked_trap") and repair:
+                elf = self._elf_bytes_at(addr, window)
+                site.update(classify_trap_site(self._raw_read(addr, window), elf, trap))
+                if repair and site["readable"] and self._drop_stub_record(addr, len(trap)):
+                    site["stub_record"] = True
+                    if site["trap_present"]:
+                        after = classify_trap_site(self._raw_read(addr, window), elf, trap)
+                        if after["readable"] and not after["trap_present"]:
+                            # The stub restored its own saved byte: the trap
+                            # was an orphan nobody would ever have removed.
+                            site["baked_trap"] = site["repaired"] = True
+                if site.get("baked_trap") and repair and not site.get("repaired"):
                     site["repaired"] = self._restore_elf_bytes(addr, bytes.fromhex(site["elf_bytes"]))
                 sites.append(site)
         return sites
+
+    def _drop_stub_record(self, addr: int, kind: int) -> bool:
+        """Ask a remote stub to forget a software breakpoint at *addr*.
+
+        True when it had one (``OK``); a stub without one answers an error.
+        Only called at a stop, where GDB has removed all of its own.
+        """
+        conn = None
+        with contextlib.suppress(Exception):
+            conn = gdb.selected_inferior().connection
+        send = getattr(conn, "send_packet", None)
+        if send is None:
+            return False
+        try:
+            reply = send(f"z0,{addr & _ADDR_MASK:x},{kind:x}")
+        except Exception:
+            _raise_if_remote_lost(self)
+            return False
+        return reply in (b"OK", "OK")
 
     def _restore_elf_bytes(self, addr: int, data: bytes) -> bool:
         """Write *data* at *addr* and confirm it reads back."""
@@ -3752,10 +3824,13 @@ class GdbBridge:
 
     @staticmethod
     def _baked_traps(sites: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        keys = ("number", "location", "address", "function", "guest_bytes", "elf_bytes", "repaired")
+        """Sites that held a trap nobody owned, and what pry did about it."""
+        keys = ("number", "location", "address", "function", "guest_bytes",
+                "elf_bytes", "stub_record", "repaired")
         return [
             {k: site[k] for k in keys if k in site}
-            for site in sites if site.get("baked_trap")
+            for site in sites
+            if site.get("baked_trap") or (site.get("stub_record") and site.get("trap_present"))
         ]
 
     def _verify_insertion(
@@ -3784,7 +3859,7 @@ class GdbBridge:
         reseated: set[tuple[int, int]] = set()
         if not code:
             return {"errors": errors, "resident": resident, "reseated": reseated,
-                    "pending": _pending_locations(), "inserted": False}
+                    "pending": _pending_locations()}
         held = []
         for bp in code:
             for index, loc in enumerate(getattr(bp, "locations", None) or [], 1):
@@ -3846,7 +3921,7 @@ class GdbBridge:
                         bp.enabled = False
                         bp.enabled = True
         return {"errors": errors, "resident": resident, "reseated": reseated,
-                "pending": pending, "inserted": True}
+                "pending": pending}
 
     def _stub_writes_traps(self, observed: bool) -> bool:
         """True when inserted software breakpoints show up as trap bytes in memory.
@@ -3919,6 +3994,11 @@ class GdbBridge:
         if not natural_stop:
             self._last_stop_reason = None
             self._pending_stop_event = None
+            # A finished background execution's answer describes the old
+            # machine; `wait` and `status` must report the re-read state.
+            job = self._background_job
+            if job is not None and job["completion"].is_set():
+                self._background_job = None
         for command in ("maintenance flush register-cache", "maintenance flush dcache"):
             with contextlib.suppress(gdb.error):
                 gdb.execute(command, to_string=True)
@@ -3962,13 +4042,13 @@ class GdbBridge:
             owner = {"number": bp.number, "kind": kind}
             if kind not in ("breakpoint", "hw-breakpoint"):
                 entry = {**owner, "expression": getattr(bp, "expression", None)}
+                # Nothing is read back for a watchpoint or catchpoint, so the
+                # only verdict besides "disabled" is an observed insert error.
                 if not bp.enabled:
                     entry["status"] = "disabled"
                 elif bp.number in verify["errors"]:
                     entry["status"] = "insert-failed"
                     entry["detail"] = verify["errors"][bp.number]
-                elif verify["inserted"] and kind.endswith("watchpoint") and kind != "watchpoint":
-                    entry["status"] = "armed"
                 else:
                     entry["status"] = "unverified"
                 entry["trap_resident"] = None
@@ -4015,7 +4095,7 @@ class GdbBridge:
                                        "it will not fire")
                 else:
                     entry["status"] = "armed"
-                for k in ("guest_bytes", "elf_bytes", "elf_match", "baked_trap", "repaired"):
+                for k in ("guest_bytes", "elf_bytes", "elf_match", "baked_trap", "stub_record", "repaired"):
                     if k in site:
                         entry[k] = site[k]
                 entry["trap_resident"] = verify["resident"].get(key)
