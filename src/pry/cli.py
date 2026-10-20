@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 from .output import write_output_result
 from .paths import (
@@ -76,11 +76,23 @@ class PryArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.set_defaults(_parser=self)
+        # Set on parsers whose positionals may begin with '-' (`pry run`'s
+        # program args): only exact options, `--opt=value` and unambiguous
+        # long prefixes are options there, so `-hide_banner` is not `-h`.
+        self.strict_options = False
         self.add_argument(
             "--help-full",
             action=_HelpFullAction,
             help="Show help for this command and all subcommands",
         )
+
+    def _get_option_tuples(self, option_string: str) -> list[Any]:
+        tuples = super()._get_option_tuples(option_string)
+        if not self.strict_options:
+            return tuples
+        if not option_string.startswith("--"):
+            return []
+        return tuples if len({t[0] for t in tuples}) == 1 else []
 
     def _iter_full_help_parsers(self) -> list[argparse.ArgumentParser]:
         parsers: list[argparse.ArgumentParser] = [self]
@@ -1824,12 +1836,11 @@ def _launch(args: argparse.Namespace) -> int:
         # forwarded to GDB. A pry option placed there (e.g.
         # `pry launch ./bin --format json`) would silently leak to GDB and
         # break the launch. Catch the common case with an actionable message.
-        _pry_flags = {
-            "--format", "--out", "--instance", "--timeout",
-            "--symbols", "--connect",
+        launch_options = {
+            o for o in args._parser._option_string_actions if o.startswith("--")
         }
         first = gdb_extra[0].split("=", 1)[0]
-        if first in _pry_flags:
+        if first in launch_options:
             raise BridgeError(
                 f"'{gdb_extra[0]}' is a pry option but appears after the binary, "
                 f"so it would be forwarded to GDB. Put pry options before the "
@@ -3470,6 +3481,7 @@ def build_parser() -> argparse.ArgumentParser:
             "pry run --timeout 10 -- -threads 1 -i crash.avi"
         ),
     )
+    run.strict_options = True
     _common_io_options(run)
     _add_timeout_arg(run)
     _add_output_arg(run)
@@ -3740,6 +3752,7 @@ def build_parser() -> argparse.ArgumentParser:
     regs_read.set_defaults(handler=_registers)
     regs_write = regs_sub.add_parser("write", help="Write a register value (e.g. registers write rip 0x401234)")
     _common_io_options(regs_write)
+    _add_thread_arg(regs_write)
     regs_write.add_argument("name", help="Register name (rip, rax, pc, ...; leading $ optional)")
     regs_write.add_argument("value", help="Value to set (hex, decimal, or a GDB expression)")
     for regs_child in (regs_read, regs_write):
@@ -3916,17 +3929,81 @@ def _match_option(parser: argparse.ArgumentParser, tok: str) -> argparse.Action 
 
 
 def _run_option_typos(run_parser: argparse.ArgumentParser, extras: list[str]) -> list[str]:
-    """Describe unrecognized `--words` that look like a misspelled `pry run` option."""
+    """Describe unrecognized `--words` that look like a misspelled `pry run` option.
+
+    Exact names and prefixes of real options are not typos: argparse left
+    them over because they were ambiguous or misplaced.
+    """
     long_options = [o for o in run_parser._option_string_actions if o.startswith("--")]
     typos = []
     for tok in extras:
         name = tok.split("=", 1)[0]
-        if not name.startswith("--"):
+        if not name.startswith("--") or any(o.startswith(name) for o in long_options):
             continue
         close = difflib.get_close_matches(name, long_options, n=1, cutoff=0.8)
         if close:
             typos.append(f"{name} (did you mean {close[0]}?)")
     return typos
+
+
+def _split_before_run(
+    parser: argparse.ArgumentParser, raw_argv: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Split `raw_argv` into the known global tokens, the unknown tokens
+    before the `run` subcommand, and the tokens from `run` on."""
+    head: list[str] = []
+    unknown: list[str] = []
+    i = 0
+    while i < len(raw_argv) and raw_argv[i] != "run":
+        tok = raw_argv[i]
+        action = _match_option(parser, tok)
+        if action is None:
+            unknown.append(tok)
+        else:
+            head.append(tok)
+            if action.nargs != 0 and "=" not in tok and i + 1 < len(raw_argv):
+                i += 1
+                head.append(raw_argv[i])
+        i += 1
+    return head, unknown, raw_argv[i:]
+
+
+def _run_extras_error(
+    parser: argparse.ArgumentParser,
+    run_parser: argparse.ArgumentParser,
+    raw_argv: list[str],
+    extras: list[str],
+) -> NoReturn:
+    """Report leftover tokens of a `pry run` command line, with the fix."""
+    head, before, tail = _split_before_run(parser, raw_argv)
+    after = list(extras)
+    for tok in before:
+        if tok in after:
+            after.remove(tok)
+    if before:
+        if not all(_match_option(run_parser, tok) for tok in before):
+            parser.error(f"unrecognized arguments: {' '.join(extras)}")
+        fixed = [*head, tail[0], *before, *tail[1:]]
+        fix = (
+            _run_sentinel_fix(parser, run_parser, fixed)
+            if after else shlex.join(["pry", *fixed])
+        )
+        names = ", ".join(tok.split("=", 1)[0] for tok in before)
+        run_parser.error(
+            f"{names} {'is a pry run option' if len(before) == 1 else 'are pry run options'}: "
+            f"put {'it' if len(before) == 1 else 'them'} after `run`: {fix}"
+        )
+    typos = _run_option_typos(run_parser, after)
+    if typos:
+        run_parser.error(
+            f"unrecognized pry run options: {', '.join(typos)}. If these are "
+            "program arguments, put them after a `--` sentinel"
+        )
+    run_parser.error(
+        f"unrecognized arguments: {' '.join(after)}. Program arguments "
+        "go after pry's own options, behind a `--` sentinel when any "
+        f"begins with '-': {_run_sentinel_fix(parser, run_parser, raw_argv)}"
+    )
 
 
 def _run_sentinel_fix(
@@ -3983,17 +4060,7 @@ def main(argv: list[str] | None = None) -> int:
     args, extras = parser.parse_known_args(argv)
     if extras:
         if getattr(args, "handler", None) is _run:
-            typos = _run_option_typos(args._parser, extras)
-            if typos:
-                args._parser.error(
-                    f"unrecognized pry run options: {', '.join(typos)}. If these are "
-                    "program arguments, put them after a `--` sentinel"
-                )
-            args._parser.error(
-                f"unrecognized arguments: {' '.join(extras)}. Program arguments "
-                "go after pry's own options, behind a `--` sentinel when any "
-                f"begins with '-': {_run_sentinel_fix(parser, args._parser, raw_argv)}"
-            )
+            _run_extras_error(parser, args._parser, raw_argv, extras)
         parser.error(f"unrecognized arguments: {' '.join(extras)}")
     # argparse strips the first `--` separator, so by parse time we can no
     # longer tell `launch ./bin --format json` (a misplaced pry flag) from
