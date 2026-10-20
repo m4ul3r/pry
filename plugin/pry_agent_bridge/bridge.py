@@ -4092,13 +4092,16 @@ class GdbBridge:
         return _elf_file_bytes(real, (addr - slide) & _ADDR_MASK, length)
 
     def _code_regions(self) -> list[tuple[str, int, bytes]]:
-        """``(path, runtime address, bytes)`` of every read-only executable
-        section of the symbol files pry can map onto target memory (see
-        :meth:`_elf_slide`).
+        """``(path, runtime address, bytes)`` of the code that stays code, in
+        the symbol files pry can map onto target memory (see :meth:`_elf_slide`).
 
-        A writable section is data the target changes as it runs, whatever
-        its flags say (Linux 7.0 links `.data` WAX): its bytes are never
-        compared with the file, let alone written back.
+        Only read-only executable sections, and none the kernel frees after
+        boot. A writable section is data the target changes as it runs,
+        whatever its flags say (Linux 7.0 links `.data` WAX). Init code
+        (`.init.text`, and the `.altinstr_*`/`.exit.text` sections Linux
+        places between `__init_begin` and `__init_end`) is poisoned with
+        0xcc and its pages handed back to the page allocator: anyone may own
+        them now. Neither is compared with the file, let alone written back.
         """
         try:
             objfiles = list(gdb.objfiles())
@@ -4119,11 +4122,18 @@ class GdbBridge:
             parsed = _elf_sections(real) if slide is not None else None
             if parsed is None or parsed[0]["type"] == _ELF_ET_REL:
                 continue  # a relocatable object's sections do not move by one slide
+            bounds = _elf_symbol_vaddrs(real, ("__init_begin", "__init_end"))
+            init_begin, init_end = bounds.get("__init_begin"), bounds.get("__init_end")
             try:
                 with open(real, "rb") as f:
                     for s in parsed[1]:
                         if (s["flags"] & wanted != wanted or s["flags"] & _ELF_SHF_WRITE
                                 or s["type"] == _ELF_SHT_NOBITS or not s["size"]):
+                            continue
+                        if s["name"].startswith((b".init.", b".exit.")) or (
+                            init_begin is not None and init_end is not None
+                            and s["addr"] < init_end and init_begin < s["addr"] + s["size"]
+                        ):
                             continue
                         f.seek(s["offset"])
                         regions.append((real, (s["addr"] + slide) & _ADDR_MASK, f.read(s["size"])))

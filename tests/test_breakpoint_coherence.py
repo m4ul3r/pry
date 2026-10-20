@@ -955,19 +955,24 @@ def test_resync_restores_a_baked_trap_away_from_every_breakpoint(monkeypatch):
     assert result["scan"]["bytes"] == len(guest)
 
 
-def test_resync_scans_only_read_only_code_sections(monkeypatch, tmp_path):
-    """Linux 7.0 links `.data` WAX. Its live bytes are data the kernel changed
-    (a 0xcc in a pointer), never compared with the file or written back."""
+def test_resync_scans_only_code_that_stays_code(monkeypatch, tmp_path):
+    """Linux 7.0 links `.data` WAX: its live bytes are data the kernel changed
+    (a 0xcc in a pointer). Init code is freed after boot (poisoned 0xcc, its
+    pages reused by anyone), whatever the section is called. Neither is
+    compared with the file or written back."""
     lead = bytes.fromhex("0f1f4000")
-    text, data = TRAP_SITE - len(lead), 0xFFFFFFFF85200000
+    text, data, init, aux = TRAP_SITE - len(lead), 0xFFFFFFFF85200000, 0xFFFFFFFF863AD000, 0xFFFFFFFF864ECAC5
     planted = lead + b"\xcc" + ELF_WINDOW[1:]
-    memory = {text + i: b for i, b in enumerate(planted)}
-    memory.update({data + i: b for i, b in enumerate(planted)})
+    memory = {}
+    for base in (text, data, init, aux):
+        memory.update({base + i: b for i, b in enumerate(planted)})
     _, fake_gdb, bridge, stub = _remote_target(monkeypatch, memory)
     vmlinux = tmp_path / "vmlinux"
-    _write_kernel_elf(vmlinux, symbols={}, sections=[
+    _write_kernel_elf(vmlinux, symbols={"__init_begin": init, "__init_end": 0xFFFFFFFF869D8000}, sections=[
         (".text", _ALLOC | _EXEC, text, lead + ELF_WINDOW),
         (".data", _WRITE | _ALLOC | _EXEC, data, lead + ELF_WINDOW),
+        (".init.text", _ALLOC | _EXEC, init, lead + ELF_WINDOW),
+        (".altinstr_aux", _ALLOC | _EXEC, aux, lead + ELF_WINDOW),
     ])
     monkeypatch.setattr(fake_gdb, "objfiles", lambda: [types.SimpleNamespace(filename=str(vmlinux))],
                         raising=False)
@@ -975,7 +980,8 @@ def test_resync_scans_only_read_only_code_sections(monkeypatch, tmp_path):
     result = bridge.dispatch({"op": "resync", "params": {}})["result"]
 
     assert [s["address"] for s in result["stray_traps"]] == [hex(TRAP_SITE)]
-    assert stub.mem[data + len(lead)] == 0xCC  # the kernel's data, untouched
+    for base in (data, init, aux):
+        assert stub.mem[base + len(lead)] == 0xCC  # not the debugger's, untouched
     assert result["scan"]["bytes"] == len(planted)
 
 
