@@ -1956,9 +1956,18 @@ class GdbBridge:
                 if any(thread.is_running() for thread in gdb.selected_inferior().threads()):
                     state = "running"
         self._running = state == "running"
-        return _json_response(ok=False, error=self._augment_error(exc, state=state))
+        cause = None
+        if state == "stopped" and str(exc).strip().lower() == "command aborted.":
+            # A resume that failed to insert a breakpoint: GDB printed why to
+            # its console. A trial insertion names it, and takes out of memory
+            # whatever GDB did insert before it gave up.
+            with contextlib.suppress(Exception):
+                cause = self._insertion_errors()
+        return _json_response(ok=False, error=self._augment_error(exc, state=state, cause=cause))
 
-    def _augment_error(self, exc: Exception, *, state: str | None = None) -> str:
+    def _augment_error(
+        self, exc: Exception, *, state: str | None = None, cause: str | None = None
+    ) -> str:
         """Turn a raw GDB/Python error into an agent-actionable message.
 
         Matches GDB's exact, stable error strings (anchored, not arbitrary
@@ -2001,17 +2010,21 @@ class GdbBridge:
         elif "ptrace" in low and "not permitted" in low:
             hint = self._ptrace_hint()
         elif low == "command aborted.":
-            # GDB swallows the real reason (e.g. "Could not insert hardware
-            # watchpoints") under to_string capture, leaving only this. The
-            # usual cause is too many hardware watchpoints/breakpoints — note
-            # they're allocated at continue, not at `watch set`, which is why a
-            # set that "succeeded" makes a later continue abort.
-            hint = (
-                "GDB couldn't run the command — most often too many hardware "
-                "watchpoints/breakpoints to insert (x86 has 4 debug registers, "
-                "allocated at continue, not at `watch set`). Delete some with "
-                "`pry watch delete N` / `pry break delete N`"
-            )
+            if cause:
+                # GDB's own reason, from a trial insertion at this stop.
+                hint = cause
+            else:
+                # GDB swallows the real reason (e.g. "Could not insert hardware
+                # watchpoints") under to_string capture, leaving only this. The
+                # usual cause is too many hardware watchpoints/breakpoints — note
+                # they're allocated at continue, not at `watch set`, which is why
+                # a set that "succeeded" makes a later continue abort.
+                hint = (
+                    "GDB couldn't run the command — most often too many hardware "
+                    "watchpoints/breakpoints to insert (x86 has 4 debug registers, "
+                    "allocated at continue, not at `watch set`). Delete some with "
+                    "`pry watch delete N` / `pry break delete N`"
+                )
         if hint:
             return f"{base} ({hint})"
         return base
@@ -3116,7 +3129,18 @@ class GdbBridge:
         base = params.get("base")
         slide = params.get("slide")
         if base is None and slide is None:
-            self._gdb_exec({"command": f"file {path}"})
+            # `file` only replaces the primary objfile: an add-symbol-file copy
+            # of the same file (a slid `load`, `kbase` rebase or raw command)
+            # would stay beside it and names would resolve to two addresses.
+            # Drop those copies so the link-time table is the only one.
+            enabled = [bp for bp in (gdb.breakpoints() or []) if bp.enabled]
+            removed = False
+            try:
+                removed = self._remove_added_copies(path)
+                self._gdb_exec({"command": f"file {path}"})
+            finally:
+                if removed:
+                    self._reenable_breakpoints(enabled)
             self._symbol_loads.pop(os.path.realpath(path), None)
             self._symbol_file = path
             return self._apply_src_and_scripts({"loaded": path}, params)
@@ -3191,13 +3215,46 @@ class GdbBridge:
         try:
             gdb.execute(f"add-symbol-file {path} -o {offset}{pinned}", to_string=True)
         finally:
-            for bp in enabled:
-                with contextlib.suppress(Exception):
-                    if getattr(bp, "is_valid", lambda: True)() and not bp.enabled:
-                        bp.enabled = True
+            self._reenable_breakpoints(enabled)
         self._symbol_loads[os.path.realpath(path)] = {"path": path, "slide": slide_int}
         self._symbol_file = path
         return list(unslid)
+
+    @staticmethod
+    def _remove_added_copies(path: str) -> bool:
+        """Remove every add-symbol-file objfile of *path*; True if any went.
+
+        Each is named as GDB spells it, so a relative or symlinked *path*
+        still matches. The primary objfile refuses `remove-symbol-file`
+        and stays.
+        """
+        real = os.path.realpath(path)
+        names = []
+        with contextlib.suppress(Exception):
+            names = [
+                o.filename for o in gdb.objfiles()
+                if o.filename and (o.filename == path or os.path.realpath(o.filename) == real)
+            ]
+        removed = False
+        for name in names:
+            try:
+                gdb.execute(f"remove-symbol-file {name}", to_string=True)
+            except gdb.error:
+                continue  # the primary, or a copy already removed
+            removed = True
+        return removed
+
+    @staticmethod
+    def _reenable_breakpoints(enabled) -> None:
+        """Re-enable *enabled* breakpoints GDB disabled during a symbol swap.
+
+        While no symbol file defines a breakpoint's names GDB disables any
+        breakpoint it fails to re-resolve; the user had these enabled.
+        """
+        for bp in enabled:
+            with contextlib.suppress(Exception):
+                if getattr(bp, "is_valid", lambda: True)() and not bp.enabled:
+                    bp.enabled = True
 
     @staticmethod
     def _pid_exists(pid: int) -> bool:
@@ -5183,9 +5240,14 @@ class GdbBridge:
         if record is not None:
             current = record["slide"]
         else:
-            # Loaded with `file`: link addresses, i.e. slide 0 for a kernel.
-            parsed = _elf_sections(path)
-            current = 0 if parsed is not None and parsed[0]["type"] == _ELF_ET_EXEC else None
+            # The primary objfile (`file`, `pry load`, `launch --symbols`) sits
+            # at its link addresses: slide 0, whatever its ELF type (arm64
+            # links vmlinux as ET_DYN). A copy added by hand has no known slide.
+            current = None
+            with contextlib.suppress(Exception):
+                primary = gdb.current_progspace().filename
+                if primary and os.path.realpath(primary) == os.path.realpath(path):
+                    current = 0
         if current is not None:
             out["previous_slide"] = hex(current)
         if current == slide:

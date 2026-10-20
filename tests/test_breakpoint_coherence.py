@@ -376,6 +376,34 @@ def test_failed_resume_is_reported_and_leaves_no_trap_at_the_stop(monkeypatch):
     assert bridge.dispatch({"op": "status"})["result"]["state"] == "stopped"
 
 
+def test_failed_continue_names_the_refused_breakpoint_and_leaves_no_trap(monkeypatch):
+    """#69: a software breakpoint at unmapped memory is the cause, not debug registers."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _Bp(stub, 2, 0xFFFFFFFF00000000)  # nothing mapped there
+    execute = fake_gdb.execute
+
+    def resume(cmd, to_string=False):
+        if cmd == "continue":
+            try:
+                stub.resume()
+            except fake_gdb.error:
+                # GDB prints the cause to its console and raises only this.
+                raise fake_gdb.error("Command aborted.") from None
+        return execute(cmd, to_string=to_string)
+
+    fake_gdb.execute = resume
+
+    response = bridge.dispatch({"op": "continue", "params": {}})
+
+    assert response["ok"] is False
+    assert "Cannot insert breakpoint 2." in response["error"]
+    assert "debug registers" not in response["error"]
+    # Breakpoint 1, which GDB inserted before it gave up, is out of memory.
+    assert stub.inserted == {}
+    assert stub.mem[TRAP_SITE] == ELF_WINDOW[0]
+
+
 def test_background_finish_is_not_cancelled_to_apply_a_change(monkeypatch):
     _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
     _Bp(stub, 1, TRAP_SITE)
