@@ -1321,17 +1321,48 @@ def _render_kbase_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     base = value.get("base")
-    method = value.get("method", "unknown")
     if not base:
         return "Unable to locate the kernel base"
-    lines = [f"Found virtual text base address: {base} (method={method})"]
+    lines = [f"kernel base: {base} ({value.get('reference', '_text')}, slide {value.get('slide')})"]
+    validated = value.get("validated") or {}
+    if validated:
+        lines.append(
+            f"validated: {validated.get('symbol')} at {validated.get('address')} matches "
+            f"{validated.get('symbols')}: {validated.get('text')!r}"
+        )
+    method = value.get("method")
+    derivation = value.get("derivation")
     handler = value.get("handler")
-    if handler:
-        lines.append(f"handler: {handler}")
-    note = value.get("note")
-    if note:
-        lines.append(f"note: {note}")
-    return "\n".join(lines)
+    name = {"idt": "IDT[0]", "vbar": "VBAR"}.get(method, method)
+    if derivation == "symbol":
+        lines.append(f"found by: {name} handler {handler} = {value.get('handler_symbol')}")
+    elif derivation == "rounded":
+        lines.append(f"found by: {name} handler {handler} rounded down to 2 MiB")
+    elif derivation == "page-tables":
+        lines.append("found by: pwndbg (guest page tables)")
+    apply = value.get("apply") or {}
+    path = apply.get("path")
+    notes: dict[str, Any] = {"run_state": value.get("run_state")}
+    if apply.get("applied"):
+        load = apply.get("load") or {}
+        lines.append(
+            f"symbols: rebased {path} from slide {apply.get('previous_slide', 'unknown')} "
+            f"to {load.get('slide', value.get('slide'))}"
+        )
+        unslid = load.get("unslid_sections")
+        if unslid:
+            lines.append(f"symbols: {', '.join(unslid)} not slid (per-CPU offsets)")
+        pending = load.get("pending_breakpoints")
+        if pending:
+            numbers = ", ".join(f"#{n}" for n in pending)
+            lines.append(f"warning: GDB could not place breakpoint(s) {numbers}: they are "
+                         "pending and will not fire (see `pry break list`)")
+        notes.update(baked_traps=load.get("baked_traps"), pending_breakpoints=pending)
+    elif apply.get("command"):
+        lines.append(f"symbols: {path} is {apply.get('reason')}; apply with: {apply['command']}")
+    elif path:
+        lines.append(f"symbols: {path} {apply.get('reason')} ({apply.get('previous_slide')})")
+    return _with_notes("\n".join(lines), notes)
 
 
 def _render_plugin_install_text(value: Any) -> str:
@@ -2096,6 +2127,9 @@ def _render_load_text(value: Any) -> str:
     else:
         line = f"loaded {path}"
     extras: list[str] = []
+    unslid = value.get("unslid_sections")
+    if unslid:
+        extras.append(f"{', '.join(unslid)} not slid (per-CPU offsets)")
     src = value.get("src")
     if src:
         extras.append(f"src {src}")
@@ -2958,11 +2992,14 @@ def _gdb_exec(args: argparse.Namespace) -> int:
 
 
 def _kbase(args: argparse.Namespace) -> int:
-    """First-class kernel base discovery (pwndbg + IDT remote-memory fallback)."""
+    """Validated kernel base discovery; rebases the loaded kernel symbols."""
+    params: dict[str, Any] = {}
+    if args.symbols:
+        params["symbols"] = str(Path(args.symbols).expanduser().resolve())
     return _call(
         args,
         "kbase",
-        {},
+        params,
         text_renderer=_render_kbase_text,
         stem="kbase",
     )
@@ -3190,16 +3227,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--base", metavar="ADDR",
         help="Runtime address of the kernel/image _text symbol (as reported by "
              "`pry kbase`, `qmu kbase`, or kallsyms `_text`). Loads symbols as the "
-             "sole copy, offsetting ALL sections uniformly (text+data) by "
+             "sole copy, offsetting every image section uniformly (text+data) by "
              "base - link-time _text, avoiding the duplicate-symbol and "
-             "data-not-relocated traps of `kbase -r`. The slide is keyed to the "
+             "data-not-relocated traps of `kbase -r`. Zero-based per-CPU sections "
+             "(.data..percpu on x86-64 6.x) hold offsets KASLR does not move, so "
+             "they stay at their link address. The slide is keyed to the "
              "_text symbol (not the .text section base, which equals _stext on "
              "arm and would be 0x10000 low on arm64); on x86 _text == _stext so "
              "behaviour is unchanged.",
     )
     load.add_argument(
         "--slide", metavar="OFFSET",
-        help="Offset added to every section (alternative to --base). Use when "
+        help="Offset added to every image section (alternative to --base; zero-based "
+             "per-CPU sections stay put as with --base). Use when "
              "the base is not the _text value or the ELF _text/.text can't be "
              "read; e.g. `--slide 0` for a non-KASLR build where link == runtime "
              "(multi_v7 arm32).",
@@ -3658,7 +3698,13 @@ def build_parser() -> argparse.ArgumentParser:
     # --- kbase ---
     kbase_cmd = subparsers.add_parser(
         "kbase",
-        help="Find the kernel virtual text base (KASLR); pwndbg then IDT fallback",
+        help="Find the runtime kernel _text (KASLR), validated against the kernel's "
+             "symbol file, and rebase the loaded symbols to it",
+    )
+    kbase_cmd.add_argument(
+        "--symbols", metavar="PATH",
+        help="The running kernel's vmlinux to validate against (default: the loaded "
+             "symbol file). The slide is applied only to a loaded file",
     )
     _common_io_options(kbase_cmd)
     kbase_cmd.set_defaults(handler=_kbase)

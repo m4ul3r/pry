@@ -198,7 +198,7 @@ Uses hardware watchpoints while single-stepping instructions inside the range, c
 | `pry types show <name>` | Type info (size, fields, declaration) |
 | `pry source list [location]` | Source listing (`--count N`) |
 | `pry info files` | ELF section info |
-| `pry kbase` | Find the kernel virtual text base (KASLR); pwndbg then IDT fallback |
+| `pry kbase` | Find the runtime kernel `_text` (KASLR), validated against the kernel's symbol file (`--symbols`, default the loaded one), and rebase the loaded vmlinux to it; exits 1 rather than report an unvalidated base |
 
 ### Session
 

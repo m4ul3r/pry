@@ -1359,86 +1359,218 @@ def test_parse_idt_entry_offset(monkeypatch):
         parse(b"\x00" * 4)
 
 
-def test_estimate_kbase_from_handler_align(monkeypatch):
-    bridge_mod, _ = _load_bridge(monkeypatch)
-    est = bridge_mod.estimate_kbase_from_handler
-    # Real Linux: asm_exc_divide_error is _text+0x1030
-    handler = 0xFFFFFFFFB0201030
-    assert est(handler) == 0xFFFFFFFFB0200000
-    # Walk-down: readable region starts lower
-    floor = 0xFFFFFFFFB0000000
+def _write_kernel_elf(path: Path, *, sections, symbols: dict[str, int]) -> None:
+    """ELF64-LE ET_EXEC with allocated *sections* plus .symtab/.strtab/.shstrtab.
 
-    def readable(addr: int) -> bool:
-        return addr >= floor
+    Each section is ``(name, flags, addr, data)``; an int ``data`` is the size
+    of a NOBITS section (no file bytes).
+    """
+    names = [s[0] for s in sections] + [".symtab", ".strtab", ".shstrtab"]
+    shstrtab = bytearray(b"\x00")
+    name_off = {}
+    for n in names:
+        name_off[n] = len(shstrtab)
+        shstrtab += n.encode() + b"\x00"
+    strtab = bytearray(b"\x00")
+    symdata = bytes(24)  # null symbol
+    for name, value in symbols.items():
+        sym = bytearray(24)
+        struct.pack_into("<I", sym, 0, len(strtab))
+        struct.pack_into("<Q", sym, 8, value)
+        symdata += bytes(sym)
+        strtab += name.encode() + b"\x00"
 
-    assert est(handler, readable=readable) == floor
+    blobs = bytearray()
+    off = 64
+    shdrs = [bytes(64)]
+
+    def shdr(name, sh_type, flags, addr, offset, size, link=0, entsize=0):
+        b = bytearray(64)
+        struct.pack_into("<IIQQQQIIQQ", b, 0, name_off[name], sh_type, flags, addr,
+                         offset, size, link, 0, 1, entsize)
+        return bytes(b)
+
+    for name, flags, addr, data in sections:
+        if isinstance(data, int):
+            shdrs.append(shdr(name, 8, flags, addr, off, data))
+        else:
+            shdrs.append(shdr(name, 1, flags, addr, off + len(blobs), len(data)))
+            blobs += data
+    symtab_index = len(shdrs)
+    for name, sh_type, blob, link, entsize in (
+        (".symtab", 2, symdata, symtab_index + 1, 24),
+        (".strtab", 3, bytes(strtab), 0, 0),
+        (".shstrtab", 3, bytes(shstrtab), 0, 0),
+    ):
+        shdrs.append(shdr(name, sh_type, 0, 0, off + len(blobs), len(blob), link, entsize))
+        blobs += blob
+    ehdr = bytearray(64)
+    ehdr[0:4] = b"\x7fELF"
+    ehdr[4], ehdr[5], ehdr[6] = 2, 1, 1
+    struct.pack_into("<HHI", ehdr, 16, 2, 0x3E, 1)  # ET_EXEC, x86-64
+    struct.pack_into("<Q", ehdr, 0x28, off + len(blobs))
+    struct.pack_into("<HHHH", ehdr, 0x34, 64, 0, 0, 64)
+    struct.pack_into("<HH", ehdr, 0x3C, len(shdrs), len(shdrs) - 1)
+    path.write_bytes(bytes(ehdr) + bytes(blobs) + b"".join(shdrs))
 
 
-def test_kbase_via_pwndbg_success(monkeypatch):
-    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
-    bridge = bridge_mod.GdbBridge()
-    real_exec = fake_gdb.execute
-
-    def _exec(cmd, to_string=False):
-        if cmd == "kbase":
-            return "Found virtual text base address: 0xffffffffb0200000\n"
-        return real_exec(cmd, to_string=to_string)
-
-    fake_gdb.execute = _exec
-    result = bridge._dispatch_op("kbase", {})
-    assert result["base"] == "0xffffffffb0200000"
-    assert result["method"] == "pwndbg"
-    assert result["attempts"][0]["ok"] is True
+_ALLOC, _WRITE, _EXEC = 0x2, 0x1, 0x4
+# 6.6.75 x86-64 layout (#55): asm_exc_divide_error sits 0x18010a0 above _text,
+# so IDT[0] rounded down to 2 MiB lands 24 MiB too high, on int3 padding.
+_X86_LINK_TEXT = 0xFFFFFFFF81000000
+_X86_LINK_HANDLER = _X86_LINK_TEXT + 0x18010A0
+_X86_LINK_BANNER = 0xFFFFFFFF82F23260
+_X86_RUNTIME_TEXT = 0xFFFFFFFF88A00000  # qmu kbase / kallsyms _text in the issue
+_X86_SLIDE = _X86_RUNTIME_TEXT - _X86_LINK_TEXT
+_X86_HANDLER = _X86_LINK_HANDLER + _X86_SLIDE  # 0xffffffff8a2010a0
+_IDT_BASE = 0xFFFFFE0000000000
+_BANNER = b"Linux version 6.6.75 (pry@test) (gcc 12) #1 SMP\n"
 
 
-def test_kbase_falls_back_to_idt_when_pwndbg_fails(monkeypatch):
-    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
-    bridge = bridge_mod.GdbBridge()
+def _x86_kernel_elf(path: Path, *, banner: bytes = _BANNER) -> Path:
+    _write_kernel_elf(
+        path,
+        sections=[
+            (".text", _ALLOC | _EXEC, _X86_LINK_TEXT, 0x2000000),
+            (".rodata", _ALLOC, _X86_LINK_BANNER, banner + b"\x00"),
+            (".data..percpu", _ALLOC | _WRITE, 0, 0x40000),
+        ],
+        symbols={
+            "_text": _X86_LINK_TEXT,
+            "asm_exc_divide_error": _X86_LINK_HANDLER,
+            "linux_banner": _X86_LINK_BANNER,
+            "current_task": 0x1AD00,
+        },
+    )
+    return path
 
-    idt_base = 0xFFFFFE0000000000
-    handler = 0xFFFFFFFFB0201030  # _text + 0x1030
-    text_base = 0xFFFFFFFFB0200000
-    off_lo = handler & 0xFFFF
-    off_mid = (handler >> 16) & 0xFFFF
-    off_hi = (handler >> 32) & 0xFFFFFFFF
-    idt_entry = struct.pack("<HHBBHII", off_lo, 0x10, 0, 0x8E, off_mid, off_hi, 0)
 
-    mem: dict[int, bytes] = {idt_base: idt_entry}
-    # Mark text region readable in 2MiB steps down to text_base
-    for a in range(text_base, handler + 0x1000, 0x200000):
-        mem.setdefault(a, b"\x90")
-
-    real_exec = fake_gdb.execute
-
-    def _exec(cmd, to_string=False):
-        if cmd == "kbase":
-            return (
-                "Permission error when attempting to parse page tables with gdb-pt-dump.\n"
-                "Unable to locate the kernel base\n"
-            )
-        if cmd == "monitor info registers":
-            return f"IDT=     {idt_base:016x} 00000fff\n"
-        return real_exec(cmd, to_string=to_string)
+def _x86_guest(fake_gdb, *, banner: bytes = _BANNER, pwndbg: str | None = None):
+    """A stopped KASLR guest: IDT[0] -> handler, linux_banner at link + slide."""
+    h = _X86_HANDLER
+    entry = struct.pack("<HHBBHII", h & 0xFFFF, 0x10, 0, 0x8E, (h >> 16) & 0xFFFF, h >> 32, 0)
+    memory = {_IDT_BASE: entry, _X86_LINK_BANNER + _X86_SLIDE: banner}
 
     def _read_memory(addr, length):
-        # Exact page or any address in a mapped 2MiB window from text_base..handler
-        if addr in mem:
-            data = mem[addr]
-            return data[:length] if len(data) >= length else data + bytes(length - len(data))
-        if text_base <= addr < handler + 0x10000:
-            return bytes(length)
-        raise OSError(f"Cannot access memory at address {addr:#x}")
+        for start, data in memory.items():
+            if start <= addr and addr + length <= start + len(data):
+                return data[addr - start:addr - start + length]
+        # The rounded candidate's banner address is int3 padding.
+        return b"\xcc" * length
+
+    real_exec = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        if cmd == "kbase":
+            return pwndbg or "Unable to locate the kernel base\n"
+        if cmd == "monitor info registers":
+            return f"IDT=     {_IDT_BASE:016x} 00000fff\n"
+        return real_exec(cmd, to_string=to_string)
 
     fake_gdb.execute = _exec
     fake_gdb.selected_inferior().read_memory = _read_memory
 
-    result = bridge._dispatch_op("kbase", {})
-    assert result["base"] == hex(text_base)
+
+def test_kbase_maps_idt_handler_through_symbols_to_exact_text(monkeypatch, tmp_path):
+    """#55: IDT[0] 24 MiB above _text gives _text exactly, not the padding."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = _x86_kernel_elf(tmp_path / "vmlinux")
+    _x86_guest(fake_gdb)
+
+    result = bridge._dispatch_op("kbase", {"symbols": str(elf)})
+
+    assert result["base"] == hex(_X86_RUNTIME_TEXT)
+    assert result["slide"] == hex(_X86_SLIDE)
     assert result["method"] == "idt"
-    assert result["handler"] == hex(handler)
-    assert result["attempts"][0]["method"] == "pwndbg"
-    assert result["attempts"][0].get("ok") is not True
-    assert result["attempts"][1]["ok"] is True
+    assert result["derivation"] == "symbol"
+    assert result["handler_symbol"] == "asm_exc_divide_error"
+    assert result["validated"]["address"] == hex(_X86_LINK_BANNER + _X86_SLIDE)
+    # Not loaded in GDB: nothing is loaded behind the user's back, and the
+    # command that applies it is given.
+    assert result["apply"]["applied"] is False
+    assert result["apply"]["command"] == f"pry load {elf} --base {_X86_RUNTIME_TEXT:#x}"
+    assert not any(c.startswith("add-symbol-file") for c in fake_gdb._execute_log)
+
+
+def test_kbase_without_symbol_file_reports_no_base(monkeypatch):
+    """No symbol file: the rounded handler is an upper bound, never the answer."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    _x86_guest(fake_gdb)
+
+    resp = bridge.dispatch({"op": "kbase", "params": {}})
+
+    assert resp["ok"] is False
+    assert "could not determine" in resp["error"]
+    assert "at or below 0xffffffff8a200000" in resp["error"]
+    assert "--symbols" in resp["error"]
+
+
+def test_kbase_refuses_when_no_candidate_matches_symbols(monkeypatch, tmp_path):
+    """A vmlinux that is not the running kernel's validates nothing."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = _x86_kernel_elf(tmp_path / "vmlinux", banner=b"Linux version 6.6.76 (other) #2 SMP\n")
+    _x86_guest(fake_gdb)
+
+    resp = bridge.dispatch({"op": "kbase", "params": {"symbols": str(elf)}})
+
+    assert resp["ok"] is False
+    assert "no candidate matches" in resp["error"]
+
+
+def test_kbase_validates_pwndbg_base(monkeypatch, tmp_path):
+    """pwndbg's page-table answer is a candidate like any other: checked first."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = _x86_kernel_elf(tmp_path / "vmlinux")
+    _x86_guest(
+        fake_gdb, pwndbg=f"Found virtual text base address: {_X86_RUNTIME_TEXT:#x}\n",
+    )
+    # No IDT: only pwndbg proposes a base.
+    real_exec = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        if cmd == "monitor info registers":
+            raise fake_gdb.error("no monitor")
+        if cmd.startswith("info"):
+            return ""
+        return real_exec(cmd, to_string=to_string)
+
+    fake_gdb.execute = _exec
+    fake_gdb.parse_and_eval = lambda expr: (_ for _ in ()).throw(fake_gdb.error("no reg"))
+
+    result = bridge._dispatch_op("kbase", {"symbols": str(elf)})
+    assert result["base"] == hex(_X86_RUNTIME_TEXT)
+    assert result["method"] == "pwndbg"
+
+
+def test_kbase_rebases_the_loaded_symbol_file(monkeypatch, tmp_path):
+    """#55: the validated slide is applied to the loaded vmlinux, once."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = _x86_kernel_elf(tmp_path / "vmlinux")
+    _x86_guest(fake_gdb)
+    # Loaded with a plain `file` (link addresses).
+    fake_gdb.objfiles = lambda: [types.SimpleNamespace(filename=str(elf))]
+    fake_gdb.current_progspace = lambda: types.SimpleNamespace(filename=str(elf))
+
+    result = bridge._dispatch_op("kbase", {})
+
+    assert result["validated"]["symbols"] == str(elf)
+    apply = result["apply"]
+    assert apply["applied"] is True
+    assert apply["previous_slide"] == "0x0"
+    assert apply["load"]["slide"] == hex(_X86_SLIDE)
+    # Per-CPU offsets stay at link addresses (#58).
+    assert f"add-symbol-file {elf} -o {_X86_SLIDE:#x} -s .data..percpu 0x0" in fake_gdb._execute_log
+
+    fake_gdb._execute_log.clear()
+    again = bridge._dispatch_op("kbase", {})
+    assert again["apply"]["applied"] is False
+    assert again["apply"]["previous_slide"] == hex(_X86_SLIDE)
+    assert not any(c.startswith("add-symbol-file") for c in fake_gdb._execute_log)
 
 
 def test_kbase_all_methods_fail(monkeypatch):
@@ -1469,9 +1601,13 @@ def test_kbase_all_methods_fail(monkeypatch):
 
 # Ground truth captured live from a Linux 7.0 arm64 guest under QEMU TCG:
 #   VBAR (== `vectors` symbol) = 0xffffb4a677611000
-#   _text (== `qmu kbase`)      = 0xffffb4a677600000  (VBAR rounded down to 2 MiB)
+#   _text (== `qmu kbase`)      = 0xffffb4a677600000
 _VBAR_LIVE = 0xFFFFB4A677611000
 _ARM64_TEXT = 0xFFFFB4A677600000
+# 7.0 arm64 vmlinux link addresses.
+_ARM64_LINK_TEXT = 0xFFFF800080000000
+_ARM64_LINK_VECTORS = 0xFFFF800080011000
+_ARM64_LINK_BANNER = 0xFFFF8000841F0BA0
 # QEMU's aarch64 gdbstub exposes the register bare as ``VBAR`` (not ``vbar_el1``)
 # in ``info all-registers``; ``RVBAR_EL1`` (reset vector base) also appears and
 # must NOT be confused for it.
@@ -1482,17 +1618,6 @@ _ARM64_ALLREGS = (
     "RVBAR_EL1      0x0                 0\n"
     "RMR_EL1        0x1                 1\n"
 )
-
-
-def _make_arm64_readable(base):
-    """read_memory that treats the whole kernel VA range as mapped."""
-
-    def _read_memory(addr, length):
-        if addr >= base:
-            return bytes(length)
-        raise OSError(f"Cannot access memory at address {addr:#x}")
-
-    return _read_memory
 
 
 def test_vbar_regex_matches_qemu_bare_name_not_rvbar(monkeypatch):
@@ -1509,10 +1634,23 @@ def test_vbar_regex_matches_qemu_bare_name_not_rvbar(monkeypatch):
     assert rx.search("RVBAR_EL1      0x0                 0\n") is None
 
 
-def test_kbase_falls_back_to_vbar_via_all_registers(monkeypatch):
-    """pwndbg + IDT fail; VBAR is recovered from ``info all-registers``."""
+def test_kbase_falls_back_to_vbar_via_all_registers(monkeypatch, tmp_path):
+    """pwndbg + IDT fail; VBAR from ``info all-registers`` maps through `vectors`."""
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
+    elf = tmp_path / "vmlinux"
+    _write_kernel_elf(
+        elf,
+        sections=[
+            (".head.text", _ALLOC | _EXEC, _ARM64_LINK_TEXT, 0x10000),
+            (".rodata", _ALLOC, _ARM64_LINK_BANNER, _BANNER + b"\x00"),
+        ],
+        symbols={
+            "_text": _ARM64_LINK_TEXT,
+            "vectors": _ARM64_LINK_VECTORS,
+            "linux_banner": _ARM64_LINK_BANNER,
+        },
+    )
 
     def _exec(cmd, to_string=False):
         if cmd == "kbase":
@@ -1525,34 +1663,32 @@ def test_kbase_falls_back_to_vbar_via_all_registers(monkeypatch):
             return _ARM64_ALLREGS
         return ""
 
+    runtime_banner = _ARM64_LINK_BANNER + _ARM64_TEXT - _ARM64_LINK_TEXT
+
+    def _read_memory(addr, length):
+        if addr == runtime_banner:
+            return _BANNER[:length]
+        return bytes(length)
+
     fake_gdb.execute = _exec
     # No register is directly evaluable (forces the regex path for both idt/vbar)
     fake_gdb.parse_and_eval = lambda expr: (_ for _ in ()).throw(
         fake_gdb.error("Cannot convert value to long.")
     )
-    fake_gdb.selected_inferior().read_memory = _make_arm64_readable(_ARM64_TEXT)
+    fake_gdb.selected_inferior().read_memory = _read_memory
 
-    result = bridge._dispatch_op("kbase", {})
+    result = bridge._dispatch_op("kbase", {"symbols": str(elf)})
     assert result["base"] == hex(_ARM64_TEXT)
     assert result["method"] == "vbar"
+    assert result["derivation"] == "symbol"
+    assert result["handler_symbol"] == "vectors"
     assert result["handler"] == hex(_VBAR_LIVE)
-    assert result["attempts"][-1]["ok"] is True
-    assert result["attempts"][-1]["align"] == hex(bridge_mod._KBASE_ALIGN_2M)
 
 
-def test_kbase_via_vbar_convenience_register(monkeypatch):
-    """QEMU exposes ``$VBAR``; the round-down base must NOT walk below _text."""
+def test_kbase_vbar_reads_convenience_register(monkeypatch):
+    """QEMU exposes ``$VBAR``; the probe reads it without the register dump."""
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
-
-    def _exec(cmd, to_string=False):
-        if cmd == "kbase":
-            return "Unable to locate the kernel base\n"
-        if cmd == "monitor info registers":
-            raise fake_gdb.error("Monitor command failed")
-        if cmd == "info registers idtr":
-            return ""
-        return ""
 
     class _V:
         def __init__(self, v):
@@ -1566,15 +1702,9 @@ def test_kbase_via_vbar_convenience_register(monkeypatch):
             return _V(_VBAR_LIVE)
         raise fake_gdb.error("Cannot convert value to long.")
 
-    fake_gdb.execute = _exec
     fake_gdb.parse_and_eval = _eval
-    # EVERYTHING below the base is also "readable"; the old walk-down code would
-    # have descended below _text. Round-down-only must land exactly on _text.
-    fake_gdb.selected_inferior().read_memory = lambda addr, length: bytes(length)
 
-    result = bridge._dispatch_op("kbase", {})
-    assert result["base"] == hex(_ARM64_TEXT)
-    assert result["method"] == "vbar"
+    assert bridge._kbase_via_vbar()["handler"] == _VBAR_LIVE
 
 
 def test_kbase_vbar_unavailable_names_fallbacks(monkeypatch):
@@ -3120,6 +3250,33 @@ def test_load_base_arm32_reads_elf32_no_valueerror(monkeypatch, tmp_path):
     assert result["slide"] == hex(0)
     assert result["reference"] == "_text"
     assert any(c == f"add-symbol-file {elf} -o 0x0" for c in fake_gdb._execute_log)
+
+
+@pytest.mark.parametrize(
+    ("percpu_addr", "pinned"),
+    [
+        (0, " -s .data..percpu 0x0"),       # x86-64 6.x: zero-based per-CPU offsets
+        (0xFFFFFFFF869A0000, ""),            # x86-64 7.0: per-CPU data inside the image
+    ],
+)
+def test_load_base_keeps_zero_based_percpu_unslid(monkeypatch, tmp_path, percpu_addr, pinned):
+    """#58: KASLR does not move zero-based per-CPU offsets; `load --base` must not either."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = tmp_path / "vmlinux"
+    _write_kernel_elf(
+        elf,
+        sections=[
+            (".text", _ALLOC | _EXEC, _X86_LINK_TEXT, 0x2000000),
+            (".data..percpu", _ALLOC | _WRITE, percpu_addr, 0x40000),
+        ],
+        symbols={"_text": _X86_LINK_TEXT},
+    )
+
+    result = bridge._dispatch_op("load", {"path": str(elf), "base": hex(_X86_RUNTIME_TEXT)})
+
+    assert f"add-symbol-file {elf} -o {_X86_SLIDE:#x}{pinned}" in fake_gdb._execute_log
+    assert result.get("unslid_sections", []) == ([".data..percpu"] if pinned else [])
 
 
 def test_function_designator_and_qualified_name(monkeypatch):
