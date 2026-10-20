@@ -97,10 +97,13 @@ Every command accepts `--format [text|json|ndjson]`, `--out <path>`, and `--inst
 | `pry connect <host:port>` | Connect to a remote GDB target (QEMU, gdbserver) (`--connect-timeout`) |
 | `pry disconnect` | Disconnect from the remote target |
 | `pry inferior list` | List inferiors |
+| `pry resync` | Re-read the stop state and re-arm breakpoints after the machine changed under GDB: snapshot load, reset, reboot (`--base`, `--symbols`) |
 
 Some `gdbserver` builds ignore the HOST in `127.0.0.1:PORT` and bind all interfaces. Verify the listener with `ss -ltnp`; use stdio or an isolated/verified loopback-only transport rather than assuming HOST restricts access. Once GDB observes transport loss, pry returns an operational error until reconnect instead of reporting successful execution or serving known-stale inspection data.
 
 Idle remote inspection refreshes GDB's register/frame caches to avoid GDB 15's stale-cache abort during lazy unwind-data fetching. Frame selection is preserved, but Python scripts must reacquire `gdb.Frame` objects after another command. Once transport loss is known, raw GDB commands are restricted to target-recovery operations.
+
+A QEMU gdbstub does not tell GDB about a snapshot load or a reset, so GDB keeps a stale stop reason and believes its breakpoints are still in memory. `pry resync` stops a running target (resuming it afterwards), drops the stale state, optionally reloads the symbols at a new KASLR base (`--base`), restores baked traps, makes GDB insert every breakpoint, and reads each trap back. Its JSON result reports every breakpoint location's `status` (`armed`, `pending`, `unreadable`, `insert-failed`, `not-resident`, `disabled`, `unverified`) and `trap_resident`, plus a `summary`; the full shape is documented in `skills/pry/SKILL.md`.
 
 ### Execution control
 
@@ -138,6 +141,8 @@ When `--timeout` fires, the bridge auto-interrupts the inferior and returns the 
 | `pry break enable/disable <num>` | Toggle breakpoint |
 | `pry watch set <expr>` | Set watchpoint (`--type write\|read\|access`) |
 | `pry watch list/delete/enable/disable` | Manage watchpoints |
+
+On a running all-stop remote target (QEMU gdbstub, gdbserver), breakpoint and watchpoint changes and `pry load` stop the target, apply, and resume it, reporting `run_state`; a target that stopped on its own meanwhile stays stopped. A location GDB gave up inserting is reported `pending` with no address. At a stop on a remote target, a lone `int3` the symbol file does not have at a breakpoint site (baked in by a snapshot) is restored and reported in `baked_traps`.
 
 #### PIE/ASLR rebasing
 

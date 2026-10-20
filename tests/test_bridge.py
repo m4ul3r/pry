@@ -293,7 +293,9 @@ def _load_bridge(monkeypatch):
             self._handlers[:] = [h for h in self._handlers if h is not handler]
 
         def fire(self, event):
-            for handler in self._handlers:
+            # GDB calls a snapshot of the callbacks: a handler that
+            # disconnects another one mid-emit does not skip it.
+            for handler in list(self._handlers):
                 handler(event)
 
     class _FakeStopEvent:

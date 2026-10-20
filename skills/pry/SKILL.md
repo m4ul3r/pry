@@ -127,6 +127,38 @@ pry backtrace
 
 The `-s` flag enables the GDB stub on port 1234. The `-S` flag freezes the CPU at startup.
 
+### Re-syncing after a snapshot load or reset (`pry resync`)
+
+A QEMU gdbstub never tells GDB that the machine changed under it. After `qmu snapshot load` (loadvm), a `system_reset`, or a guest reboot, GDB keeps the old stop reason and believes its breakpoints are still in memory. `pry resync` re-establishes the truth:
+
+```bash
+pry resync                              # after a snapshot load or a nokaslr reset
+pry resync --base 0x<kbase>             # KASLR re-slid (reset/reboot): reload symbols at the new base first
+pry resync --base 0x<kbase> --symbols ./vmlinux   # name the symbol file (default: the last `pry load`)
+```
+
+It stops a running target (and resumes it afterwards), drops the stale stop reason, the register/memory caches and any finished background result (so `pry status` and `pry wait` both report the re-read state), re-reads a rebased symbol file whose breakpoints GDB gave up on (`<PENDING>`), restores baked traps and drops stub records nobody owns (below), then makes GDB insert every breakpoint at that stop and reads each trap back from target memory. Left stopped, it removes them again, so a snapshot taken at that stop holds no `int3`.
+
+JSON result (`--format json`), a stable interface for callers such as qmu:
+
+| Key | Meaning |
+|-----|---------|
+| `resynced` | always `true` |
+| `state` / `status` | where the target is now: `stopped` or `running` |
+| `reason` | when stopped: `{"kind": "resynced"}`, or the target's own stop if it stopped by itself while resync was stopping it; absent when running |
+| `frame`, `thread` | freshly re-read, when stopped |
+| `run_state` | `{was_running, interrupted, resumed}`, plus `stop` (it stopped on its own, or again at once after the resume) or `error` (it could not be resumed and is stopped) |
+| `symbols` | with `--base`: `{loaded, base, slide, reference}` as `pry load` reports them |
+| `reloaded` | paths of rebased symbol files re-read to recover `<PENDING>` locations |
+| `breakpoints[]` | one entry per breakpoint location (per watchpoint/catchpoint): `number`, `location` (`"N.M"`), `kind`, `address` (absent when pending), `function` / `expression`, `status`, `detail`, `trap_resident`, `reseated` (only when true), and for software breakpoints with readable memory `guest_bytes`, `elf_bytes`, `elf_match`, `baked_trap`, `stub_record` (only when true), `repaired` |
+| `summary` | `{breakpoints, armed, not_armed, baked_traps, repaired, elf_mismatch}` |
+
+`status` is one of: `armed` (GDB inserted it at resync's stop without error, and its trap is in memory wherever that is observable), `pending` (no address GDB will insert: unresolved, or `<PENDING>`), `unreadable` (target memory at the address cannot be read, so no trap can go there: the code moved after a KASLR re-slide, or is not mapped yet), `insert-failed` (the stub refused; `detail` has GDB's message), `not-resident` (the stub accepted it but its trap is not in memory, even after re-inserting it), `disabled` (by the user), `unverified` (watchpoints and catchpoints: nothing is read back for them, so only an observed insert error changes this). `not_armed` counts `pending` + `unreadable` + `insert-failed` + `not-resident`.
+
+`trap_resident` is the trap instruction read back from target memory while GDB had the breakpoint inserted. It is `true`/`false` where traps are observable in memory (native targets, QEMU with KVM, or any stub where one was seen) and `null` where the stub keeps breakpoints out of the memory it reports (QEMU TCG, gdbserver), and for hardware breakpoints, watchpoints and entries that were not inserted. `reseated: true` means the first insert wrote nothing because QEMU's KVM gdbstub still held a record for that address (it survives a failed removal, e.g. the first stop after a reset, before the kernel maps its text), so resync dropped the record and inserted the breakpoint again. `elf_match: false` means target memory at the site is not what the symbol file has there, usually symbols at a stale KASLR base: rerun with `--base`.
+
+Exit 0 means the report is current, not that every breakpoint is armed: check `summary.not_armed`, and `summary.elf_mismatch` (an `armed` breakpoint whose site does not match the symbol file traps wherever the stale symbols point, usually not the code you meant). Exit 1 means resync could not do its job (no live target, remote lost, a reload failed, or a running target could not be stopped, in which case nothing was changed).
+
 ## Workflow
 
 1. Start with bridge health check:
@@ -236,6 +268,8 @@ Execution commands report the **stop reason** when available:
 - `reason: watchpoint #2 (buf) hit` — watchpoint triggered
 - `reason: signal SIGSEGV` — received a signal
 - `reason: step` — a step/next/finish/until completed normally
+- `reason: trap at ADDR: ...` — `continue`/`run`/`jump` stopped on a trap no breakpoint of pry's owns (JSON `kind: "trap"`, `address`; `trap_in_memory: true` with `trap_address` when a trap instruction is in memory there: the program's own `int3`, or one left behind, orphaned or baked into a restored snapshot)
+- `reason: resynced` — `pry resync` re-read the state after the machine changed; the previous stop reason no longer applies
 
 `pry status` and `pry wait` carry the same `reason`, so you can always ask "why is it stopped?" after a background exec or poll.
 
@@ -264,6 +298,12 @@ pry watch list                              # List all (same as break list)
 ```
 
 **Multi-location breakpoints:** GDB can resolve one symbolic breakpoint to several sites (common with inlined callees — e.g. `free_msg` may also land inside `load_msg`). `pry break set` / `pry break list` report `location_count` and a full `locations[]` of `{address,file,line,function}` (text lists every site). Do not assume the top-level `address`/`function` is the only hit site; inspect `locations` when `location_count > 1`.
+
+**Running remote targets:** an all-stop remote stub (QEMU gdbstub, gdbserver) accepts no packets while it runs, and GDB edits its breakpoint table before it talks to the target. So when the target is running, `break set/delete/enable/disable`, `watch set/delete/enable/disable` and `load` stop it, apply the change at that stop, and resume it. JSON results carry `run_state: {was_running, interrupted, resumed}` and text ends with a `note:` line. GDB inserts breakpoints only when it resumes: a location it gives up on then (`<PENDING>`) is listed in `run_state.pending_after_resume` (`"N.M"`), marked pending in the returned breakpoint, and added to `load`'s `pending_breakpoints`. If the target stopped on its own meanwhile (a breakpoint hit racing the stop), it is left stopped and `run_state.stop` holds that stop. If the resume fails (GDB could not insert a breakpoint), the change still stands, `run_state.error` carries GDB's reason (e.g. `Cannot insert breakpoint 6. Cannot access memory at address …`), and the target is left stopped with no trap of GDB's in memory. If pry cannot stop the target, or the running execution is a background `finish`/`until`/`step`/`next` that a stop would cancel, the command exits 1 and nothing is changed. A `pry wait` already waiting keeps waiting through this internal stop. Native targets take these changes live (no `run_state`). Raw `pry gdb 'delete 3'` bypasses all of this.
+
+**Pending locations:** `pending: true` (text `(pending)` / `<PENDING>`) also covers a location GDB tried to insert and gave up on (it shows `<PENDING>` in `maint info breakpoints`): such a location carries `pending: true` and no `address`, because nothing will trap there. `pry load` lists the breakpoints it left pending in `pending_breakpoints`, including those GDB gave up on when it resumed a running target. `pry resync` re-reads a rebased symbol file to recover them.
+
+**Baked traps and orphaned records:** at a stop GDB holds none of its breakpoints in memory, so a lone trap instruction (`0xcc` on x86, `brk #0` on arm64) at a breakpoint site, where the symbol file has another instruction and the following bytes match, belongs to nobody. It is typically an `int3` baked into a snapshot saved while breakpoints were inserted. Arming over it would save the trap as the "original" and leave it behind for good. Likewise any record the stub still keeps for that address belongs to nobody: an orphaned `int3` (its trap still in memory) or a stale record from a failed removal (the first stop after a reset). QEMU's KVM gdbstub turns GDB's next insert at such an address into a no-op, so the breakpoint would be listed `[enabled]` and never fire. On remote targets, `break set/enable/disable/delete`, `load` and `resync` first drop any such stub record (a raw `z0`; QEMU writes an orphan's saved byte back), then restore the symbol file's byte(s) over a trap still there, and report `baked_traps: [{number, location, address, function, guest_bytes, elf_bytes, stub_record, repaired}]` (text: a `warning:` line; `stub_record: true` marks an orphan the stub still recorded). A stale record with no trap in memory is dropped silently: the breakpoint then simply works. A site whose surrounding bytes do not match the symbol file (stale base, patched text) is never written. An unoptimised kprobe's `int3` at the very same address looks identical and is restored too. The byte check needs the symbol file's mapping: a plainly loaded non-PIE ELF (a nokaslr vmlinux), or one loaded with `pry load --base/--slide`. Native processes are never touched (a lone `int3` there is the program's own).
 
 ### PIE/ASLR rebasing
 
