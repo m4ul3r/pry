@@ -195,6 +195,7 @@ Automatic spills use exclusively created unique files, so concurrent commands ca
 
 ```bash
 pry run [args...]            # Run the program (blocks until stop/exit)
+pry run -- -threads 1 -i crash.avi  # `--` before args that begin with '-'
 pry run --stdin-file /path/to/payload [args...]  # Feed raw stdin from a file (CTF/exploit)
 pry continue                 # Continue from current stop
 pry step [count]             # Step into (source-level)
@@ -217,7 +218,9 @@ pry thread select 3          # Make thread 3 the persistently selected one
 
 Execution commands block until the inferior stops or exits. Use `--timeout N` to auto-interrupt after N seconds — the bridge interrupts the inferior and returns stop info with `timeout_interrupt: true`, staying responsive for subsequent commands. Set breakpoints before running to ensure the program stops where you want.
 
-**Stdin for the inferior:** use `pry run --stdin-file PATH` to open `PATH` as the inferior's real stdin (fd 0). Bytes are delivered raw — no PTY, so cooked-mode XON/XOFF cannot eat control bytes. Program args stay separate (`pry run --stdin-file payload.bin arg1 arg2`); use `--` before leading-dash program arguments.
+**Program arguments:** pry's own `run` options (`--timeout`, `--background`, `--stdin-file`, `--output`, `--format`, `--out`, `--instance`) come first, then the program arguments. When any program argument begins with `-`, put `--` in front of them: `pry run --timeout 10 -- -threads 1 -i crash.avi -f null -`. Without the sentinel pry rejects the command and prints the corrected command line. An argument that spells one of pry's options (or an unambiguous prefix like `--time`) is taken by pry unless it follows `--`.
+
+**Stdin for the inferior:** use `pry run --stdin-file PATH` to open `PATH` as the inferior's real stdin (fd 0). Bytes are delivered raw — no PTY, so cooked-mode XON/XOFF cannot eat control bytes. Program args stay separate (`pry run --stdin-file payload.bin arg1 arg2`).
 
 **Exact argv:** `pry run` preserves empty arguments, whitespace, quotes, backslashes, and literal shell metacharacters. It temporarily uses `/bin/sh` with each argument safely quoted, then restores GDB's `startup-with-shell` and the debugger's `SHELL`. This avoids old GDB no-shell parsers that split on whitespace regardless of quoting. Rerunning without new arguments reuses the previous vector. Raw `pry gdb 'run ...'` remains a GDB command and does not use pry's argv handling; the default launch setting is still `startup-with-shell off`, so use `--stdin-file` rather than raw shell redirection.
 
@@ -378,6 +381,7 @@ pry print "/x flags"             # GDB muscle-memory `print /x expr` also works
 pry call 'fn(1, "x")'            # Call an inferior function, return its value
 pry registers                    # General-purpose registers
 pry registers --all              # All registers (including FP/SIMD)
+pry registers read rip rdi       # Named registers only (aliases pc/sp, sub-registers eax; leading $ optional)
 pry registers write rip 0x401234 # Set a register ($pc/$rsp/etc.; leading $ optional)
 pry mappings                     # Process memory map (structured vmmap)
 pry mappings --contains 0x7ffff7d00000   # Mapping that holds an address
