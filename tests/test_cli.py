@@ -2884,6 +2884,14 @@ def test_run_misspelled_pry_option_is_not_forwarded(monkeypatch, capsys):
     assert "--timeout" in capsys.readouterr().err
 
 
+def test_run_misspelled_option_after_misplaced_one_is_still_a_typo(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch)
+    with pytest.raises(SystemExit):
+        pry.cli.main(["--background", "run", "--tmeout", "5", "a"])
+    assert cap == {}
+    assert "--timeout" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("program_args", [
     ["-hide_banner", "-i", "crash.avi"], ["-hwaccel", "cuda"], ["-help"], ["--h"], ["--o", "x"],
 ])

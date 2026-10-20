@@ -80,6 +80,7 @@ class PryArgumentParser(argparse.ArgumentParser):
         # program args): only exact options, `--opt=value` and unambiguous
         # long prefixes are options there, so `-hide_banner` is not `-h`.
         self.strict_options = False
+        self.ambiguous_is_unknown = False
         self.add_argument(
             "--help-full",
             action=_HelpFullAction,
@@ -88,11 +89,14 @@ class PryArgumentParser(argparse.ArgumentParser):
 
     def _get_option_tuples(self, option_string: str) -> list[Any]:
         tuples = super()._get_option_tuples(option_string)
-        if not self.strict_options:
-            return tuples
-        if not option_string.startswith("--"):
+        if self.strict_options and not option_string.startswith("--"):
             return []
-        return tuples if len({t[0] for t in tuples}) == 1 else []
+        # An ambiguous prefix is left as an unknown token on strict parsers
+        # and on the top-level parser, which on Python < 3.12 classifies the
+        # subcommand's tokens too (`pry run --h` must reach the run hint).
+        if (self.strict_options or self.ambiguous_is_unknown) and len({t[0] for t in tuples}) > 1:
+            return []
+        return tuples
 
     def _iter_full_help_parsers(self) -> list[argparse.ArgumentParser]:
         parsers: list[argparse.ArgumentParser] = [self]
@@ -3269,6 +3273,7 @@ def _add_timeout_arg(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = PryArgumentParser(prog="pry", description="Agent-friendly GDB CLI")
     parser.set_defaults(handler=None)
+    parser.ambiguous_is_unknown = True
     parser.add_argument(
         "--version", action="version", version=f"pry {_package_version()}",
         help="Print the pry version and exit",
@@ -3980,9 +3985,15 @@ def _run_extras_error(
     for tok in before:
         if tok in after:
             after.remove(tok)
+    if not all(_match_option(run_parser, tok) for tok in before):
+        parser.error(f"unrecognized arguments: {' '.join(extras)}")
+    typos = _run_option_typos(run_parser, after)
+    if typos:
+        run_parser.error(
+            f"unrecognized pry run options: {', '.join(typos)}. If these are "
+            "program arguments, put them after a `--` sentinel"
+        )
     if before:
-        if not all(_match_option(run_parser, tok) for tok in before):
-            parser.error(f"unrecognized arguments: {' '.join(extras)}")
         fixed = [*head, tail[0], *before, *tail[1:]]
         fix = (
             _run_sentinel_fix(parser, run_parser, fixed)
@@ -3992,12 +4003,6 @@ def _run_extras_error(
         run_parser.error(
             f"{names} {'is a pry run option' if len(before) == 1 else 'are pry run options'}: "
             f"put {'it' if len(before) == 1 else 'them'} after `run`: {fix}"
-        )
-    typos = _run_option_typos(run_parser, after)
-    if typos:
-        run_parser.error(
-            f"unrecognized pry run options: {', '.join(typos)}. If these are "
-            "program arguments, put them after a `--` sentinel"
         )
     run_parser.error(
         f"unrecognized arguments: {' '.join(after)}. Program arguments "
