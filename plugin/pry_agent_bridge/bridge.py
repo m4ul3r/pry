@@ -526,6 +526,14 @@ _TRAP_PATTERNS = (
 _TRAP_CONFIRM_BYTES = 7
 _TRAP_MIN_CONFIRM = 4
 _ADDR_MASK = 0xFFFFFFFFFFFFFFFF
+# The usual reason GDB cannot insert its breakpoints. Hardware ones are
+# allocated when it resumes, which is why a set that "succeeded" makes a later
+# continue fail.
+_HW_INSERT_HINT = (
+    "most often too many hardware watchpoints/breakpoints to insert (x86 has 4 "
+    "debug registers, allocated at continue, not at `watch set`). Delete some "
+    "with `pry watch delete N` / `pry break delete N`"
+)
 
 
 def classify_trap_site(guest: bytes | None, elf: bytes | None, trap: bytes) -> dict[str, Any]:
@@ -1921,10 +1929,46 @@ class GdbBridge:
     def _insertion_errors(self) -> str | None:
         """GDB thread, at a stop: GDB's own reasons for refusing to insert."""
         errors = self._verify_insertion(
-            list(gdb.breakpoints() or []), set(), keep_inserted=False
+            list(gdb.breakpoints() or []), set(), keep_inserted=False, read_back=False
         )["errors"]
         messages = dict.fromkeys(" ".join(m.split()) for m in errors.values())
         return "; ".join(messages) or None
+
+    def _resume_failure(self, op: str) -> str | None:
+        """GDB thread, after an execution stopped: GDB's failure to resume, if that was the stop.
+
+        GDB inserts its breakpoints each time it resumes. When that fails
+        after the target has already moved (a step over the breakpoint at the
+        PC, an internal shared-library event stop), GDB prints the cause to
+        its console and stops: the same plain stop as a trap no breakpoint
+        owns. No trap in memory at the stop and a trial insertion that fails
+        tell the two apart.
+        """
+        reason = self._last_stop_reason
+        if not reason or reason.get("kind") != "trap":
+            return None
+        self._resolve_pending_stop()
+        if reason.get("trap_in_memory"):
+            return None
+        cause = self._insertion_errors()
+        if cause is None:
+            return None
+        # The stop reports GDB's failure, not a trap: nothing replays it.
+        self._last_stop_reason = None
+        where = reason.get("address") or "the current PC"
+        with contextlib.suppress(Exception):
+            name = gdb.selected_frame().name()
+            if name:
+                where = f"{where} in {name}"
+        hint = (
+            _HW_INSERT_HINT if "hardware" in cause.lower()
+            else "`pry break list` names the breakpoints: delete or disable the one GDB could not insert"
+        )
+        cause = re.sub(r"^Warning:\s*", "", cause)
+        return (
+            f"GDB could not insert its breakpoints, so it stopped the `{op}` at "
+            f"{where}: {cause} ({hint})"
+        )
 
     @staticmethod
     def _ptrace_hint() -> str:
@@ -1945,17 +1989,17 @@ class GdbBridge:
         return msg
 
     def _error_response(self, exc: Exception) -> dict[str, Any]:
-        """Capture error context on GDB's thread, after the command unwinds."""
+        """Capture error context on GDB's thread, after the command unwinds.
+
+        A failed op leaves pry's run state as it was: GDB's stop, resume and
+        exit events keep it, and an execution settles its own.
+        """
         self._resolve_pending_exit()
         if self._remote_failure:
             return _json_response(ok=False, error=self._remote_failure)
         state = "not-started"
         if self._inferior_is_live():
-            state = "stopped"
-            with contextlib.suppress(Exception):
-                if any(thread.is_running() for thread in gdb.selected_inferior().threads()):
-                    state = "running"
-        self._running = state == "running"
+            state = "running" if self._threads_running() else "stopped"
         cause = None
         if state == "stopped" and str(exc).strip().lower() == "command aborted.":
             # A resume that failed to insert a breakpoint: GDB printed why to
@@ -1964,6 +2008,21 @@ class GdbBridge:
             with contextlib.suppress(Exception):
                 cause = self._insertion_errors()
         return _json_response(ok=False, error=self._augment_error(exc, state=state, cause=cause))
+
+    @staticmethod
+    def _threads_running() -> bool:
+        """GDB thread: whether GDB has the inferior's threads running.
+
+        Listing an all-stop remote target's threads asks the stub, which
+        refuses while it runs; the selected thread's state is GDB's own.
+        """
+        with contextlib.suppress(Exception):
+            thread = gdb.selected_thread()
+            if thread is not None and thread.is_running():
+                return True
+        with contextlib.suppress(Exception):
+            return any(thread.is_running() for thread in gdb.selected_inferior().threads())
+        return False
 
     def _augment_error(
         self, exc: Exception, *, state: str | None = None, cause: str | None = None
@@ -2015,16 +2074,8 @@ class GdbBridge:
                 hint = cause
             else:
                 # GDB swallows the real reason (e.g. "Could not insert hardware
-                # watchpoints") under to_string capture, leaving only this. The
-                # usual cause is too many hardware watchpoints/breakpoints — note
-                # they're allocated at continue, not at `watch set`, which is why
-                # a set that "succeeded" makes a later continue abort.
-                hint = (
-                    "GDB couldn't run the command — most often too many hardware "
-                    "watchpoints/breakpoints to insert (x86 has 4 debug registers, "
-                    "allocated at continue, not at `watch set`). Delete some with "
-                    "`pry watch delete N` / `pry break delete N`"
-                )
+                # watchpoints") under to_string capture, leaving only this.
+                hint = f"GDB couldn't run the command — {_HW_INSERT_HINT}"
         if hint:
             return f"{base} ({hint})"
         return base
@@ -2260,15 +2311,22 @@ class GdbBridge:
             if self._remote_failure:
                 response = _json_response(ok=False, error=self._remote_failure)
             elif error_box:
+                # The command failed. Whether the target runs now is GDB's
+                # word, not the flag this execution raised before it began.
+                self._running = self._inferior_is_live() and self._threads_running()
                 response = self._error_response(error_box[0])
             else:
                 try:
-                    result = self._execution_state()
-                    if op == "finish" and result["state"] == "stopped":
-                        rv = self._finish_return_value()
-                        if rv is not None:
-                            result["return_value"] = rv
-                    response = _json_response(ok=True, result=result)
+                    failure = self._resume_failure(op)
+                    if failure is not None:
+                        response = _json_response(ok=False, error=failure)
+                    else:
+                        result = self._execution_state()
+                        if op == "finish" and result["state"] == "stopped":
+                            rv = self._finish_return_value()
+                            if rv is not None:
+                                result["return_value"] = rv
+                        response = _json_response(ok=True, result=result)
                 except Exception as exc:
                     response = self._error_response(exc)
             _cleanup()
@@ -3972,7 +4030,8 @@ class GdbBridge:
         ]
 
     def _verify_insertion(
-        self, bps, unreadable: set[tuple[int, int]], *, keep_inserted: bool
+        self, bps, unreadable: set[tuple[int, int]], *, keep_inserted: bool,
+        read_back: bool = True,
     ) -> dict[str, Any]:
         """Have GDB insert its breakpoints at this stop and read each trap back.
 
@@ -3989,8 +4048,10 @@ class GdbBridge:
 
         ``resident`` is True/False only where trap bytes are observable (the
         stub writes them into memory); None where it keeps them elsewhere.
+        Without ``read_back`` only the refusals are wanted: no trap is read
+        back or re-seated.
         """
-        trap = self._trap_bytes()
+        trap = self._trap_bytes() if read_back else None
         code = [bp for bp in bps if bp.enabled and _bp_kind(bp.type) in ("breakpoint", "hw-breakpoint")]
         errors: dict[int, str] = {}
         resident: dict[tuple[int, int], bool | None] = {}
