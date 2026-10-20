@@ -513,8 +513,11 @@ def _format_stop_reason(reason: Any) -> str | None:
             site = reason.get("trap_address") or where
             return (f"trap at {where}: no pry breakpoint owns the trap instruction at "
                     f"{site} (the program's own, or one left behind: orphaned, or baked "
-                    "into a restored snapshot)")
-        return f"trap at {where}: no breakpoint or signal explains this stop"
+                    "into a restored snapshot; on a remote target `pry resync` restores "
+                    "one left behind)")
+        return (f"trap at {where}: no breakpoint or signal explains this stop (on a remote "
+                "target, a breakpoint the stub still records for nobody stops it like this: "
+                "`pry resync` drops it)")
     if kind == "resynced":
         return "resynced (state re-read after the machine changed under the debugger)"
     return kind or None
@@ -536,25 +539,25 @@ def _run_state_text(run_state: dict) -> str:
             f"({stop_reason or 'see `pry status`'}) while pry was stopping it; it was left stopped")
 
 
+def _trap_warning(trap: dict) -> str:
+    """A `warning:` line for a trap nobody owned, and what pry did about it."""
+    where = trap.get("address", "?")
+    if trap.get("function"):
+        where += f" ({trap['function']})"
+    held = f"guest memory held a trap ({trap.get('guest_bytes')})"
+    if trap.get("elf_bytes"):
+        held += f" where the symbol file has {trap['elf_bytes']}"
+    origin = ("an orphan the stub still recorded for nobody" if trap.get("stub_record")
+              else "most likely baked in by a snapshot")
+    if trap.get("repaired"):
+        return f"warning: {where}: {held}, {origin}; restored the original byte(s)"
+    return (f"warning: {where}: {held}, {origin}; could NOT restore it, so the "
+            "target traps there with no breakpoint to catch it")
+
+
 def _breakpoint_op_notes(value: dict) -> list[str]:
     """Trailing lines of a breakpoint op: restored traps, and a paused target."""
-    lines = []
-    for trap in value.get("baked_traps") or []:
-        if not isinstance(trap, dict):
-            continue
-        where = trap.get("address", "?")
-        if trap.get("function"):
-            where += f" ({trap['function']})"
-        held = f"guest memory held a trap ({trap.get('guest_bytes')})"
-        if trap.get("elf_bytes"):
-            held += f" where the symbol file has {trap['elf_bytes']}"
-        origin = ("an orphan the stub still recorded for nobody" if trap.get("stub_record")
-                  else "most likely baked in by a snapshot")
-        if trap.get("repaired"):
-            lines.append(f"warning: {where}: {held}, {origin}; restored the original byte(s)")
-        else:
-            lines.append(f"warning: {where}: {held}, {origin}; could NOT restore it, so the "
-                         "target traps there with no breakpoint to catch it")
+    lines = [_trap_warning(t) for t in value.get("baked_traps") or [] if isinstance(t, dict)]
     run_state = value.get("run_state")
     if isinstance(run_state, dict) and run_state.get("was_running"):
         lines.append(f"note: {_run_state_text(run_state)}")
@@ -606,6 +609,9 @@ def _render_stop_text(value: Any) -> str:
         for d in displays:
             if isinstance(d, dict):
                 parts.append(f"  display #{d.get('number')}: {d.get('expr')} = {d.get('value')}")
+    for trap in value.get("baked_traps") or []:
+        if isinstance(trap, dict):
+            parts.append(_trap_warning(trap))
     return "\n".join(parts)
 
 
@@ -1954,17 +1960,33 @@ def _launch(args: argparse.Namespace) -> int:
 def _kill(args: argparse.Namespace) -> int:
     if getattr(args, "all", False):
         killed = []
+        stopped: list[int] = []
+        warnings: list[str] = []
         for inst in list_instances():
+            released = _release_target(inst)
             _kill_instance(inst.pid)
             killed.append(inst.pid)
+            if released.get("stopped_target"):
+                stopped.append(inst.pid)
+            if released.get("warning"):
+                warnings.append(f"pid {inst.pid}: {released['warning']}")
         if args.format == "text":
             msg = (
                 f"Killed {len(killed)} GDB session(s): {', '.join(map(str, killed))}"
                 if killed else "No running GDB sessions to kill."
             )
-            _render_result(msg, fmt="text", out_path=args.out, stem="kill")
+            lines = [msg]
+            if stopped:
+                lines.append(f"note: {_STOPPED_BEFORE_KILL} (pid {', '.join(map(str, stopped))})")
+            lines.extend(f"warning: {w}" for w in warnings)
+            _render_result("\n".join(lines), fmt="text", out_path=args.out, stem="kill")
         else:
-            _render_result({"killed": True, "pids": killed}, fmt=args.format, out_path=args.out, stem="kill")
+            result: dict[str, Any] = {"killed": True, "pids": killed}
+            if stopped:
+                result["stopped_targets"] = stopped
+            if warnings:
+                result["warnings"] = warnings
+            _render_result(result, fmt=args.format, out_path=args.out, stem="kill")
         return 0
 
     selector = getattr(args, "instance", None)
@@ -1979,22 +2001,66 @@ def _kill(args: argparse.Namespace) -> int:
                 f"Multiple bridge instances running (pids: {pids}). "
                 f"Use --instance <pid|name> to select one, or 'pry kill --all'."
             )
-        target_pid = instances[0].pid
+        target = instances[0]
     else:
         # Resolve an explicit --instance (pid or unique live name) so we don't
         # falsely report "Killed" for something that was never a pry instance
         # (os.kill silently no-ops a dead pid). match_instance raises on an
         # unknown pid/name or an ambiguous name.
-        target_pid = match_instance(list_instances(), selector).pid
+        target = match_instance(list_instances(), selector)
+    target_pid = target.pid
 
+    released = _release_target(target)
     _kill_instance(target_pid)
 
-    result: dict[str, Any] = {"killed": True, "pid": target_pid}
+    result = {"killed": True, "pid": target_pid, **released}
     if args.format == "text":
-        _render_result(f"Killed GDB (pid={target_pid})", fmt="text", out_path=args.out, stem="kill")
+        lines = [f"Killed GDB (pid={target_pid})"]
+        if released.get("stopped_target"):
+            lines.append(f"note: {_STOPPED_BEFORE_KILL}")
+        if released.get("warning"):
+            lines.append(f"warning: {released['warning']}")
+        _render_result("\n".join(lines), fmt="text", out_path=args.out, stem="kill")
     else:
         _render_result(result, fmt=args.format, out_path=args.out, stem="kill")
     return 0
+
+
+_STOPPED_BEFORE_KILL = (
+    "the remote target was running: pry stopped it first, so that GDB left none of "
+    "its breakpoints in target memory when it exited"
+)
+
+
+def _release_target(inst: Any) -> dict[str, Any]:
+    """Before GDB is signalled, have its bridge stop a running remote target (#64).
+
+    GDB takes its breakpoints out of an all-stop remote target only at a
+    stop; killed while the target runs, it leaves them all in target memory.
+    Returns ``{"stopped_target": True}`` when the bridge stopped one,
+    ``{"warning": ...}`` when pry could not make sure, else ``{}``.
+    """
+    try:
+        try:
+            response = _send_request_to_instance(inst, "prepare_kill", timeout=5.0, connect_retries=1)
+            stopped = bool((response.get("result") or {}).get("was_running"))
+        except BridgeError as exc:
+            if "Unknown op: 'prepare_kill'" not in str(exc):
+                raise
+            # A bridge from before `prepare_kill`: stop whatever runs with the
+            # lock-free ops it has.
+            status = _send_request_to_instance(inst, "status", timeout=5.0, connect_retries=1)
+            stopped = (status.get("result") or {}).get("state") == "running"
+            if stopped:
+                _send_request_to_instance(inst, "interrupt", timeout=5.0, connect_retries=1)
+    except BridgeError as exc:
+        return {"warning": (
+            f"pry could not make sure that no breakpoint of GDB's stays in target memory ({exc}). "
+            "If a remote target was running, the breakpoints GDB had inserted may remain "
+            "there: a QEMU guest halts at the first one it reaches, until a debugger "
+            "connects again (QEMU drops them for a new client)"
+        )}
+    return {"stopped_target": True} if stopped else {}
 
 
 def _logs(args: argparse.Namespace) -> int:
@@ -2483,7 +2549,51 @@ def _render_resync_text(value: Any) -> str:
             "breakpoint site(s); if the kernel re-slid (reset, reboot), rerun with "
             "`pry resync --base <KBASE>`"
         )
+    scan = value.get("scan")
+    if isinstance(scan, dict):
+        lines.append(_scan_text(scan, value.get("stray_traps") or []))
+    for trap in value.get("stray_traps") or []:
+        if isinstance(trap, dict):
+            lines.append("  " + _stray_trap_text(trap))
     return "\n".join(lines)
+
+
+def _scan_text(scan: dict, strays: list) -> str:
+    """What resync checked for traps away from breakpoint sites, and found."""
+    found = sum(isinstance(s, dict) for s in strays)
+    restored = sum(isinstance(s, dict) and bool(s.get("repaired")) for s in strays)
+    head = "stray traps (off breakpoint sites): " + (
+        f"{found} found, {restored} restored" if found else "none found"
+    )
+    if scan.get("skipped"):
+        return f"{head}; code not scanned: {scan['skipped']}"
+    files = [Path(f).name for f in scan.get("files") or []]
+    if not files:
+        return (f"{head}; code not scanned: no symbol file pry can map onto target "
+                "memory (a plainly loaded non-PIE ELF such as a nokaslr vmlinux, or one "
+                "loaded with `pry load --base/--slide`)")
+    text = f"{head}; scanned {scan.get('bytes', 0) / 2**20:.1f} MiB of code in {', '.join(files)}"
+    if scan.get("unreadable"):
+        text += f" ({scan['unreadable']} bytes unreadable)"
+    if scan.get("unreadable") and not scan.get("bytes"):
+        text += ("\nhint: none of the symbol file's code is mapped where pry looked; if the "
+                 "kernel re-slid (KASLR, reset, reboot), rerun with `pry resync --base <KBASE>`")
+    return text
+
+
+def _stray_trap_text(trap: dict) -> str:
+    if not trap.get("trap_in_memory"):
+        where = trap.get("address", "?")
+        if trap.get("function"):
+            where += f" ({trap['function']})"
+        return (f"warning: {where}: the stub still recorded a breakpoint there for nobody, "
+                "with no trap in memory; dropped it")
+    if trap.get("elf_bytes") is None and not trap.get("repaired"):
+        where = trap.get("address", "?")
+        return (f"warning: {where}: the target stopped on a trap ({trap.get('guest_bytes')}) "
+                "no breakpoint owns; no symbol file maps this address, so pry cannot tell "
+                "the program's own from one left behind, and left it")
+    return _trap_warning(trap)
 
 
 def _resync(args: argparse.Namespace) -> int:

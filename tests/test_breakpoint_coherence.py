@@ -9,7 +9,7 @@ import types
 import pytest
 
 import pry.cli
-from tests.test_bridge import _load_bridge
+from tests.test_bridge import _ALLOC, _EXEC, _WRITE, _load_bridge, _write_kernel_elf
 
 TRAP_SITE = 0xFFFFFFFF810881D0
 # `mov 0x70(%rdi),%rdi; jmp ...` as the ELF has it at the breakpoint site.
@@ -142,7 +142,13 @@ def _remote_target(monkeypatch, memory, *, maint_rows="", writes=True):
         for i, byte in enumerate(bytes(data)):
             stub.mem[addr + i] = byte
 
+    def read_memory(addr, length):
+        if any(addr + i not in stub.mem for i in range(length)):
+            raise fake_gdb.error(f"Cannot access memory at address {addr:#x}")
+        return bytes(stub.mem[addr + i] for i in range(length))
+
     inferior.write_memory = write_memory
+    inferior.read_memory = read_memory
     monkeypatch.setattr(fake_gdb, "breakpoints", lambda: list(stub.bps))
     params = {"args": "", "startup-with-shell": False}
     monkeypatch.setattr(fake_gdb, "parameter", lambda name: (
@@ -225,6 +231,41 @@ def test_classify_trap_site_without_elf_or_memory(monkeypatch):
     assert info["trap_present"] is True
     assert info["baked_trap"] is False
     assert info["elf_bytes"] is None
+
+
+_BRK = bytes.fromhex("000020d4")  # aarch64 `brk #0`
+_A64 = bytes.fromhex("fd7bbfa9" "fd030091" "e00313aa" "c0035fd6")
+
+
+@pytest.mark.parametrize(
+    ("guest", "elf", "trap", "start", "found"),
+    [
+        # Planted at a function entry after nop padding.
+        ("0f1f4000cc8b7f70e9b7ebffff", "0f1f4000488b7f70e9b7ebffff", "cc", 0x1000, [4]),
+        # The ELF has int3 there itself (padding): the program's own.
+        ("cccc488b7f70e9b7ebffff", "cccc488b7f70e9b7ebffff", "cc", 0x1000, []),
+        # Linux rewrote `jmp __x86_return_thunk` as `ret; int3 x4`: the last
+        # int3 has the ELF's next instruction after it, but sits inside the jmp.
+        ("5e415f5dc3cccccccc0f0b658b052c25ce", "5e415f5de95dfecc000f0b658b052c25ce", "cc", 0x1000, []),
+        # A trap planted right after such a rewritten jmp is still found.
+        ("c3cccccccc0f1f4000cc8b7f70e9b7ebff", "e934b1f7000f1f4000488b7f70e9b7ebff", "cc", 0x1000, [9]),
+        # Alternatives turned a NOP run into `jmp +12; int3 x12`: the last
+        # int3 has the ELF's next instruction after it, but is jumped over.
+        ("eb0c" + "cc" * 12 + "90488d7c2408", "90" * 15 + "488d7c2408", "cc", 0x1000, []),
+        # ...while a trap planted where that jmp lands is an instruction start.
+        ("eb0c" + "cc" * 13 + "488d7c240890", "90" * 14 + "48488d7c240890", "cc", 0x1000, [14]),
+        # Too few bytes after it to confirm the mapping.
+        ("0f1f4000cc8b7f", "0f1f4000488b7f", "cc", 0x1000, []),
+        # aarch64: a `brk #0` replacing one instruction, on its boundary.
+        (_A64[:4] + _BRK + _A64[8:], _A64, _BRK, 0x1000, [4]),
+        # ...and the same bytes off a 4-byte boundary are not an instruction.
+        (_A64[:4] + _BRK + _A64[8:], _A64, _BRK, 0x1002, []),
+    ],
+)
+def test_stray_trap_offsets(monkeypatch, guest, elf, trap, start, found):
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    as_bytes = lambda v: v if isinstance(v, bytes) else bytes.fromhex(v)  # noqa: E731
+    assert bridge_mod.stray_trap_offsets(as_bytes(guest), as_bytes(elf), as_bytes(trap), start) == found
 
 
 # --- <PENDING> locations --------------------------------------------------------
@@ -551,6 +592,36 @@ def test_trap_that_does_not_match_the_elf_is_left_alone(monkeypatch):
     assert stub.mem == memory
 
 
+@pytest.mark.parametrize("background", [False, True])
+def test_baked_trap_under_a_breakpoint_is_restored_before_the_resume(monkeypatch, background):
+    """#62: GDB saves what it finds under a breakpoint as its original when it
+    inserts it. Over a baked trap, stepping over the hit would run that trap
+    with no breakpoint behind it, and every removal would leave it behind."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(b"\xcc" + ELF_WINDOW[1:]))
+    bp = _Bp(stub, 1, TRAP_SITE)
+    execute = fake_gdb.execute
+
+    def continue_to_the_hit(cmd, to_string=False):
+        if cmd == "continue":
+            stub.resume()  # GDB inserts its breakpoints as it resumes
+            fake_gdb._pending_stop_event = fake_gdb._FakeBreakpointEvent([bp])
+            # At the hit GDB removes them; the stub writes back what it saved.
+            for addr in list(stub.inserted):
+                stub.mem[addr] = stub.inserted.pop(addr)
+        return execute(cmd, to_string=to_string)
+
+    fake_gdb.execute = continue_to_the_hit
+    response = bridge.dispatch({"op": "continue", "params": {"_background": background}})
+    if background:
+        response = bridge.dispatch({"op": "wait", "params": {}})
+
+    result = response["result"]
+    assert result["reason"]["kind"] == "breakpoint-hit"
+    assert stub.mem[TRAP_SITE] == ELF_WINDOW[0]
+    [trap] = result["baked_traps"]
+    assert trap["address"] == hex(TRAP_SITE) and trap["repaired"] is True
+
+
 # --- unexplained stops -----------------------------------------------------------
 
 @pytest.mark.parametrize(("op", "kind"), [("continue", "trap"), ("step", "step")])
@@ -865,6 +936,72 @@ def test_resync_does_not_judge_residency_where_the_stub_hides_traps(monkeypatch)
     assert "reseated" not in entry
 
 
+def test_resync_restores_a_baked_trap_away_from_every_breakpoint(monkeypatch):
+    """#63: a canary armed when the snapshot was saved and deleted before the
+    load left its int3 baked in; no breakpoint site leads to it."""
+    lead = bytes.fromhex("0f1f4000")
+    start = TRAP_SITE - len(lead)
+    guest = lead + b"\xcc" + ELF_WINDOW[1:]
+    _, _, bridge, stub = _remote_target(monkeypatch, {start + i: b for i, b in enumerate(guest)})
+    bridge._code_regions = lambda: [("/k/vmlinux", start, lead + ELF_WINDOW)]
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    assert stub.mem[TRAP_SITE] == ELF_WINDOW[0]
+    [stray] = result["stray_traps"]
+    assert stray["address"] == hex(TRAP_SITE)
+    assert stray["repaired"] is True
+    assert result["summary"]["stray_traps"] == result["summary"]["stray_repaired"] == 1
+    assert result["scan"]["bytes"] == len(guest)
+
+
+def test_resync_scans_only_code_that_stays_code(monkeypatch, tmp_path):
+    """Linux 7.0 links `.data` WAX: its live bytes are data the kernel changed
+    (a 0xcc in a pointer). Init code is freed after boot (poisoned 0xcc, its
+    pages reused by anyone), whatever the section is called. Neither is
+    compared with the file or written back."""
+    lead = bytes.fromhex("0f1f4000")
+    text, data, init, aux = TRAP_SITE - len(lead), 0xFFFFFFFF85200000, 0xFFFFFFFF863AD000, 0xFFFFFFFF864ECAC5
+    planted = lead + b"\xcc" + ELF_WINDOW[1:]
+    memory = {}
+    for base in (text, data, init, aux):
+        memory.update({base + i: b for i, b in enumerate(planted)})
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, memory)
+    vmlinux = tmp_path / "vmlinux"
+    _write_kernel_elf(vmlinux, symbols={"__init_begin": init, "__init_end": 0xFFFFFFFF869D8000}, sections=[
+        (".text", _ALLOC | _EXEC, text, lead + ELF_WINDOW),
+        (".data", _WRITE | _ALLOC | _EXEC, data, lead + ELF_WINDOW),
+        (".init.text", _ALLOC | _EXEC, init, lead + ELF_WINDOW),
+        (".altinstr_aux", _ALLOC | _EXEC, aux, lead + ELF_WINDOW),
+    ])
+    monkeypatch.setattr(fake_gdb, "objfiles", lambda: [types.SimpleNamespace(filename=str(vmlinux))],
+                        raising=False)
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    assert [s["address"] for s in result["stray_traps"]] == [hex(TRAP_SITE)]
+    for base in (data, init, aux):
+        assert stub.mem[base + len(lead)] == 0xCC  # not the debugger's, untouched
+    assert result["scan"]["bytes"] == len(planted)
+
+
+def test_resync_drops_the_orphan_the_target_last_stopped_on(monkeypatch):
+    """#63: an orphan the stub still records traps on every continue. Under
+    QEMU TCG it has no byte in memory, so only the stop says where it is."""
+    _, _, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW), writes=False)
+    stub.orphans[TRAP_SITE] = ELF_WINDOW[0]
+    bridge._last_stop_reason = {"kind": "trap", "address": hex(TRAP_SITE), "trap_in_memory": False}
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    [stray] = result["stray_traps"]
+    assert stray["address"] == hex(TRAP_SITE)
+    assert stray["stub_record"] is True and stray["repaired"] is True
+    assert stub.orphans == {}
+    # No trap can be seen in this stub's memory, so the code is not scanned.
+    assert "skipped" in result["scan"]
+
+
 def test_resync_refuses_without_a_live_target(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     fake_gdb.selected_inferior().pid = 0
@@ -890,3 +1027,23 @@ def test_resync_cli_sends_base_and_symbols(monkeypatch, tmp_path):
 def test_resync_cli_rejects_symbols_without_base(monkeypatch):
     monkeypatch.setattr(pry.cli, "send_request", lambda *a, **k: pytest.fail("sent"))
     assert pry.cli.main(["resync", "--symbols", "/x/vmlinux"]) == 1
+
+
+# --- pry kill -----------------------------------------------------------------------
+
+def test_prepare_kill_stops_a_running_remote_target_and_leaves_it_stopped(monkeypatch):
+    """#64: GDB killed while the target runs leaves its inserted traps in
+    target memory; at a stop it holds none, and its exit detaches cleanly."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    assert stub.mem[TRAP_SITE] == 0xCC
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    response = bridge.dispatch({"op": "prepare_kill", "params": {}})
+
+    assert response["ok"] is True and response["result"]["was_running"] is True
+    assert stub.inserted == {} and stub.mem[TRAP_SITE] == ELF_WINDOW[0]
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "stopped"
+    # At a stop there is nothing to do.
+    assert bridge.dispatch({"op": "prepare_kill", "params": {}})["result"] == {"was_running": False}

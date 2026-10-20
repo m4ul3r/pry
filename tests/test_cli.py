@@ -2132,6 +2132,75 @@ def test_kill_all_none_running(monkeypatch, capsys):
     assert "No running GDB sessions" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("bridge_answers", [True, False])
+def test_kill_has_the_bridge_stop_the_target_before_signalling_gdb(
+    monkeypatch, capsys, tmp_path, bridge_answers
+):
+    """#64: GDB signalled while a remote target runs leaves its traps in target
+    memory. pry asks the bridge to stop it first; if the bridge cannot, GDB is
+    still killed and the risk is reported."""
+    import signal
+
+    events = []
+
+    def prepare(inst, op, **kwargs):
+        events.append(op)
+        if not bridge_answers:
+            raise pry.cli.BridgeError("Timed out waiting for GDB bridge")
+        return {"ok": True, "result": {"was_running": True}}
+
+    def kill(pid, sig):
+        events.append(sig)
+        if sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [_mk_instance(tmp_path, 4321)])
+    monkeypatch.setattr(pry.cli, "_send_request_to_instance", prepare)
+    monkeypatch.setattr(pry.cli.os, "kill", kill)
+
+    rc = pry.cli.main(["kill", "--instance", "4321", "--format", "json"])
+
+    assert rc == 0
+    assert events[:2] == ["prepare_kill", signal.SIGTERM]
+    result = json.loads(capsys.readouterr().out)
+    assert result["killed"] is True
+    assert result.get("stopped_target") is (True if bridge_answers else None)
+    assert ("warning" in result) is not bridge_answers
+
+
+@pytest.mark.parametrize("state", ["stopped", "running"])
+def test_kill_against_a_bridge_without_prepare_kill(monkeypatch, capsys, tmp_path, state):
+    """A bridge started before `prepare_kill` exists: pry stops a running
+    target with the ops it has, and warns about nothing at a stop."""
+    import signal
+
+    events = []
+
+    def send(inst, op, **kwargs):
+        events.append(op)
+        if op == "prepare_kill":
+            raise pry.cli.BridgeError("ValueError: Unknown op: 'prepare_kill'")
+        return {"ok": True, "result": {"state": state} if op == "status" else {}}
+
+    def kill(pid, sig):
+        events.append(sig)
+        if sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [_mk_instance(tmp_path, 4321)])
+    monkeypatch.setattr(pry.cli, "_send_request_to_instance", send)
+    monkeypatch.setattr(pry.cli.os, "kill", kill)
+
+    assert pry.cli.main(["kill", "--instance", "4321", "--format", "json"]) == 0
+
+    stops = ["interrupt"] if state == "running" else []
+    assert events[:3 + len(stops)] == ["prepare_kill", "status", *stops, signal.SIGTERM]
+    result = json.loads(capsys.readouterr().out)
+    assert "warning" not in result
+    assert result.get("stopped_target") is (True if state == "running" else None)
+
+
+
 def test_logs_reads_instance_log(monkeypatch, capsys, tmp_path):
     inst = _mk_instance(tmp_path, 4242)
     logf = tmp_path / "4242.log"

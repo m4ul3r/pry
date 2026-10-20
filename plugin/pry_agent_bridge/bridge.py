@@ -454,9 +454,11 @@ def _elf_reloc_reference(path: str, syms: dict | None = None):
     return None
 
 
+_ELF_SHF_WRITE = 0x1
 _ELF_SHF_ALLOC = 0x2
 _ELF_SHF_EXECINSTR = 0x4
 _ELF_SHT_NOBITS = 8
+_ELF_ET_REL = 1
 _ELF_ET_EXEC = 2
 
 
@@ -526,6 +528,10 @@ _TRAP_PATTERNS = (
 _TRAP_CONFIRM_BYTES = 7
 _TRAP_MIN_CONFIRM = 4
 _ADDR_MASK = 0xFFFFFFFFFFFFFFFF
+# Resync reads code in chunks GDB splits into packets; a chunk that fails is
+# read again page by page.
+_SCAN_CHUNK = 0x10000
+_SCAN_PAGE = 0x1000
 # The usual reason GDB cannot insert its breakpoints. Hardware ones are
 # allocated when it resumes, which is why a set that "succeeded" makes a later
 # continue fail.
@@ -569,6 +575,102 @@ def classify_trap_site(guest: bytes | None, elf: bytes | None, trap: bytes) -> d
     )
     info["baked_trap"] = bool(info["trap_present"] and elf[:n] != trap and info["elf_match"])
     return info
+
+
+# x86 opcodes of the rel32 branches Linux rewrites at boot (return thunks,
+# retpolines, static calls): `call`/`jmp rel32`, and `jcc rel32` after 0x0F.
+_X86_REL32_BRANCH = (0xE8, 0xE9)
+_X86_JCC_REL32 = range(0x80, 0x90)
+
+
+def _inside_rewritten_branch(guest: bytes, elf: bytes, i: int) -> bool:
+    """x86: whether offset *i* lies inside a rel32 branch the target rewrote.
+
+    Linux turns ``jmp __x86_return_thunk`` into ``ret; int3; int3; int3;
+    int3``: its last int3 has the symbol file's next instruction after it,
+    like a planted trap, but sits inside the 5-byte ``jmp`` the file has
+    (inside a 6-byte ``jcc`` for the 0x0F forms).
+    """
+    for k in range(max(0, i - 4), i):
+        if elf[k] in _X86_REL32_BRANCH and guest[k] != elf[k]:
+            return True
+    for k in range(max(0, i - 5), i - 1):
+        if elf[k] == 0x0F and elf[k + 1] in _X86_JCC_REL32 and guest[k] != elf[k]:
+            return True
+    return False
+
+
+# Longest run of int3 padding looked back over for the jump that skips it.
+_PADDING_RUN_MAX = 256
+
+
+def _inside_jumped_over_padding(guest: bytes, elf: bytes, i: int) -> bool:
+    """x86: whether offset *i* lies in int3 padding a rewritten jump skips.
+
+    Linux's text patching (alternatives) turns a run of NOPs into ``jmp
+    +N; int3; …``: the last int3 has the symbol file's next instruction
+    after it, like a planted trap, but the target only ever jumps over it.
+    A trap at the jump's destination itself is an instruction start, and
+    still counts.
+    """
+    s = i
+    while s > 0 and i - s < _PADDING_RUN_MAX and guest[s - 1] == 0xCC:
+        s -= 1
+    if s >= 2 and guest[s - 2] == 0xEB and guest[s - 2:s] != elf[s - 2:s]:
+        return s + int.from_bytes(guest[s - 1:s], "little", signed=True) > i
+    if s >= 5 and guest[s - 5] == 0xE9 and guest[s - 5:s] != elf[s - 5:s]:
+        return s + int.from_bytes(guest[s - 4:s], "little", signed=True) > i
+    return False
+
+
+def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, start: int) -> list[int]:
+    """Offsets where *guest* holds a lone trap instruction nobody owns.
+
+    *guest* is target code read at a stop, where GDB holds none of its
+    breakpoints in memory; *elf* is the symbol file's bytes for the same
+    addresses, from runtime address *start*. A trap a debugger planted (and
+    a snapshot baked in, or GDB orphaned) replaces the first byte(s) of one
+    instruction: the symbol file has another instruction there and agrees
+    on the bytes that follow, as :func:`classify_trap_site` requires. Traps
+    the kernel writes itself are told apart: on x86 those inside a
+    rewritten rel32 branch (:func:`_inside_rewritten_branch`) or in padding
+    a rewritten jump skips (:func:`_inside_jumped_over_padding`), and with
+    fixed-width instructions (aarch64) a trap off an instruction boundary.
+    """
+    n = len(trap)
+    size = min(len(guest), len(elf))
+    if n == 1:
+        table = bytes(1 if b == trap[0] else 0 for b in range(256))
+        marks = (
+            int.from_bytes(guest[:size].translate(table), "little")
+            & ~int.from_bytes(elf[:size].translate(table), "little")
+        )
+        if not marks:
+            return []
+        flags = marks.to_bytes(size, "little")
+        candidates = []
+        i = flags.find(1)
+        while i != -1:
+            candidates.append(i)
+            i = flags.find(1, i + 1)
+    else:
+        candidates = []
+        i = guest.find(trap, 0, size)
+        while i != -1:
+            if not (start + i) % n and elf[i:i + n] != trap:
+                candidates.append(i)
+            i = guest.find(trap, i + 1, size)
+    found = []
+    for i in candidates:
+        confirm = min(size - i - n, _TRAP_CONFIRM_BYTES)
+        if confirm < _TRAP_MIN_CONFIRM or guest[i + n:i + n + confirm] != elf[i + n:i + n + confirm]:
+            continue
+        if trap == b"\xcc" and (
+            _inside_rewritten_branch(guest, elf, i) or _inside_jumped_over_padding(guest, elf, i)
+        ):
+            continue
+        found.append(i)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1226,11 +1328,20 @@ def _run_state_note(run_state: dict[str, Any]) -> str:
             "stopped on its own before it could be resumed")
 
 
+def _restored_note(traps: list[dict[str, Any]]) -> str:
+    """One clause on the traps an execution found under breakpoints before it resumed."""
+    sites = ", ".join(
+        f"{t.get('address', '?')} ({'restored' if t.get('repaired') else 'NOT restored'})"
+        for t in traps
+    )
+    return f"before resuming, pry found a trap nobody owned at breakpoint site(s) {sites}"
+
+
 # Resync entry statuses of an enabled breakpoint that will not fire.
 _NOT_ARMED = ("pending", "unreadable", "insert-failed", "not-resident")
 
 
-def _resync_summary(entries: list[dict[str, Any]]) -> dict[str, int]:
+def _resync_summary(entries: list[dict[str, Any]], strays: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "breakpoints": len(entries),
         "armed": sum(e["status"] == "armed" for e in entries),
@@ -1238,6 +1349,8 @@ def _resync_summary(entries: list[dict[str, Any]]) -> dict[str, int]:
         "baked_traps": sum(bool(e.get("baked_trap")) for e in entries),
         "repaired": sum(bool(e.get("repaired")) for e in entries),
         "elf_mismatch": sum(e.get("elf_match") is False for e in entries),
+        "stray_traps": len(strays),
+        "stray_repaired": sum(bool(s.get("repaired")) for s in strays),
     }
 
 
@@ -1328,6 +1441,10 @@ class GdbBridge:
         # Execution op driving the inferior, so a stop nothing explains is not
         # mistaken for a completed step.
         self._exec_op: str | None = None
+        # True while GDB holds its code breakpoints in target memory at a
+        # stop: resync arms them there for the resume that follows. Any other
+        # stop has them out (GDB removes them), unless always-inserted is on.
+        self._breakpoints_held = False
         gdb.events.stop.connect(self._on_stop)
         if hasattr(gdb.events, "exited"):
             gdb.events.exited.connect(self._on_exited)
@@ -1450,6 +1567,7 @@ class GdbBridge:
     def _on_stop(self, event):
         """Capture metadata now; defer target reads, not ephemeral GDB objects."""
         self._running = False
+        self._breakpoints_held = False
         self._has_run = True
         self._has_exited = False
         self._inactive_reason = None
@@ -1502,6 +1620,7 @@ class GdbBridge:
         if self._background_job is not None and self._background_job["completion"].is_set():
             self._background_job = None
         self._running = True
+        self._breakpoints_held = False
         self._has_run = True
         self._has_exited = False
         self._inactive_reason = None
@@ -1692,6 +1811,8 @@ class GdbBridge:
                 return self._dispatch_status()
             if op == "wait":
                 return self._dispatch_wait(params)
+            if op == "prepare_kill":
+                return self._dispatch_prepare_kill()
 
             if op == "trace":
                 return self._dispatch_trace(params)
@@ -1779,6 +1900,9 @@ class GdbBridge:
         result = response["result"]
         if isinstance(result, dict):
             result["run_state"] = run_state
+            if pause.get("baked_traps"):
+                # Restored at the resume, under breakpoints this op did not touch.
+                result["baked_traps"] = [*(result.get("baked_traps") or []), *pause["baked_traps"]]
             if gave_up and op == "load":
                 result["pending_breakpoints"] = sorted(
                     set(result.get("pending_breakpoints") or []) | {n for n, _ in gave_up}
@@ -1796,7 +1920,9 @@ class GdbBridge:
                         result[key] = now[key]
                 if pending_now:
                     _mark_gave_up(result.get("breakpoints") or [], pending_now)
-                    result["summary"] = _resync_summary(result.get("breakpoints") or [])
+                    result["summary"] = _resync_summary(
+                        result.get("breakpoints") or [], result.get("stray_traps") or []
+                    )
         return response
 
     def _needs_stop_for_breakpoints(self) -> bool:
@@ -1883,6 +2009,11 @@ class GdbBridge:
                 # once GDB has inserted its breakpoints and resumed the target,
                 # or failed to (then the job has completed with the error).
                 _run_on_gdb_thread(lambda: None)
+            if job is not None:
+                # Restored as it resumed, under breakpoints the op did not
+                # touch: this op reports them, not the resumed execution.
+                job["restored_reported"] = True
+                pause["baked_traps"] = list(job["restored"])
             if job is not None and job["completion"].is_set():
                 response = job["response"]
             if job is not None and pause["job"] is not None:
@@ -1910,13 +2041,13 @@ class GdbBridge:
         finally:
             pause["settled"].set()
 
-    @staticmethod
-    def _remove_inserted_breakpoints() -> None:
+    def _remove_inserted_breakpoints(self) -> None:
         """GDB thread, at a stop: take GDB's code breakpoints out of memory.
 
         Disabling removes a breakpoint; re-enabling it at a stop does not
         insert it again (unless the user runs with always-inserted on).
         """
+        self._breakpoints_held = False
         with contextlib.suppress(Exception):
             if gdb.parameter("breakpoint always-inserted"):
                 return
@@ -2156,6 +2287,31 @@ class GdbBridge:
             return _cancel_trace(holder["trace"])
         return holder["response"]
 
+    def _dispatch_prepare_kill(self) -> dict[str, Any]:
+        """`pry kill` asks this before it signals GDB (#64).
+
+        GDB inserts its breakpoints when it resumes an all-stop remote target
+        and takes them out at the next stop, and the stub refuses the detach
+        GDB sends on its way out while the target runs. Killed then, GDB
+        leaves every trap it inserted in target memory with no debugger
+        behind it: a QEMU guest halts at the first one it reaches. So such a
+        target is stopped first. GDB's exit then leaves it as from any stop
+        (it detaches QEMU, which drops its breakpoints and resumes the guest).
+        """
+        running = _run_on_gdb_thread(
+            lambda: self._running and self._needs_stop_for_breakpoints(), timeout=5.0
+        )
+        if not running:
+            return _json_response(ok=True, result={"was_running": False})
+        response = self._dispatch_interrupt()
+        status = (response.get("result") or {}).get("status")
+        if not response["ok"] or status == "running":
+            why = response.get("error") or "it was still running after the interrupt"
+            return _json_response(
+                ok=False, error=f"the remote target is running and pry could not stop it: {why}"
+            )
+        return _json_response(ok=True, result={"was_running": True, "state": status})
+
     def _refresh_remote_inspection_state(self):
         """Drop stale remote register/frame caches at idle request boundaries.
 
@@ -2281,7 +2437,11 @@ class GdbBridge:
             )
 
         completion = threading.Event()
-        job: dict[str, Any] = {"completion": completion, "response": None}
+        # `restored`: traps nobody owned under breakpoint sites, restored just
+        # before the resume. The execution's answer reports them, unless the
+        # breakpoint op that resumed the target already did (`restored_reported`).
+        restored: list[dict[str, Any]] = []
+        job: dict[str, Any] = {"completion": completion, "response": None, "restored": restored}
         terminal_event = [False]
         error_box: list[Exception] = []
         command_returned = [False]
@@ -2329,6 +2489,11 @@ class GdbBridge:
                         response = _json_response(ok=True, result=result)
                 except Exception as exc:
                     response = self._error_response(exc)
+            if restored:
+                if not response["ok"]:
+                    response["error"] = f"{response['error']} ({_restored_note(restored)})"
+                elif not job.get("restored_reported"):
+                    response["result"]["baked_traps"] = restored
             _cleanup()
             self._restarting = False
             self._exec_op = None
@@ -2372,6 +2537,7 @@ class GdbBridge:
                 if hasattr(gdb.events, "connection_removed"):
                     gdb.events.connection_removed.connect(_on_exec_connection_removed)
                 self._snapshot_watchpoints()
+                restored.extend(self._restore_traps_before_resume())
                 self._exec_op = op
                 self._dispatch_op(op, params)
             except Exception as exc:
@@ -3895,13 +4061,23 @@ class GdbBridge:
             _raise_if_remote_lost(self)
             return None
 
-    def _elf_bytes_at(self, addr: int, length: int) -> bytes | None:
-        """The symbol file's bytes for a runtime address, or None.
+    def _elf_slide(self, real: str) -> int | None:
+        """The slide mapping symbol file *real* (a realpath) onto target memory.
 
-        Mapped back through the slide `load --base/--slide` applied; a plainly
-        loaded ET_EXEC file (a nokaslr vmlinux) maps 1:1. PIE images, modules
-        and raw `add-symbol-file` loads are not guessed at.
+        The one `load --base/--slide` applied; a plainly loaded ET_EXEC file
+        (a nokaslr vmlinux) maps 1:1. PIE images, modules and raw
+        `add-symbol-file` loads are not guessed at (None).
         """
+        record = self._symbol_loads.get(real)
+        if record is not None:
+            return record["slide"]
+        parsed = _elf_sections(real)
+        if parsed is None or parsed[0]["type"] != _ELF_ET_EXEC:
+            return None
+        return 0
+
+    def _elf_bytes_at(self, addr: int, length: int) -> bytes | None:
+        """The symbol file's bytes for a runtime address (see :meth:`_elf_slide`), or None."""
         try:
             objfile = gdb.current_progspace().objfile_for_address(addr)
         except Exception:
@@ -3910,40 +4086,135 @@ class GdbBridge:
         if not path or not os.path.isfile(path):
             return None
         real = os.path.realpath(path)
-        record = self._symbol_loads.get(real)
-        if record is not None:
-            slide = record["slide"]
-        else:
-            parsed = _elf_sections(real)
-            if parsed is None or parsed[0]["type"] != _ELF_ET_EXEC:
-                return None
-            slide = 0
+        slide = self._elf_slide(real)
+        if slide is None:
+            return None
         return _elf_file_bytes(real, (addr - slide) & _ADDR_MASK, length)
 
-    def _trap_sites_checkable(self) -> bool:
-        """True at a live stop of a remote target where GDB holds none of its
-        breakpoints in memory.
+    def _code_regions(self) -> list[tuple[str, int, bytes]]:
+        """``(path, runtime address, bytes)`` of the code that stays code, in
+        the symbol files pry can map onto target memory (see :meth:`_elf_slide`).
 
-        Only remote targets: a trap nobody owns there is the snapshot-baked or
-        orphaned kind. In a native process it is the program's own (or a
-        uprobe's), and GDB never orphans one, so it is never touched.
+        Only read-only executable sections, and none the kernel frees after
+        boot. A writable section is data the target changes as it runs,
+        whatever its flags say (Linux 7.0 links `.data` WAX). Init code
+        (`.init.text`, and the `.altinstr_*`/`.exit.text` sections Linux
+        places between `__init_begin` and `__init_end`) is poisoned with
+        0xcc and its pages handed back to the page allocator: anyone may own
+        them now. Neither is compared with the file, let alone written back.
         """
-        if self._running or self._has_exited or not self._inferior_is_live():
-            return False
+        try:
+            objfiles = list(gdb.objfiles())
+        except Exception:
+            return []
+        regions: list[tuple[str, int, bytes]] = []
+        seen: set[str] = set()
+        wanted = _ELF_SHF_ALLOC | _ELF_SHF_EXECINSTR
+        for objfile in objfiles:
+            path = getattr(objfile, "filename", None)
+            if not path or not os.path.isfile(path):
+                continue
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            slide = self._elf_slide(real)
+            parsed = _elf_sections(real) if slide is not None else None
+            if parsed is None or parsed[0]["type"] == _ELF_ET_REL:
+                continue  # a relocatable object's sections do not move by one slide
+            bounds = _elf_symbol_vaddrs(real, ("__init_begin", "__init_end"))
+            init_begin, init_end = bounds.get("__init_begin"), bounds.get("__init_end")
+            try:
+                with open(real, "rb") as f:
+                    for s in parsed[1]:
+                        if (s["flags"] & wanted != wanted or s["flags"] & _ELF_SHF_WRITE
+                                or s["type"] == _ELF_SHT_NOBITS or not s["size"]):
+                            continue
+                        if s["name"].startswith((b".init.", b".exit.")) or (
+                            init_begin is not None and init_end is not None
+                            and s["addr"] < init_end and init_begin < s["addr"] + s["size"]
+                        ):
+                            continue
+                        f.seek(s["offset"])
+                        regions.append((real, (s["addr"] + slide) & _ADDR_MASK, f.read(s["size"])))
+            except OSError:
+                continue
+        return regions
+
+    def _read_code(self, start: int, size: int) -> tuple[list[tuple[int, bytes]], int]:
+        """Target memory in [start, start + size), read at a stop.
+
+        Returns its readable runs as ``(offset, bytes)`` and the number of
+        bytes that could not be read. GDB splits each read into packets; with
+        none of its breakpoints in memory it reads what the target holds. A
+        chunk that fails is read again page by page, so an unmapped page
+        costs only itself.
+        """
+        inferior = gdb.selected_inferior()
+        runs: list[tuple[int, bytearray]] = []
+        unreadable = 0
+
+        def read(addr: int, length: int) -> bytes | None:
+            try:
+                data = bytes(inferior.read_memory(addr & _ADDR_MASK, length))
+            except Exception:
+                _raise_if_remote_lost(self)
+                return None
+            return data if len(data) == length else None
+
+        def keep(offset: int, data: bytes) -> None:
+            if runs and runs[-1][0] + len(runs[-1][1]) == offset:
+                runs[-1][1].extend(data)
+            else:
+                runs.append((offset, bytearray(data)))
+
+        for offset in range(0, size, _SCAN_CHUNK):
+            length = min(_SCAN_CHUNK, size - offset)
+            data = read(start + offset, length)
+            if data is not None:
+                keep(offset, data)
+                continue
+            addr, end = start + offset, start + offset + length
+            while addr < end:
+                page_end = min(end, (addr // _SCAN_PAGE + 1) * _SCAN_PAGE)
+                data = read(addr, page_end - addr)
+                if data is None:
+                    unreadable += page_end - addr
+                else:
+                    keep(addr - start, data)
+                addr = page_end
+        return [(offset, bytes(data)) for offset, data in runs], unreadable
+
+    def _trap_sites_unchecked(self, *, resuming: bool = False) -> str | None:
+        """Why trap sites cannot be checked now; None at a live stop of a
+        remote target where GDB holds none of its breakpoints in memory.
+
+        *resuming*: asked by an execution about to resume the target, which
+        already counts it as running. Only remote targets: a trap nobody owns
+        there is the snapshot-baked or orphaned kind. In a native process it
+        is the program's own (or a uprobe's), and GDB never orphans one, so
+        it is never touched.
+        """
+        if (self._running and not resuming) or self._has_exited or not self._inferior_is_live():
+            return "the target is not stopped"
+        if self._breakpoints_held:
+            return "GDB holds its breakpoints in target memory at this stop"
         if not self._remember_remote_connection():
-            return False
+            return "not a remote target: a trap instruction in a native process is the program's own"
         with contextlib.suppress(Exception):
             if gdb.parameter("breakpoint always-inserted"):
-                return False
-        return self._trap_bytes() is not None
+                return "`breakpoint always-inserted` is on, so GDB keeps its own traps in memory at a stop"
+        if self._trap_bytes() is None:
+            return "pry knows no trap instruction for this architecture"
+        return None
 
-    def _trap_sites(
-        self, bps, *, repair: bool, skip: set[tuple[int, int]] = frozenset()
-    ) -> list[dict[str, Any]]:
-        """Classify every software-breakpoint site of *bps* (see classify_trap_site).
+    def _trap_sites_checkable(self, *, resuming: bool = False) -> bool:
+        return self._trap_sites_unchecked(resuming=resuming) is None
 
-        Empty unless :meth:`_trap_sites_checkable`. *skip* holds
-        ``(number, index)`` locations to leave alone. With *repair*:
+    def _inspect_site(self, addr: int, trap: bytes, elf: bytes | None, *, repair: bool) -> dict[str, Any]:
+        """Classify the trap site *addr* at a stop (see classify_trap_site).
+
+        *elf* holds the symbol file's bytes there, or None. With *repair*:
 
         - any record the stub keeps for the address is dropped first. GDB
           holds none of its breakpoints at this stop, so such a record belongs
@@ -3952,10 +4223,33 @@ class GdbBridge:
           no-op (QEMU's KVM gdbstub only bumps its count). Dropping an orphan
           makes QEMU write its saved byte back.
         - a trap still there that the ELF does not have is overwritten with
-          the ELF bytes, so the breakpoint GDB inserts next saves the real
+          the ELF bytes, so a breakpoint GDB inserts next saves the real
           instruction as its original and its removal leaves no trap behind.
         """
-        if not self._trap_sites_checkable():
+        window = len(trap) + _TRAP_CONFIRM_BYTES
+        site = classify_trap_site(self._raw_read(addr, window), elf, trap)
+        if repair and site["readable"] and self._drop_stub_record(addr, len(trap)):
+            site["stub_record"] = True
+            if site["trap_present"]:
+                after = classify_trap_site(self._raw_read(addr, window), elf, trap)
+                if after["readable"] and not after["trap_present"]:
+                    # The stub restored its own saved byte: the trap was an
+                    # orphan nobody would ever have removed.
+                    site["baked_trap"] = site["repaired"] = True
+        if site.get("baked_trap") and repair and not site.get("repaired"):
+            site["repaired"] = self._restore_elf_bytes(addr, bytes.fromhex(site["elf_bytes"]))
+        return site
+
+    def _trap_sites(
+        self, bps, *, repair: bool, skip: set[tuple[int, int]] = frozenset(),
+        resuming: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Classify (with *repair*, repair) every software-breakpoint site of *bps*.
+
+        Empty unless :meth:`_trap_sites_checkable`. *skip* holds
+        ``(number, index)`` locations to leave alone. See :meth:`_inspect_site`.
+        """
+        if not self._trap_sites_checkable(resuming=resuming):
             return []
         trap = self._trap_bytes()
         window = len(trap) + _TRAP_CONFIRM_BYTES
@@ -3975,20 +4269,99 @@ class GdbBridge:
                 fn = getattr(loc, "function", None)
                 if fn:
                     site["function"] = fn
-                elf = self._elf_bytes_at(addr, window)
-                site.update(classify_trap_site(self._raw_read(addr, window), elf, trap))
-                if repair and site["readable"] and self._drop_stub_record(addr, len(trap)):
-                    site["stub_record"] = True
-                    if site["trap_present"]:
-                        after = classify_trap_site(self._raw_read(addr, window), elf, trap)
-                        if after["readable"] and not after["trap_present"]:
-                            # The stub restored its own saved byte: the trap
-                            # was an orphan nobody would ever have removed.
-                            site["baked_trap"] = site["repaired"] = True
-                if site.get("baked_trap") and repair and not site.get("repaired"):
-                    site["repaired"] = self._restore_elf_bytes(addr, bytes.fromhex(site["elf_bytes"]))
+                site.update(self._inspect_site(addr, trap, self._elf_bytes_at(addr, window), repair=repair))
                 sites.append(site)
         return sites
+
+    def _restore_traps_before_resume(self) -> list[dict[str, Any]]:
+        """GDB thread, at the stop an execution is about to leave (#62).
+
+        GDB inserts its breakpoints as it resumes and saves what it finds as
+        each one's original instruction. A trap already under a breakpoint
+        (baked into a restored snapshot) would be saved as that original:
+        the breakpoint is hit, and the next resume steps over it by running
+        the saved trap, which nobody owns any more. So every software
+        breakpoint site is repaired here first, as the breakpoint ops do.
+        """
+        bps = list(gdb.breakpoints() or [])
+        if not any(bp.type == gdb.BP_BREAKPOINT for bp in bps):
+            return []
+        if not self._trap_sites_checkable(resuming=True):
+            return []
+        sites = self._trap_sites(bps, repair=True, skip=_pending_locations(), resuming=True)
+        return self._baked_traps(sites)
+
+    def _stray_traps(
+        self, exclude: set[int], stop_at: int | None
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """GDB thread, at resync's stop: traps nobody owns away from the
+        breakpoint sites in *exclude* (already checked), restored.
+
+        *stop_at* is the trap the target last stopped on: any record the stub
+        keeps there is dropped (under QEMU TCG an orphan has no byte in
+        memory), then a trap the symbol file does not have is restored. Then
+        every executable section of the symbol files pry can map onto target
+        memory is read and checked (:func:`stray_trap_offsets`), where the
+        stub writes its traps into memory (QEMU under KVM): elsewhere no trap
+        is visible, and none can be baked into a snapshot.
+
+        Returns the traps found and what was scanned (``skipped`` says why
+        nothing was).
+        """
+        unchecked = self._trap_sites_unchecked()
+        if unchecked is not None:
+            return [], {"skipped": unchecked}
+        trap = self._trap_bytes()
+        window = len(trap) + _TRAP_CONFIRM_BYTES
+        strays: list[dict[str, Any]] = []
+        done = set(exclude)
+        if stop_at is not None and stop_at not in done:
+            done.add(stop_at)
+            site = self._inspect_site(stop_at, trap, self._elf_bytes_at(stop_at, window), repair=True)
+            # A trap the symbol file has too is the program's own.
+            if site.get("stub_record") or (site.get("trap_present") and site.get("elf_bytes") != trap.hex()):
+                strays.append(self._stray_entry(stop_at, site, "stop"))
+        if not self._stub_writes_traps(False):
+            return strays, {"skipped": (
+                "the stub keeps breakpoints out of the memory it reports (QEMU TCG, "
+                "gdbserver): no trap is visible there, and none is baked into a snapshot"
+            )}
+        regions = self._code_regions()
+        scan: dict[str, Any] = {
+            "files": sorted({path for path, _, _ in regions}), "bytes": 0, "unreadable": 0,
+        }
+        for _, start, elf in regions:
+            runs, unreadable = self._read_code(start, len(elf))
+            scan["unreadable"] += unreadable
+            for offset, guest in runs:
+                scan["bytes"] += len(guest)
+                elf_run = elf[offset:offset + len(guest)]
+                for i in stray_trap_offsets(guest, elf_run, trap, start + offset):
+                    addr = (start + offset + i) & _ADDR_MASK
+                    if addr in done:
+                        continue
+                    done.add(addr)
+                    site = self._inspect_site(addr, trap, elf_run[i:i + window], repair=True)
+                    if site.get("baked_trap"):
+                        strays.append(self._stray_entry(addr, site, "scan"))
+        return strays, scan
+
+    def _stray_entry(self, addr: int, site: dict[str, Any], source: str) -> dict[str, Any]:
+        """A resync ``stray_traps`` entry for the trap site *addr*."""
+        entry: dict[str, Any] = {"address": hex(addr), "source": source}
+        label = self._symbolize(addr)
+        if label:
+            entry["function"] = label
+        entry["guest_bytes"] = site.get("guest_bytes")
+        entry["elf_bytes"] = site.get("elf_bytes")
+        entry["trap_in_memory"] = bool(site.get("trap_present"))
+        if site.get("stub_record"):
+            entry["stub_record"] = True
+        # A record with no trap in memory (QEMU TCG) is gone once dropped.
+        entry["repaired"] = bool(site.get("repaired") or (
+            site.get("stub_record") and not site.get("trap_present")
+        ))
+        return entry
 
     def _drop_stub_record(self, addr: int, kind: int) -> bool:
         """Ask a remote stub to forget a software breakpoint at *addr*.
@@ -4119,6 +4492,8 @@ class GdbBridge:
                     with contextlib.suppress(gdb.error):
                         bp.enabled = False
                         bp.enabled = True
+            elif keep_inserted and not previous:
+                self._breakpoints_held = True
         return {"errors": errors, "resident": resident, "reseated": reseated,
                 "pending": pending}
 
@@ -4177,8 +4552,10 @@ class GdbBridge:
         (``_dispatch_breakpoint_op`` stops a running target and resumes it
         afterwards): it drops the stale stop reason and caches, reloads the
         symbols at a new ``base`` if given, re-reads rebased symbol files GDB
-        gave up on (<PENDING>), restores baked traps, and then has GDB insert
-        every breakpoint and reads each trap back from target memory.
+        gave up on (<PENDING>), restores baked traps at breakpoint sites and
+        stray ones anywhere in the mapped code (:meth:`_stray_traps`), and then
+        has GDB insert every breakpoint and reads each trap back from target
+        memory.
         """
         was_running = bool(params.get("_was_running"))
         will_resume = bool(params.get("_will_resume"))
@@ -4187,6 +4564,12 @@ class GdbBridge:
             raise RuntimeError(self._remote_failure)
         if self._has_exited or not self._inferior_is_live():
             raise RuntimeError("no live target to resync; connect or attach first")
+        # A trap the target last stopped on belongs to nobody (#63).
+        self._resolve_pending_stop()
+        prior = self._last_stop_reason or {}
+        stop_at = None
+        if prior.get("kind") == "trap" and (prior.get("trap_address") or prior.get("address")):
+            stop_at = int(prior.get("trap_address") or prior["address"], 16)
         # A stop the target reached by itself while resync was stopping it
         # happened in the new machine: it stays the stop reason.
         natural_stop = was_running and not will_resume
@@ -4222,9 +4605,12 @@ class GdbBridge:
         unreadable = {
             tuple(int(p) for p in loc.split(".")) for loc, s in sites.items() if not s["readable"]
         }
+        result["stray_traps"], result["scan"] = self._stray_traps(
+            {int(s["address"], 16) for s in sites.values()}, stop_at
+        )
         verify = self._verify_insertion(bps, unreadable, keep_inserted=will_resume)
         result["breakpoints"] = self._resync_entries(bps, sites, verify)
-        result["summary"] = _resync_summary(result["breakpoints"])
+        result["summary"] = _resync_summary(result["breakpoints"], result["stray_traps"])
         if not natural_stop:
             self._last_stop_reason = {"kind": "resynced"}
         result.update(self._execution_state())
