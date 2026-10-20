@@ -488,7 +488,62 @@ def _format_stop_reason(reason: Any) -> str | None:
     if kind == "exited":
         code = reason.get("code")
         return f"exited (code {code})" if code is not None else "exited"
+    if kind == "trap":
+        where = reason.get("address") or "?"
+        if reason.get("trap_in_memory"):
+            site = reason.get("trap_address") or where
+            return (f"trap at {where}: no pry breakpoint owns the trap instruction at "
+                    f"{site} (the program's own, or one left behind: orphaned, or baked "
+                    "into a restored snapshot)")
+        return f"trap at {where}: no breakpoint or signal explains this stop"
+    if kind == "resynced":
+        return "resynced (state re-read after the machine changed under the debugger)"
     return kind or None
+
+
+def _run_state_text(run_state: dict) -> str:
+    """What a breakpoint op did to a target that was running when it arrived."""
+    stop = run_state.get("stop") if isinstance(run_state.get("stop"), dict) else None
+    stop_reason = _format_stop_reason(stop.get("reason")) if stop else None
+    if run_state.get("resumed"):
+        if stop:
+            return ("the target was running: pry interrupted it to apply this and "
+                    f"resumed it, and it stopped again at once ({stop_reason or stop.get('state')})")
+        return "the target was running: pry interrupted it to apply this, then resumed it"
+    if run_state.get("error"):
+        return ("the target was running: pry interrupted it to apply this but could "
+                f"not resume it, so it is stopped: {run_state['error']}")
+    return ("the target was running and stopped on its own "
+            f"({stop_reason or 'see `pry status`'}) while pry was stopping it; it was left stopped")
+
+
+def _breakpoint_op_notes(value: dict) -> list[str]:
+    """Trailing lines of a breakpoint op: restored traps, and a paused target."""
+    lines = []
+    for trap in value.get("baked_traps") or []:
+        if not isinstance(trap, dict):
+            continue
+        where = trap.get("address", "?")
+        if trap.get("function"):
+            where += f" ({trap['function']})"
+        held = (f"guest memory held a trap ({trap.get('guest_bytes')}) where the "
+                f"symbol file has {trap.get('elf_bytes')}")
+        if trap.get("repaired"):
+            lines.append(f"warning: {where}: {held}, most likely baked in by a snapshot; "
+                         "restored the original byte(s)")
+        else:
+            lines.append(f"warning: {where}: {held}, most likely baked in by a snapshot; "
+                         "could NOT restore it, so the target traps there with no "
+                         "breakpoint to catch it")
+    run_state = value.get("run_state")
+    if isinstance(run_state, dict) and run_state.get("was_running"):
+        lines.append(f"note: {_run_state_text(run_state)}")
+    return lines
+
+
+def _with_notes(text: str, value: dict) -> str:
+    notes = _breakpoint_op_notes(value)
+    return "\n".join([text, *notes]) if notes else text
 
 
 def _render_stop_text(value: Any) -> str:
@@ -691,7 +746,14 @@ def _bp_location_entries(bp: dict) -> list[dict]:
 
 
 def _format_bp_location_detail(loc: dict) -> str:
-    """Format one resolved location as '@ ADDR [FN] [FILE:LINE]'."""
+    """Format one resolved location as '@ ADDR [FN] [FILE:LINE]'.
+
+    A location GDB shows <PENDING> has no address it will insert, so it
+    renders as '<PENDING> [FN]'.
+    """
+    if loc.get("pending"):
+        fn = loc.get("function")
+        return f"<PENDING> {fn}" if fn else "<PENDING>"
     addr = loc.get("address")
     if not addr:
         return ""
@@ -812,8 +874,8 @@ def _render_breakpoint_set_text(value: Any) -> str:
             if detail:
                 detail_lines.append(f"  {detail}")
         if detail_lines:
-            return header + "\n" + "\n".join(detail_lines)
-    return header
+            return _with_notes(header + "\n" + "\n".join(detail_lines), value)
+    return _with_notes(header, value)
 
 
 def _render_breakpoint_delete_text(value: Any) -> str:
@@ -826,11 +888,13 @@ def _render_breakpoint_delete_text(value: Any) -> str:
 
     items = value.get("items")
     if isinstance(items, list) and items:
-        return "\n".join(
+        text = "\n".join(
             f"{_noun(it.get('kind'))} #{it.get('number')} deleted"
             for it in items if isinstance(it, dict)
         )
-    return f"{_noun(value.get('kind'))} #{value.get('deleted', '?')} deleted"
+    else:
+        text = f"{_noun(value.get('kind'))} #{value.get('deleted', '?')} deleted"
+    return _with_notes(text, value)
 
 
 def _render_breakpoint_state_text(value: Any) -> str:
@@ -841,7 +905,10 @@ def _render_breakpoint_state_text(value: Any) -> str:
     prep = _bp_target_preposition(value)
     noun = "watchpoint" if "watchpoint" in (value.get("kind") or "") else "breakpoint"
     enabled = "enabled" if value.get("enabled") else "disabled"
-    return f"{noun} #{num} {prep} {target} [{enabled}]"
+    text = f"{noun} #{num} {prep} {target} [{enabled}]"
+    if value.get("pending"):
+        text += " (pending — GDB has no address it will insert)"
+    return _with_notes(text, value)
 
 
 def _render_watch_set_text(value: Any) -> str:
@@ -850,7 +917,7 @@ def _render_watch_set_text(value: Any) -> str:
     num = value.get("number", "?")
     expression = value.get("expression") or "<unknown>"
     enabled = "enabled" if value.get("enabled") else "disabled"
-    return f"watchpoint #{num} on {expression} [{enabled}]"
+    return _with_notes(f"watchpoint #{num} on {expression} [{enabled}]", value)
 
 
 def _render_backtrace_text(value: Any) -> str:
@@ -2031,7 +2098,12 @@ def _render_load_text(value: Any) -> str:
         extras.append(f"scripts {gdb_scripts}")
     if extras:
         line = f"{line}; " + "; ".join(extras)
-    return line
+    pending = value.get("pending_breakpoints")
+    if isinstance(pending, list) and pending:
+        numbers = ", ".join(f"#{n}" for n in pending)
+        line += (f"\nwarning: GDB could not place breakpoint(s) {numbers}: they are "
+                 "pending and will not fire (see `pry break list`)")
+    return _with_notes(line, value)
 
 
 def _load(args: argparse.Namespace) -> int:
@@ -2276,6 +2348,100 @@ def _wait(args: argparse.Namespace) -> int:
         params or None,
         text_renderer=_render_stop_text,
         stem="wait",
+        timeout=(timeout + 10) if timeout else None,
+    )
+
+
+def _format_resync_entry(entry: dict) -> str:
+    label = f"#{entry.get('location') or entry.get('number', '?')}"
+    parts = [label, str(entry.get("status", "?"))]
+    if entry.get("address"):
+        parts.append(f"@ {entry['address']}")
+    what = entry.get("function") or entry.get("expression")
+    if what:
+        parts.append(str(what))
+    tags = []
+    if entry.get("trap_resident") is True:
+        tags.append("trap byte resident")
+    elif entry.get("trap_resident") is False:
+        tags.append("no trap byte in memory")
+    if entry.get("reseated"):
+        tags.append("re-inserted over a stale stub record")
+    if entry.get("baked_trap"):
+        fix = "restored" if entry.get("repaired") else "NOT restored"
+        tags.append(f"baked trap {entry.get('guest_bytes')} over {entry.get('elf_bytes')}: {fix}")
+    elif entry.get("elf_match") is False:
+        tags.append("memory differs from the symbol file")
+    line = " ".join(parts)
+    if tags:
+        line += f" ({'; '.join(tags)})"
+    if entry.get("detail"):
+        line += f": {entry['detail']}"
+    return line
+
+
+def _render_resync_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    state = value.get("state", "unknown")
+    lines = [f"state: {state}"]
+    if state != "running":
+        reason = _format_stop_reason(value.get("reason"))
+        if reason:
+            lines.append(f"reason: {reason}")
+        frame = value.get("frame") or {}
+        if frame.get("function") or frame.get("address"):
+            loc = frame.get("function") or "??"
+            if frame.get("file"):
+                loc += f" at {frame['file']}"
+                if frame.get("line") is not None:
+                    loc += f":{frame['line']}"
+            if frame.get("address"):
+                loc += f" ({frame['address']})"
+            lines.append(f"frame: {loc}")
+    run_state = value.get("run_state") or {}
+    if run_state.get("was_running"):
+        lines.append(f"target: {_run_state_text(run_state)}")
+    symbols = value.get("symbols")
+    if isinstance(symbols, dict):
+        lines.append(f"symbols: reloaded {symbols.get('loaded')} @ "
+                     f"{symbols.get('base')} (slide {symbols.get('slide')})")
+    for path in value.get("reloaded") or []:
+        lines.append(f"symbols: re-read {path} so GDB re-resolves breakpoints it had given up on")
+    summary = value.get("summary") or {}
+    head = f"breakpoints: {summary.get('armed', 0)} armed, {summary.get('not_armed', 0)} not armed"
+    if summary.get("baked_traps"):
+        head += f", {summary.get('repaired', 0)} of {summary['baked_traps']} baked trap(s) restored"
+    lines.append(head)
+    for entry in value.get("breakpoints") or []:
+        if isinstance(entry, dict):
+            lines.append("  " + _format_resync_entry(entry))
+    if summary.get("elf_mismatch"):
+        lines.append(
+            f"hint: target memory differs from the symbol file at {summary['elf_mismatch']} "
+            "breakpoint site(s); if the kernel re-slid (reset, reboot), rerun with "
+            "`pry resync --base <KBASE>`"
+        )
+    return "\n".join(lines)
+
+
+def _resync(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.base:
+        params["base"] = args.base
+    if args.symbols:
+        if not args.base:
+            raise BridgeError("--symbols only applies with --base")
+        params["symbols"] = str(Path(args.symbols).expanduser().resolve())
+    timeout = getattr(args, "timeout", None)
+    if timeout is not None:
+        params["_timeout"] = timeout
+    return _call(
+        args,
+        "resync",
+        params,
+        text_renderer=_render_resync_text,
+        stem="resync",
         timeout=(timeout + 10) if timeout else None,
     )
 
@@ -3203,6 +3369,35 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(wait_cmd)
     _add_timeout_arg(wait_cmd)
     wait_cmd.set_defaults(handler=_wait)
+
+    # --- resync ---
+    resync_cmd = subparsers.add_parser(
+        "resync",
+        help="Re-establish the debugger's view after the machine changed under it "
+             "(snapshot load, reset, reboot)",
+        description=(
+            "Re-read the stop state and re-arm breakpoints after the target machine "
+            "was rewound or reset behind GDB's back. Stops a running target first and "
+            "resumes it afterwards. Reports every breakpoint location's status "
+            "(armed, pending, unreadable, insert-failed, not-resident, disabled), whether its trap "
+            "byte is resident in target memory, and any baked trap it restored. Exit 0 "
+            "means the report is current, not that every breakpoint is armed: check "
+            "summary.not_armed."
+        ),
+    )
+    _common_io_options(resync_cmd)
+    _add_timeout_arg(resync_cmd)
+    resync_cmd.add_argument(
+        "--base", metavar="ADDR",
+        help="Reload the symbols at this runtime _text first (the kernel re-slid "
+             "after a reset or reboot), exactly as `pry load --base` does",
+    )
+    resync_cmd.add_argument(
+        "--symbols", metavar="PATH",
+        help="Symbol file to reload with --base (default: the last one `pry load` "
+             "read, else the main executable)",
+    )
+    resync_cmd.set_defaults(handler=_resync)
 
     # --- break ---
     brk = subparsers.add_parser("break", help="Breakpoint management")
