@@ -454,6 +454,7 @@ def _elf_reloc_reference(path: str, syms: dict | None = None):
     return None
 
 
+_ELF_SHF_WRITE = 0x1
 _ELF_SHF_ALLOC = 0x2
 _ELF_SHF_EXECINSTR = 0x4
 _ELF_SHT_NOBITS = 8
@@ -599,6 +600,29 @@ def _inside_rewritten_branch(guest: bytes, elf: bytes, i: int) -> bool:
     return False
 
 
+# Longest run of int3 padding looked back over for the jump that skips it.
+_PADDING_RUN_MAX = 256
+
+
+def _inside_jumped_over_padding(guest: bytes, elf: bytes, i: int) -> bool:
+    """x86: whether offset *i* lies in int3 padding a rewritten jump skips.
+
+    Linux's text patching (alternatives) turns a run of NOPs into ``jmp
+    +N; int3; …``: the last int3 has the symbol file's next instruction
+    after it, like a planted trap, but the target only ever jumps over it.
+    A trap at the jump's destination itself is an instruction start, and
+    still counts.
+    """
+    s = i
+    while s > 0 and i - s < _PADDING_RUN_MAX and guest[s - 1] == 0xCC:
+        s -= 1
+    if s >= 2 and guest[s - 2] == 0xEB and guest[s - 2:s] != elf[s - 2:s]:
+        return s + int.from_bytes(guest[s - 1:s], "little", signed=True) > i
+    if s >= 5 and guest[s - 5] == 0xE9 and guest[s - 5:s] != elf[s - 5:s]:
+        return s + int.from_bytes(guest[s - 4:s], "little", signed=True) > i
+    return False
+
+
 def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, start: int) -> list[int]:
     """Offsets where *guest* holds a lone trap instruction nobody owns.
 
@@ -608,9 +632,10 @@ def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, start: int) -> lis
     a snapshot baked in, or GDB orphaned) replaces the first byte(s) of one
     instruction: the symbol file has another instruction there and agrees
     on the bytes that follow, as :func:`classify_trap_site` requires. Traps
-    the kernel writes itself are told apart: on x86 those after a rewritten
-    rel32 branch (:func:`_inside_rewritten_branch`), and with fixed-width
-    instructions (aarch64) a trap off an instruction boundary.
+    the kernel writes itself are told apart: on x86 those inside a
+    rewritten rel32 branch (:func:`_inside_rewritten_branch`) or in padding
+    a rewritten jump skips (:func:`_inside_jumped_over_padding`), and with
+    fixed-width instructions (aarch64) a trap off an instruction boundary.
     """
     n = len(trap)
     size = min(len(guest), len(elf))
@@ -640,7 +665,9 @@ def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, start: int) -> lis
         confirm = min(size - i - n, _TRAP_CONFIRM_BYTES)
         if confirm < _TRAP_MIN_CONFIRM or guest[i + n:i + n + confirm] != elf[i + n:i + n + confirm]:
             continue
-        if trap == b"\xcc" and _inside_rewritten_branch(guest, elf, i):
+        if trap == b"\xcc" and (
+            _inside_rewritten_branch(guest, elf, i) or _inside_jumped_over_padding(guest, elf, i)
+        ):
             continue
         found.append(i)
     return found
@@ -4065,8 +4092,14 @@ class GdbBridge:
         return _elf_file_bytes(real, (addr - slide) & _ADDR_MASK, length)
 
     def _code_regions(self) -> list[tuple[str, int, bytes]]:
-        """``(path, runtime address, bytes)`` of every executable section of the
-        symbol files pry can map onto target memory (see :meth:`_elf_slide`)."""
+        """``(path, runtime address, bytes)`` of every read-only executable
+        section of the symbol files pry can map onto target memory (see
+        :meth:`_elf_slide`).
+
+        A writable section is data the target changes as it runs, whatever
+        its flags say (Linux 7.0 links `.data` WAX): its bytes are never
+        compared with the file, let alone written back.
+        """
         try:
             objfiles = list(gdb.objfiles())
         except Exception:
@@ -4089,7 +4122,8 @@ class GdbBridge:
             try:
                 with open(real, "rb") as f:
                     for s in parsed[1]:
-                        if s["flags"] & wanted != wanted or s["type"] == _ELF_SHT_NOBITS or not s["size"]:
+                        if (s["flags"] & wanted != wanted or s["flags"] & _ELF_SHF_WRITE
+                                or s["type"] == _ELF_SHT_NOBITS or not s["size"]):
                             continue
                         f.seek(s["offset"])
                         regions.append((real, (s["addr"] + slide) & _ADDR_MASK, f.read(s["size"])))

@@ -9,7 +9,7 @@ import types
 import pytest
 
 import pry.cli
-from tests.test_bridge import _load_bridge
+from tests.test_bridge import _ALLOC, _EXEC, _WRITE, _load_bridge, _write_kernel_elf
 
 TRAP_SITE = 0xFFFFFFFF810881D0
 # `mov 0x70(%rdi),%rdi; jmp ...` as the ELF has it at the breakpoint site.
@@ -249,6 +249,11 @@ _A64 = bytes.fromhex("fd7bbfa9" "fd030091" "e00313aa" "c0035fd6")
         ("5e415f5dc3cccccccc0f0b658b052c25ce", "5e415f5de95dfecc000f0b658b052c25ce", "cc", 0x1000, []),
         # A trap planted right after such a rewritten jmp is still found.
         ("c3cccccccc0f1f4000cc8b7f70e9b7ebff", "e934b1f7000f1f4000488b7f70e9b7ebff", "cc", 0x1000, [9]),
+        # Alternatives turned a NOP run into `jmp +12; int3 x12`: the last
+        # int3 has the ELF's next instruction after it, but is jumped over.
+        ("eb0c" + "cc" * 12 + "90488d7c2408", "90" * 15 + "488d7c2408", "cc", 0x1000, []),
+        # ...while a trap planted where that jmp lands is an instruction start.
+        ("eb0c" + "cc" * 13 + "488d7c240890", "90" * 14 + "48488d7c240890", "cc", 0x1000, [14]),
         # Too few bytes after it to confirm the mapping.
         ("0f1f4000cc8b7f", "0f1f4000488b7f", "cc", 0x1000, []),
         # aarch64: a `brk #0` replacing one instruction, on its boundary.
@@ -948,6 +953,30 @@ def test_resync_restores_a_baked_trap_away_from_every_breakpoint(monkeypatch):
     assert stray["repaired"] is True
     assert result["summary"]["stray_traps"] == result["summary"]["stray_repaired"] == 1
     assert result["scan"]["bytes"] == len(guest)
+
+
+def test_resync_scans_only_read_only_code_sections(monkeypatch, tmp_path):
+    """Linux 7.0 links `.data` WAX. Its live bytes are data the kernel changed
+    (a 0xcc in a pointer), never compared with the file or written back."""
+    lead = bytes.fromhex("0f1f4000")
+    text, data = TRAP_SITE - len(lead), 0xFFFFFFFF85200000
+    planted = lead + b"\xcc" + ELF_WINDOW[1:]
+    memory = {text + i: b for i, b in enumerate(planted)}
+    memory.update({data + i: b for i, b in enumerate(planted)})
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, memory)
+    vmlinux = tmp_path / "vmlinux"
+    _write_kernel_elf(vmlinux, symbols={}, sections=[
+        (".text", _ALLOC | _EXEC, text, lead + ELF_WINDOW),
+        (".data", _WRITE | _ALLOC | _EXEC, data, lead + ELF_WINDOW),
+    ])
+    monkeypatch.setattr(fake_gdb, "objfiles", lambda: [types.SimpleNamespace(filename=str(vmlinux))],
+                        raising=False)
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    assert [s["address"] for s in result["stray_traps"]] == [hex(TRAP_SITE)]
+    assert stub.mem[data + len(lead)] == 0xCC  # the kernel's data, untouched
+    assert result["scan"]["bytes"] == len(planted)
 
 
 def test_resync_drops_the_orphan_the_target_last_stopped_on(monkeypatch):

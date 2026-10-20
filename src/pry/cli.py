@@ -2041,7 +2041,18 @@ def _release_target(inst: Any) -> dict[str, Any]:
     ``{"warning": ...}`` when pry could not make sure, else ``{}``.
     """
     try:
-        response = _send_request_to_instance(inst, "prepare_kill", timeout=5.0, connect_retries=1)
+        try:
+            response = _send_request_to_instance(inst, "prepare_kill", timeout=5.0, connect_retries=1)
+            stopped = bool((response.get("result") or {}).get("was_running"))
+        except BridgeError as exc:
+            if "Unknown op: 'prepare_kill'" not in str(exc):
+                raise
+            # A bridge from before `prepare_kill`: stop whatever runs with the
+            # lock-free ops it has.
+            status = _send_request_to_instance(inst, "status", timeout=5.0, connect_retries=1)
+            stopped = (status.get("result") or {}).get("state") == "running"
+            if stopped:
+                _send_request_to_instance(inst, "interrupt", timeout=5.0, connect_retries=1)
     except BridgeError as exc:
         return {"warning": (
             f"pry could not make sure that no breakpoint of GDB's stays in target memory ({exc}). "
@@ -2049,9 +2060,7 @@ def _release_target(inst: Any) -> dict[str, Any]:
             "there: a QEMU guest halts at the first one it reaches, until a debugger "
             "connects again (QEMU drops them for a new client)"
         )}
-    if (response.get("result") or {}).get("was_running"):
-        return {"stopped_target": True}
-    return {}
+    return {"stopped_target": True} if stopped else {}
 
 
 def _logs(args: argparse.Namespace) -> int:
