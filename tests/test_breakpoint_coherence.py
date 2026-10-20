@@ -441,6 +441,57 @@ def test_waiter_follows_the_resumed_execution(monkeypatch):
     assert responses[0]["result"]["reason"]["number"] == 1
 
 
+def test_failed_op_while_running_keeps_the_run_state(monkeypatch):
+    """#68: a read the running stub refuses does not make pry think it stopped,
+    so the next breakpoint change still stops, applies and resumes."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    running = [True]
+    execute = fake_gdb.execute
+
+    def track(cmd, to_string=False):
+        if cmd == "interrupt":
+            running[0] = False
+        result = execute(cmd, to_string=to_string)
+        if cmd == "continue":
+            running[0] = True
+        return result
+
+    def threads():
+        # Listing threads asks the all-stop stub, which refuses while it runs.
+        if running[0]:
+            raise fake_gdb.error("Cannot execute this command while the target is running.")
+        return [thread]
+
+    def parse_and_eval(expression):
+        if running[0]:
+            raise fake_gdb.error("Selected thread is running.")
+        return 0
+
+    thread = fake_gdb.selected_thread()
+    monkeypatch.setattr(thread, "is_running", lambda: running[0])
+    monkeypatch.setattr(thread, "is_stopped", lambda: not running[0])
+    monkeypatch.setattr(fake_gdb.selected_inferior(), "threads", threads)
+    monkeypatch.setattr(fake_gdb, "parse_and_eval", parse_and_eval)
+    fake_gdb.execute = track
+
+    assert bridge.dispatch({"op": "print", "params": {"expression": "$pc"}})["ok"] is False
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "running"
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    response = bridge.dispatch({"op": "break_delete", "params": {"number": 1}})
+
+    assert response["ok"] is True, response
+    assert response["result"]["run_state"] == {
+        "was_running": True, "interrupted": True, "resumed": True,
+    }
+    assert stub.bps == []
+    assert stub.mem[TRAP_SITE] == ELF_WINDOW[0]
+    assert running[0] is True
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "running"
+
+
 # --- baked traps ----------------------------------------------------------------
 
 @pytest.mark.parametrize("op", ["break_delete", "break_disable", "break_enable"])
@@ -483,6 +534,40 @@ def test_plain_stop_is_a_trap_only_when_nothing_was_stepping(monkeypatch, op, ki
     response = bridge.dispatch({"op": op, "params": {}})
 
     assert response["result"]["reason"]["kind"] == kind
+
+
+@pytest.mark.parametrize("refused", [True, False])
+def test_plain_continue_stop_fails_when_gdb_could_not_insert(monkeypatch, refused):
+    """#65: GDB resumed (a step over the breakpoint at the PC), could not insert
+    its breakpoints and stopped: the continue failed. With every breakpoint
+    insertable the same plain stop is an unexplained trap."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    hw = _Bp(stub, 2, TRAP_SITE + 4, bp_type=fake_gdb.BP_HARDWARE_BREAKPOINT)
+    update = stub.update
+
+    def update_without_free_debug_registers():
+        if refused and stub.always_inserted and hw.enabled:
+            raise fake_gdb.error(
+                "Warning:\nCannot insert hardware breakpoint 2:Remote failure reply: 01.\n"
+            )
+        update()
+
+    stub.update = update_without_free_debug_registers
+    fake_gdb._pending_stop_event = fake_gdb._FakeStopEvent()
+
+    response = bridge.dispatch({"op": "continue", "params": {}})
+    status = bridge.dispatch({"op": "status"})["result"]
+
+    if refused:
+        assert response["ok"] is False
+        assert "Cannot insert hardware breakpoint 2" in response["error"]
+        assert status["state"] == "stopped"
+        assert status.get("reason", {}).get("kind") != "trap"
+    else:
+        assert response["result"]["reason"]["kind"] == "trap"
+    # The trial insertion leaves no trap of GDB's in memory at the stop.
+    assert stub.inserted == {}
 
 
 # --- symbol reload ---------------------------------------------------------------
