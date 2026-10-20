@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import struct
 import sys
 import types
@@ -1359,8 +1360,8 @@ def test_parse_idt_entry_offset(monkeypatch):
         parse(b"\x00" * 4)
 
 
-def _write_kernel_elf(path: Path, *, sections, symbols: dict[str, int]) -> None:
-    """ELF64-LE ET_EXEC with allocated *sections* plus .symtab/.strtab/.shstrtab.
+def _write_kernel_elf(path: Path, *, sections, symbols: dict[str, int], e_type: int = 2) -> None:
+    """ELF64-LE (ET_EXEC unless *e_type*) with allocated *sections* plus .symtab/.strtab/.shstrtab.
 
     Each section is ``(name, flags, addr, data)``; an int ``data`` is the size
     of a NOBITS section (no file bytes).
@@ -1407,7 +1408,7 @@ def _write_kernel_elf(path: Path, *, sections, symbols: dict[str, int]) -> None:
     ehdr = bytearray(64)
     ehdr[0:4] = b"\x7fELF"
     ehdr[4], ehdr[5], ehdr[6] = 2, 1, 1
-    struct.pack_into("<HHI", ehdr, 16, 2, 0x3E, 1)  # ET_EXEC, x86-64
+    struct.pack_into("<HHI", ehdr, 16, e_type, 0x3E, 1)  # x86-64
     struct.pack_into("<Q", ehdr, 0x28, off + len(blobs))
     struct.pack_into("<HHHH", ehdr, 0x34, 64, 0, 0, 64)
     struct.pack_into("<HH", ehdr, 0x3C, len(shdrs), len(shdrs) - 1)
@@ -1683,6 +1684,62 @@ def test_kbase_falls_back_to_vbar_via_all_registers(monkeypatch, tmp_path):
     assert result["derivation"] == "symbol"
     assert result["handler_symbol"] == "vectors"
     assert result["handler"] == hex(_VBAR_LIVE)
+
+
+@pytest.mark.parametrize("runtime_text", [_ARM64_LINK_TEXT, _ARM64_TEXT], ids=["nokaslr", "kaslr"])
+def test_kbase_knows_link_time_slide_of_et_dyn_primary(monkeypatch, tmp_path, runtime_text):
+    """#70: arm64 links vmlinux ET_DYN; loaded with `file` it still sits at slide 0."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = tmp_path / "vmlinux"
+    _write_kernel_elf(
+        elf,
+        sections=[
+            (".head.text", _ALLOC | _EXEC, _ARM64_LINK_TEXT, 0x10000),
+            (".rodata", _ALLOC, _ARM64_LINK_BANNER, _BANNER + b"\x00"),
+        ],
+        symbols={
+            "_text": _ARM64_LINK_TEXT,
+            "vectors": _ARM64_LINK_VECTORS,
+            "linux_banner": _ARM64_LINK_BANNER,
+        },
+        e_type=3,  # ET_DYN
+    )
+    slide = runtime_text - _ARM64_LINK_TEXT
+    vbar = _ARM64_LINK_VECTORS + slide
+
+    def _exec(cmd, to_string=False):
+        fake_gdb._execute_log.append(cmd)
+        if cmd == "kbase":
+            return "Unable to locate the kernel base\n"
+        if cmd == "monitor info registers":
+            raise fake_gdb.error("Monitor command failed")
+        if cmd == "info all-registers":
+            return f"VBAR           {vbar:#x}  0\n"
+        return ""
+
+    def _read_memory(addr, length):
+        if addr == _ARM64_LINK_BANNER + slide:
+            return _BANNER[:length]
+        return bytes(length)
+
+    fake_gdb.execute = _exec
+    fake_gdb.parse_and_eval = lambda expr: (_ for _ in ()).throw(fake_gdb.error("no reg"))
+    fake_gdb.selected_inferior().read_memory = _read_memory
+    # Loaded as GDB's primary symbol file (`pry load`, `launch --symbols`).
+    fake_gdb.objfiles = lambda: [types.SimpleNamespace(filename=str(elf))]
+    fake_gdb.current_progspace = lambda: types.SimpleNamespace(filename=str(elf))
+
+    apply = bridge._dispatch_op("kbase", {})["apply"]
+
+    assert apply["previous_slide"] == "0x0"
+    if slide == 0:
+        # Nothing to rebase: the symbol file is left alone.
+        assert apply["applied"] is False
+        assert not any(c.startswith(("add-symbol-file", "symbol-file")) for c in fake_gdb._execute_log)
+    else:
+        assert apply["applied"] is True
+        assert apply["load"]["slide"] == hex(slide)
 
 
 def test_kbase_vbar_reads_convenience_register(monkeypatch):
@@ -3026,6 +3083,53 @@ def test_load_with_base_computes_slide_from_elf(monkeypatch, tmp_path):
     assert any(
         c == f"add-symbol-file {elf} -o 0x7000000" for c in fake_gdb._execute_log
     )
+
+
+@pytest.mark.parametrize("slid", [{"slide": "0x7000000"}, {"base": "0xffffffff88000000"}])
+def test_plain_load_replaces_a_slid_copy(monkeypatch, tmp_path, slid):
+    """#69: `load FILE` after `load FILE --base/--slide` leaves one link-time copy."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    elf = tmp_path / "vmlinux"
+    _write_minimal_elf64(elf, 0xFFFFFFFF81000000)
+    # GDB's objfiles: the primary (`file`) plus add-symbol-file copies, which
+    # only `remove-symbol-file` (exact objfile name) or `symbol-file` drop.
+    objfiles = {"primary": None, "added": []}
+    real_exec = fake_gdb.execute
+
+    def _exec(cmd, to_string=False):
+        words = cmd.split()
+        if words[0] == "file":
+            objfiles["primary"] = os.path.realpath(words[1])
+        elif words[0] == "symbol-file":
+            objfiles.update(primary=None, added=[])
+        elif words[0] == "add-symbol-file":
+            objfiles["added"].append(os.path.realpath(words[1]))
+        elif words[0] == "remove-symbol-file":
+            if words[1] not in objfiles["added"]:
+                raise fake_gdb.error("No symbol file found")
+            objfiles["added"].remove(words[1])
+            for bp in fake_gdb.breakpoints():
+                bp.enabled = False  # its name no longer resolves anywhere
+        return real_exec(cmd, to_string=to_string)
+
+    fake_gdb.execute = _exec
+    fake_gdb.objfiles = lambda: [
+        types.SimpleNamespace(filename=f)
+        for f in ([objfiles["primary"]] if objfiles["primary"] else []) + objfiles["added"]
+    ]
+    fake_gdb.current_progspace = lambda: types.SimpleNamespace(filename=objfiles["primary"])
+    bp = fake_gdb.Breakpoint("commit_creds")
+
+    bridge._dispatch_op("load", {"path": str(elf), **slid})
+    assert objfiles == {"primary": None, "added": [str(elf)]}
+
+    bridge._dispatch_op("load", {"path": str(elf)})
+    assert objfiles == {"primary": str(elf), "added": []}
+    assert bp.enabled is True
+
+    # Nothing slid is left on record: kbase sees link addresses (slide 0).
+    assert bridge._kbase_apply(str(elf), 0xFFFFFFFF81000000, 0)["applied"] is False
 
 
 def test_load_with_base_errors_when_text_unreadable(monkeypatch, tmp_path):
