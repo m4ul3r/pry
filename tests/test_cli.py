@@ -2765,17 +2765,52 @@ def test_break_delete_single_keeps_legacy_shape(monkeypatch, capsys):
     assert "numbers" not in cap["params"]
 
 
-def test_run_dash_args_rejected_with_working_sentinel_fix(monkeypatch, capsys):
-    cap = _capture_send(monkeypatch, result={"status": "exited", "exit_code": 0})
-    argv = ["run", "--timeout", "5", "a", "--background", "-threads", "1", "-i", "crash.avi", "-"]
+def _suggested_run_command(capsys, argv):
     with pytest.raises(SystemExit) as exc:
         pry.cli.main(argv)
     assert exc.value.code == 2
+    last_line = capsys.readouterr().err.strip().splitlines()[-1]
+    fixed = shlex.split(last_line.rsplit(": ", 1)[1])
+    assert fixed[0] == "pry"
+    return fixed[1:]
+
+
+def test_run_dash_args_rejected_with_working_sentinel_fix(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"status": "exited", "exit_code": 0})
+    argv = ["run", "--timeout", "5", "a", "--background", "-threads", "1", "-i", "crash.avi", "-"]
+    fixed = _suggested_run_command(capsys, argv)
     assert cap == {}
 
-    run_parser = pry.cli.build_parser()._subparsers._group_actions[0].choices["run"]
-    fixed = shlex.split(pry.cli._run_sentinel_fix(run_parser, argv))
-    assert fixed[0] == "pry"
-    assert pry.cli.main(fixed[1:]) == 0
+    assert pry.cli.main(fixed) == 0
     assert cap["params"]["args"] == ["a", "-threads", "1", "-i", "crash.avi", "-"]
     assert cap["params"]["_background"] is True
+
+
+def test_run_sentinel_fix_keeps_global_instance_named_run(capsys):
+    fixed = _suggested_run_command(capsys, ["--instance", "run", "run", "-x", "run"])
+    args = pry.cli.build_parser().parse_args(fixed)
+    assert args.instance_global == "run"
+    assert args.handler is pry.cli._run
+    assert args.args == ["-x", "run"]
+
+
+def test_run_misspelled_pry_option_is_not_forwarded(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        pry.cli.main(["run", "--timout", "5", "-x"])
+    assert exc.value.code == 2
+    assert cap == {}
+    assert "--timeout" in capsys.readouterr().err
+
+
+def test_registers_subcommands_keep_options_given_before_them(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result=[{"name": "rip", "value": "0x1"}])
+    assert pry.cli.main(["registers", "--thread", "2", "--format", "json", "read", "rip"]) == 0
+    assert cap["params"] == {"names": ["rip"], "thread": 2}
+    assert json.loads(capsys.readouterr().out) == [{"name": "rip", "value": "0x1"}]
+
+    assert pry.cli.main(["registers", "--all", "read"]) == 0
+    assert cap["params"] == {"all": True}
+
+    assert pry.cli.main(["registers", "read", "--thread", "3", "rip"]) == 0
+    assert cap["params"]["thread"] == 3
