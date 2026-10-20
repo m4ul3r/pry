@@ -43,7 +43,7 @@ The CLI is stateless: every command opens a fresh socket connection, sends one r
 
 The bridge runs a threaded socket server inside GDB, but the GDB Python API is only safe on GDB's main thread, so handlers funnel work through `_run_on_gdb_thread()` (`gdb.post_event` + wait). Ops are classified for locking in `GdbBridge.dispatch()`:
 
-- **Lock-free ops** (`interrupt`, `status`, `wait`): must work while the inferior is running, e.g. during background execution.
+- **Lock-free ops** (`interrupt`, `status`, `wait`, and `prepare_kill`, which `pry kill` sends before it signals GDB so a running remote target is stopped first): must work while the inferior is running, e.g. during background execution.
 - **EXEC_OPS** (`run`, `continue`, `step`, ...): take the write lock; they block until the inferior stops (via `gdb.events.stop`) or return immediately with `--background`. `--timeout` auto-interrupts and returns stop info with `timeout_interrupt: true`.
 - **READ_LOCKED_OPS** (`backtrace`, `locals`, ...): take the read lock, so inspection commands can run concurrently with each other but not during a mutation.
 - **BREAKPOINT_OPS** (`break_set/delete/enable/disable`, `watch_set`, `load`, `resync`): take the write lock via `_dispatch_breakpoint_op()`. An all-stop remote stub refuses packets while it runs, so a running remote target is interrupted, the op applied at that stop, and the target resumed (`run_state` in the result); `resync` always works at a stop. Never let GDB edit its breakpoint table against a running remote target: it changes the table first and fails to reach the target second.
