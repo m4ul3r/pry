@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import itertools
 import json
 import os
 import re
+import shlex
 import signal
 import shutil
 import subprocess
@@ -2634,7 +2636,12 @@ def _call_fn(args: argparse.Namespace) -> int:
 
 def _registers(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
-    if args.all:
+    names = getattr(args, "names", None)
+    if names:
+        if args.all:
+            raise BridgeError("--all lists every register; drop it or the register names")
+        params["names"] = names
+    elif args.all:
         params["all"] = True
     return _call(
         args,
@@ -3325,7 +3332,17 @@ def build_parser() -> argparse.ArgumentParser:
     display_remove.set_defaults(handler=_display_remove)
 
     # --- run ---
-    run = subparsers.add_parser("run", help="Run the loaded program")
+    run = subparsers.add_parser(
+        "run",
+        help="Run the loaded program",
+        usage="pry run [pry options] [--] [args ...]",
+        description=(
+            "Run the loaded program. Program arguments go last, after pry's own "
+            "options. When any of them begins with '-', put `--` in front of them "
+            "so pry does not parse them as its own options: "
+            "pry run --timeout 10 -- -threads 1 -i crash.avi"
+        ),
+    )
     _common_io_options(run)
     _add_timeout_arg(run)
     _add_output_arg(run)
@@ -3339,7 +3356,10 @@ def build_parser() -> argparse.ArgumentParser:
             "`pry gdb 'run < file'` is not supported (startup-with-shell off)."
         ),
     )
-    run.add_argument("args", nargs="*", help="Program arguments")
+    run.add_argument(
+        "args", nargs="*",
+        help="Program arguments; precede them with `--` if any begins with '-'",
+    )
     run.set_defaults(handler=_run)
 
     # --- continue ---
@@ -3571,12 +3591,26 @@ def build_parser() -> argparse.ArgumentParser:
     call_cmd.set_defaults(handler=_call_fn)
 
     # --- registers ---
-    regs = subparsers.add_parser("registers", help="Show or write register values")
+    regs = subparsers.add_parser("registers", help="Show, read, or write register values")
     _common_io_options(regs)
     _add_thread_arg(regs)
     regs.add_argument("--all", action="store_true", help="Show all registers including floating-point")
     regs.set_defaults(handler=_registers)
     regs_sub = regs.add_subparsers(dest="registers_command")
+    regs_read = regs_sub.add_parser(
+        "read", help="Read named registers (e.g. registers read rip rdi); no names = full dump",
+    )
+    _common_io_options(regs_read)
+    _add_thread_arg(regs_read)
+    regs_read.add_argument(
+        "names", nargs="*", metavar="NAME",
+        help="Register names (rip, rdi, pc, eax, ...; leading $ optional)",
+    )
+    regs_read.add_argument(
+        "--all", action="store_true", default=argparse.SUPPRESS,
+        help="With no names, show all registers including floating-point",
+    )
+    regs_read.set_defaults(handler=_registers)
     regs_write = regs_sub.add_parser("write", help="Write a register value (e.g. registers write rip 0x401234)")
     _common_io_options(regs_write)
     regs_write.add_argument("name", help="Register name (rip, rax, pc, ...; leading $ optional)")
@@ -3738,6 +3772,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_sentinel_fix(run_parser: argparse.ArgumentParser, raw_argv: list[str]) -> str:
+    """Rewrite a rejected `pry run` command line with program args after `--`.
+
+    Tokens naming a `pry run` option (exact, `--opt=value`, or an unambiguous
+    long prefix, as argparse accepts) stay in front with their values; every
+    other token after `run` is a program argument and keeps its order.
+    """
+    options = run_parser._option_string_actions
+    try:
+        start = raw_argv.index("run")
+    except ValueError:
+        start = -1
+    head, pry_opts, program = raw_argv[: start + 1], [], []
+    tokens = iter(raw_argv[start + 1:])
+    for tok in tokens:
+        if tok == "--":
+            program.extend(tokens)
+            break
+        name = tok.split("=", 1)[0]
+        action = options.get(name)
+        if action is None and name.startswith("--"):
+            matches = {options[o] for o in options if o.startswith(name)}
+            action = matches.pop() if len(matches) == 1 else None
+        if action is None:
+            program.append(tok)
+            continue
+        pry_opts.append(tok)
+        if action.nargs != 0 and "=" not in tok:
+            pry_opts.extend(itertools.islice(tokens, 1))
+    return shlex.join(["pry", *head, *pry_opts, "--", *program])
+
+
 def _emit_error(args: argparse.Namespace, message: str) -> None:
     fmt = getattr(args, "format", "text")
     if fmt in ("json", "ndjson"):
@@ -3753,7 +3819,15 @@ def _emit_error(args: argparse.Namespace, message: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    args = parser.parse_args(argv)
+    args, extras = parser.parse_known_args(argv)
+    if extras:
+        if getattr(args, "handler", None) is _run:
+            args._parser.error(
+                f"unrecognized arguments: {' '.join(extras)}. Program arguments "
+                "go after pry's own options, behind a `--` sentinel when any "
+                f"begins with '-': {_run_sentinel_fix(args._parser, raw_argv)}"
+            )
+        parser.error(f"unrecognized arguments: {' '.join(extras)}")
     # argparse strips the first `--` separator, so by parse time we can no
     # longer tell `launch ./bin --format json` (a misplaced pry flag) from
     # `launch ./bin -- --format json` (a genuine GDB arg). Stash the raw argv

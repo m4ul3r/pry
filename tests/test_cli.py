@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pry.cli
@@ -2762,3 +2763,19 @@ def test_break_delete_single_keeps_legacy_shape(monkeypatch, capsys):
     pry.cli.main(["break", "delete", "3"])
     assert cap["params"] == {"number": 3}
     assert "numbers" not in cap["params"]
+
+
+def test_run_dash_args_rejected_with_working_sentinel_fix(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch, result={"status": "exited", "exit_code": 0})
+    argv = ["run", "--timeout", "5", "a", "--background", "-threads", "1", "-i", "crash.avi", "-"]
+    with pytest.raises(SystemExit) as exc:
+        pry.cli.main(argv)
+    assert exc.value.code == 2
+    assert cap == {}
+
+    run_parser = pry.cli.build_parser()._subparsers._group_actions[0].choices["run"]
+    fixed = shlex.split(pry.cli._run_sentinel_fix(run_parser, argv))
+    assert fixed[0] == "pry"
+    assert pry.cli.main(fixed[1:]) == 0
+    assert cap["params"]["args"] == ["a", "-threads", "1", "-i", "crash.avi", "-"]
+    assert cap["params"]["_background"] is True

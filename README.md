@@ -115,7 +115,7 @@ Loading or clearing the executable resets prior exit/background history. Intenti
 
 | Command | Description |
 |---------|-------------|
-| `pry run [args...]` | Start program (`--timeout`, `--background`) |
+| `pry run [args...]` | Start program (`--timeout`, `--background`); `pry run -- -x ...` for args beginning with `-` |
 | `pry continue` | Continue from stop (`--timeout`, `--background`) |
 | `pry step [count]` | Source-level step into |
 | `pry next [count]` | Source-level step over |
@@ -179,7 +179,7 @@ Uses hardware watchpoints while single-stepping instructions inside the range, c
 | `pry locals` | Local variables |
 | `pry args` | Function arguments |
 | `pry print <expr>` | Evaluate expression |
-| `pry registers` | CPU registers (`--all`) |
+| `pry registers` | CPU registers (`--all`); `pry registers read rip rdi` for named registers |
 | `pry memory read <addr> <len>` | Read memory (`--display hex\|string\|bytes\|pretty`, `--plain`) |
 | `pry memory write <addr> <hex>` | Write memory |
 | `pry mappings` | List process memory mappings (structured vmmap) |

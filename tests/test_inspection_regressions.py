@@ -115,3 +115,30 @@ def test_qualified_function_disassembly_stops_before_neighbor(monkeypatch, name)
     assert whole[-1]["asm"] == "ret"
     counted = bridge._dispatch_op("disasm", {"location": name, "count": 3})
     assert [int(row["address"], 16) for row in counted] == [0x401000, 0x401004, 0x401008]
+
+
+def test_registers_read_named_registers(monkeypatch):
+    bridge_mod, gdb = _load_bridge(monkeypatch)
+
+    def registers(command, to_string=False):
+        if command == "info registers rip eax":
+            return (
+                "rip            0x401136            0x401136 <main+4>\n"
+                "eax            0x0                 0\n"
+            )
+        if command.startswith("info registers "):
+            bad = command.split()[2]
+            raise gdb.error(f"Invalid register `{bad}'")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(gdb, "execute", registers)
+    bridge = bridge_mod.GdbBridge()
+    result = bridge._dispatch_op("registers", {"names": ["$rip", "eax"]})
+    assert result == [
+        {"name": "rip", "value": "0x401136            0x401136 <main+4>"},
+        {"name": "eax", "value": "0x0                 0"},
+    ]
+    with pytest.raises(ValueError, match="'nope'"):
+        bridge._dispatch_op("registers", {"names": ["nope"]})
+    with pytest.raises(ValueError):
+        bridge._dispatch_op("registers", {"names": ["rip; shell id"]})

@@ -4411,9 +4411,24 @@ class GdbBridge:
         return result
 
     def _registers(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        show_all = params.get("all", False)
-        cmd = "info all-registers" if show_all else "info registers"
-        output = gdb.execute(cmd, to_string=True)
+        names = [str(n).lstrip("$") for n in params.get("names") or []]
+        if names:
+            for reg in names:
+                if not re.fullmatch(r"\w+", reg):
+                    raise ValueError(f"invalid register name {reg!r}")
+            cmd = "info registers " + " ".join(names)
+        else:
+            cmd = "info all-registers" if params.get("all", False) else "info registers"
+        try:
+            output = gdb.execute(cmd, to_string=True)
+        except gdb.error as exc:
+            match = re.search(r"Invalid register `([^']*)'", str(exc))
+            if match:
+                raise ValueError(
+                    f"unknown register {match.group(1)!r} — run `pry registers` "
+                    "(or `pry registers --all`) to see valid names"
+                ) from None
+            raise
         result: list[dict[str, Any]] = []
         name: str | None = None
         value_lines: list[str] = []
