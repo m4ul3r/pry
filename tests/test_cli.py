@@ -871,6 +871,18 @@ def test_launch_pry_flag_after_binary_errors(monkeypatch, capsys, tmp_path):
     assert "before the binary" in stderr
 
 
+@pytest.mark.parametrize("option", ["--instance-id", "--gdb-binary"])
+def test_launch_any_launch_option_after_binary_errors(monkeypatch, capsys, tmp_path, option):
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned GDB"))
+    binary = tmp_path / "bin"
+    binary.write_text("")
+
+    assert pry.cli.main(["launch", str(binary), option, "x"]) == 1
+    assert option in capsys.readouterr().err
+
+
 def test_launch_double_dash_passes_gdb_args(monkeypatch, capsys, tmp_path):
     # A leading `--` means everything after is a genuine GDB arg, not a pry
     # flag — the leaked-flag guard must not fire.
@@ -2872,6 +2884,45 @@ def test_run_misspelled_pry_option_is_not_forwarded(monkeypatch, capsys):
     assert "--timeout" in capsys.readouterr().err
 
 
+def test_run_misspelled_option_after_misplaced_one_is_still_a_typo(monkeypatch, capsys):
+    cap = _capture_send(monkeypatch)
+    with pytest.raises(SystemExit):
+        pry.cli.main(["--background", "run", "--tmeout", "5", "a"])
+    assert cap == {}
+    assert "--timeout" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("program_args", [
+    ["-hide_banner", "-i", "crash.avi"], ["-hwaccel", "cuda"], ["-help"], ["--h"], ["--o", "x"],
+])
+def test_run_program_args_claimed_by_argparse_get_sentinel_fix(monkeypatch, capsys, program_args):
+    cap = _capture_send(monkeypatch, result={"status": "exited", "exit_code": 0})
+    fixed = _suggested_run_command(capsys, ["run", *program_args])
+    assert cap == {}
+    assert pry.cli.main(fixed) == 0
+    assert cap["params"]["args"] == program_args
+
+
+@pytest.mark.parametrize("argv, program_args", [
+    (["--background", "run", "foo", "-x"], ["foo", "-x"]),
+    (["--timeout=5", "run", "-x"], ["-x"]),
+])
+def test_run_option_before_run_gets_working_fix(monkeypatch, capsys, argv, program_args):
+    cap = _capture_send(monkeypatch, result={"status": "exited", "exit_code": 0})
+    fixed = _suggested_run_command(capsys, argv)
+    assert cap == {}
+    assert pry.cli.main(fixed) == 0
+    assert cap["params"]["args"] == program_args
+
+
+def test_run_unknown_token_before_run_gets_no_sentinel_rewrite(capsys):
+    with pytest.raises(SystemExit) as exc:
+        pry.cli.main(["--instance", "zz", "--bogus", "run", "-x"])
+    assert exc.value.code == 2
+    assert "-- run" not in capsys.readouterr().err
+
+
+
 def test_registers_subcommands_keep_options_given_before_them(monkeypatch, capsys):
     cap = _capture_send(monkeypatch, result=[{"name": "rip", "value": "0x1"}])
     assert pry.cli.main(["registers", "--thread", "2", "--format", "json", "read", "rip"]) == 0
@@ -2883,3 +2934,7 @@ def test_registers_subcommands_keep_options_given_before_them(monkeypatch, capsy
 
     assert pry.cli.main(["registers", "read", "--thread", "3", "rip"]) == 0
     assert cap["params"]["thread"] == 3
+
+    assert pry.cli.main(["registers", "write", "--thread", "2", "r15", "0x4242"]) == 0
+    assert cap["params"]["thread"] == 2
+    assert cap["params"]["name"] == "r15"
