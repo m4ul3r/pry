@@ -2994,6 +2994,9 @@ def test_run_hint_names_program_args_in_order(capsys, program_args):
     (["gdb", "--", "x/4gx", "-8"], "x/4gx -8"),
     (["gdb", "info", "proc", "mappings", "--format", "json"], "info proc mappings"),
     (["gdb", "info breakpoints"], "info breakpoints"),
+    (["gdb", "with", "print", "pretty", "--", "print", "g"], "with print pretty -- print g"),
+    (["gdb", "--", "with", "print", "pretty", "--", "print", "g"], "with print pretty -- print g"),
+    (["gdb", "--format", "json", "p", "g", "--"], "p g --"),
 ])
 def test_gdb_unquoted_command_words_are_joined(monkeypatch, capsys, argv, command):
     cap = _capture_send(monkeypatch, result={"output": ""})
@@ -3001,12 +3004,17 @@ def test_gdb_unquoted_command_words_are_joined(monkeypatch, capsys, argv, comman
     assert cap["params"]["command"] == command
 
 
-def test_gdb_dash_word_gets_quoted_fix(monkeypatch, capsys):
+@pytest.mark.parametrize("argv, command", [
+    (["gdb", "--timeout", "3", "info", "-x"], "info -x"),
+    (["gdb", "--timeout", "3", "print", "-pretty", "--", "g"], "print -pretty -- g"),
+    (["gdb", "--timeout", "3", "frame", "apply", "all", "-q", "--", "p", "g"], "frame apply all -q -- p g"),
+])
+def test_gdb_dash_word_gets_quoted_fix(monkeypatch, capsys, argv, command):
     cap = _capture_send(monkeypatch, result={"output": ""})
-    fixed = _suggested_run_command(capsys, ["gdb", "--timeout", "3", "info", "-x"])
+    fixed = _suggested_run_command(capsys, argv)
     assert cap == {}
     assert pry.cli.main(fixed) == 0
-    assert cap["params"]["command"] == "info -x"
+    assert cap["params"]["command"] == command
     assert cap["params"]["_timeout"] == 3.0
 
 

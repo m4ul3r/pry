@@ -4061,10 +4061,10 @@ def _split_command_line(
     parser: argparse.ArgumentParser,
     command_parser: argparse.ArgumentParser,
     argv: list[str],
-) -> tuple[list[str], list[str], list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str], list[str] | None]:
     """Split a command line into the tokens up to the subcommand, the
     subcommand's own options with their values, and its other tokens before
-    and after an explicit `--`, each in their order."""
+    and after an explicit `--` (None without one), each in their order."""
     head: list[str] = []
     tokens = iter(argv)
     for tok in tokens:
@@ -4086,7 +4086,7 @@ def _split_command_line(
         opts.append(tok)
         if action.nargs != 0 and "=" not in tok:
             opts.extend(itertools.islice(tokens, 1))
-    return head, opts, loose, []
+    return head, opts, loose, None
 
 
 def _run_hint_error(
@@ -4109,7 +4109,7 @@ def _run_hint_error(
             f"unrecognized pry run options: {', '.join(typos)}. If these are "
             "program arguments, put them after a `--` sentinel"
         )
-    program = [*loose, *guarded]
+    program = [*loose, *(guarded or [])]
     sentinel = ["--"] if any(tok.startswith("-") for tok in program) else []
     fix = shlex.join(["pry", *head, *opts, *sentinel, *program])
     if moved:
@@ -4120,6 +4120,24 @@ def _run_hint_error(
     )
 
 
+def _gdb_command_words(
+    parser: argparse.ArgumentParser,
+    gdb_parser: argparse.ArgumentParser,
+    argv: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Split a `pry gdb` command line into the tokens up to `gdb`, its pry
+    options, and the words of the GDB command.
+
+    A `--` before the first word separates pry's options from the command;
+    one after a word belongs to the GDB command (`with print pretty -- p x`).
+    argparse drops either, so the words are taken from the command line.
+    """
+    head, opts, loose, guarded = _split_command_line(parser, gdb_parser, argv)
+    if guarded is None:
+        return head, opts, loose
+    return head, opts, [*loose, *(["--"] if loose else []), *guarded]
+
+
 def _gdb_hint_error(
     parser: argparse.ArgumentParser,
     gdb_parser: argparse.ArgumentParser,
@@ -4127,8 +4145,8 @@ def _gdb_hint_error(
     extras: list[str],
 ) -> NoReturn:
     """Report a `pry gdb` command whose words argparse took as options."""
-    head, opts, loose, guarded = _split_command_line(parser, gdb_parser, argv)
-    fix = shlex.join(["pry", *head, *opts, " ".join([*loose, *guarded])])
+    head, opts, words = _gdb_command_words(parser, gdb_parser, argv)
+    fix = shlex.join(["pry", *head, *opts, " ".join(words)])
     gdb_parser.error(
         f"unrecognized arguments: {' '.join(extras)}. Pass the GDB command as "
         f"one quoted argument: {fix}"
@@ -4173,6 +4191,9 @@ def main(argv: list[str] | None = None) -> int:
         if not before and handler is _gdb_exec:
             _gdb_hint_error(parser, args._parser, raw_argv, extras)
         parser.error(f"unrecognized arguments: {' '.join(extras)}")
+    if getattr(args, "handler", None) is _gdb_exec:
+        # argparse drops a GDB-level `--` from the words (`with ... -- p x`).
+        args.command = _gdb_command_words(parser, args._parser, raw_argv)[2]
     # argparse strips the first `--` separator, so by parse time we can no
     # longer tell `launch ./bin --format json` (a misplaced pry flag) from
     # `launch ./bin -- --format json` (a genuine GDB arg). Stash the raw argv
