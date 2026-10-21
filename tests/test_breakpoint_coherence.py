@@ -1416,6 +1416,33 @@ def test_a_raw_breakpoint_set_under_stale_symbols_is_not_moved_by_their_rebase(m
     assert entry["rebased_address"] == hex(TRAP_SITE - _SLIDE + 0x23200000)
 
 
+@pytest.mark.parametrize("spelling", [f"*{TRAP_SITE:#x}", f"*0{TRAP_SITE:o}", f"*{TRAP_SITE}"])
+def test_raw_breakpoints_in_every_gdb_spelling_resync(monkeypatch, tmp_path, spelling):
+    """#112 review: GDB takes C literals (hex, octal, decimal); `break set`
+    and resync must take every one it accepted, not fail after creating it."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    vmlinux = _kaslr_kernel(monkeypatch, tmp_path, fake_gdb, stub)
+    bridge._dispatch_op("load", {"path": str(vmlinux), "slide": hex(_SLIDE)})
+    monkeypatch.setattr(fake_gdb, "Breakpoint", lambda location, type=1, temporary=False: _set_bp(
+        stub, location))
+    assert bridge.dispatch({"op": "break_set", "params": {"location": spelling}})["ok"]
+    for i in range(len(ELF_WINDOW)):  # a reset re-slid KASLR
+        del stub.mem[TRAP_SITE + i]
+    bridge._dispatch_op("load", {"path": str(vmlinux), "slide": "0x23200000"})
+
+    response = bridge.dispatch({"op": "resync", "params": {}})
+
+    assert response["ok"], response
+    assert response["result"]["breakpoints"][0]["rebased_address"] == hex(TRAP_SITE - _SLIDE + 0x23200000)
+
+
+def _set_bp(stub, location):
+    """GDB resolves the literal itself; the stub breakpoint sits at TRAP_SITE."""
+    bp = _Bp(stub, 1, TRAP_SITE)
+    bp.location = location
+    return bp
+
+
 def test_a_breakpoint_hit_the_frame_no_longer_matches_is_reported_stale(monkeypatch):
     """#100: the VM ran outside GDB (`qmu cont`) and was halted again; GDB's
     PC is at none of breakpoint 1's locations, so the hit is not current."""

@@ -1797,7 +1797,9 @@ def _mark_locations_pending(bp: dict[str, Any], pending: set[tuple[int, int]]) -
             bp.pop(key, None)
 
 
-_RAW_LOCATION_RE = re.compile(r"^\*\s*(0[xX][0-9a-fA-F]+|[0-9]+)\s*$")
+# GDB's C literals: 0x hex, a leading 0 octal, otherwise decimal. Anything
+# else (a suffix, an expression) is left to GDB and not called raw.
+_RAW_LOCATION_RE = re.compile(r"^\*\s*(?:0[xX]([0-9a-fA-F]+)|(0[0-7]*)|([1-9][0-9]*))\s*$")
 
 
 def _raw_location_address(bp) -> int | None:
@@ -1809,7 +1811,16 @@ def _raw_location_address(bp) -> int | None:
     if _bp_kind(bp.type) not in ("breakpoint", "hw-breakpoint"):
         return None
     match = _RAW_LOCATION_RE.match(str(getattr(bp, "location", None) or ""))
-    return int(match.group(1), 0) & _ADDR_MASK if match else None
+    if not match:
+        return None
+    hex_digits, octal, decimal = match.groups()
+    if hex_digits is not None:
+        value = int(hex_digits, 16)
+    elif octal is not None:
+        value = int(octal, 8)
+    else:
+        value = int(decimal, 10)
+    return value & _ADDR_MASK
 
 
 def _raw_command_leaves_target_alone(command: str) -> bool:
