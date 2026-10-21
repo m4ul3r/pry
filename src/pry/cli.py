@@ -541,6 +541,15 @@ def _format_stop_reason(reason: Any) -> str | None:
     if kind == "held":
         return ("held (a caller stopped the target with `pry interrupt --hold`; "
                 "`pry continue --release` resumes it)")
+    if kind == "stale":
+        previous = _format_stop_reason(reason.get("previous")) or "the last stop reason"
+        where = reason.get("address") or "?"
+        number = (reason.get("previous") or {}).get("number", "?")
+        return (f"stale: {previous} no longer describes this stop, since the PC ({where}) is "
+                f"at none of breakpoint #{number}'s locations: the target moved without pry "
+                "seeing it run (a VM resumed outside the debugger, e.g. `qmu cont`, and "
+                "halted again; or a PC written since). `pry resync` re-reads the state and "
+                "re-arms the breakpoints; `pry continue` resumes the target under GDB")
     return kind or None
 
 
@@ -3240,7 +3249,9 @@ def _gdb_exec(args: argparse.Namespace) -> int:
         text_renderer=_render_gdb_exec_text,
         map_result=lambda result: _map_gdb_exec_result(command, result),
         stem="gdb_exec",
-        timeout=timeout,
+        # Past the bridge's own timeout and its grace, as for `py exec`, so
+        # the bridge's answer naming the op arrives instead of a socket timeout.
+        timeout=(timeout + 10) if timeout is not None else None,
     )
 
 
