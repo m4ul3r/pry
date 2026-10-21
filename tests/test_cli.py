@@ -2332,6 +2332,52 @@ def test_interrupt_text_not_running(monkeypatch, capsys):
     assert "not interrupted (inferior is stopped)" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(("argv", "op"), [
+    (["interrupt", "--hold"], "hold"),
+    (["continue", "--release"], "release"),
+])
+def test_hold_and_release_send_their_own_ops(monkeypatch, argv, op):
+    """A release sent as a plain `continue` would resume a target the hold
+    found stopped (the operator's stop); a hold sent as `interrupt` would end
+    the operator's wait (#99)."""
+    sent = []
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        sent.append(op)
+        return {"ok": True, "result": {"state": "stopped", "status": "stopped", "run_state": {}}}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    assert pry.cli.main(argv) == 0
+    assert sent == [op]
+
+
+@pytest.mark.parametrize("flags", [["--timeout", "5"], ["--background"]])
+def test_release_refuses_execution_flags_without_sending(monkeypatch, flags):
+    monkeypatch.setattr(pry.cli, "send_request", lambda *a, **k: pytest.fail("sent"))
+    assert pry.cli.main(["continue", "--release", *flags]) == 1
+
+
+def test_hold_and_release_text_name_a_stop_the_target_reached_on_its_own(monkeypatch, capsys):
+    """Neither claims pry stopped or resumed a target that stopped by itself."""
+    stop = {"state": "stopped", "reason": {"kind": "breakpoint-hit", "number": 1}}
+    results = {
+        "hold": {"held": True, "state": "stopped", "status": "stopped", "reason": stop["reason"],
+                 "run_state": {"was_running": True, "interrupted": True, "will_resume": False, "stop": stop}},
+        "release": {"released": True, "state": "stopped", "status": "stopped", "reason": stop["reason"],
+                    "run_state": {"was_running": True, "interrupted": True, "resumed": False, "stop": stop}},
+    }
+
+    def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
+        return {"ok": True, "result": results[op]}
+
+    monkeypatch.setattr(pry.cli, "send_request", fake_send_request)
+    for argv in (["interrupt", "--hold"], ["continue", "--release"]):
+        assert pry.cli.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "breakpoint #1 hit" in out
+        assert "pry stopped the target" not in out and "resumed the target" not in out
+
+
 def test_memory_write_text_rendering(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, timeout=30.0, connect_retries=4, instance_pid=None):
         return {"ok": True, "result": {"written": 4, "address": "0x401000"}}

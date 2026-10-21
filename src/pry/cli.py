@@ -537,6 +537,9 @@ def _format_stop_reason(reason: Any) -> str | None:
                 "`pry resync` drops it)")
     if kind == "resynced":
         return "resynced (state re-read after the machine changed under the debugger)"
+    if kind == "held":
+        return ("held (a caller stopped the target with `pry interrupt --hold`; "
+                "`pry continue --release` resumes it)")
     return kind or None
 
 
@@ -731,6 +734,46 @@ def _render_interrupt_text(value: Any) -> str:
         return "interrupted"
     state = value.get("state")
     return f"not interrupted (inferior is {state})" if state else "not interrupted (inferior was not running)"
+
+
+def _render_hold_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    run_state = value.get("run_state") if isinstance(value.get("run_state"), dict) else {}
+    if run_state.get("will_resume"):
+        head = ("held: pry stopped the target; a `pry wait` or foreground `continue` already "
+                "waiting keeps waiting, and `pry continue --release` resumes it")
+    elif run_state.get("was_running"):
+        stop = run_state.get("stop") if isinstance(run_state.get("stop"), dict) else {}
+        why = _format_stop_reason(stop.get("reason")) or stop.get("state") or "see `pry status`"
+        head = (f"held: the target stopped on its own ({why}) while pry was stopping it; "
+                "that stop is the operator's, and `pry continue --release` leaves it stopped")
+    else:
+        head = (f"held: the target was {value.get('state', 'stopped')} already; "
+                "`pry continue --release` ends the hold and leaves it so")
+    return "\n".join([head, _render_stop_text(value)])
+
+
+def _render_release_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    run_state = value.get("run_state") if isinstance(value.get("run_state"), dict) else {}
+    stop = run_state.get("stop") if isinstance(run_state.get("stop"), dict) else None
+    why = (_format_stop_reason(stop.get("reason")) or stop.get("state")) if stop else None
+    if run_state.get("resumed"):
+        line = ("released: resumed the target, and it stopped again at once "
+                f"({why})" if stop else "released: resumed the target")
+    elif run_state.get("was_running"):
+        line = f"released: the target stays at the stop it reached on its own ({why})"
+    else:
+        line = "released: the target stays stopped (it was stopped when held)"
+    lines = [line, *(_trap_warning(t) for t in value.get("baked_traps") or [] if isinstance(t, dict))]
+    gave_up = run_state.get("pending_after_resume")
+    if gave_up:
+        lines.append("warning: GDB could not insert location(s) "
+                     f"{', '.join('#' + str(g) for g in gave_up)} when it resumed the "
+                     "target: they are pending and will not fire")
+    return "\n".join(lines)
 
 
 def _render_memory_write_text(value: Any) -> str:
@@ -2408,6 +2451,17 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _continue(args: argparse.Namespace) -> int:
+    if args.release:
+        clash = [flag for flag, given in (
+            ("--timeout", getattr(args, "timeout", None) is not None),
+            ("--background", args.background),
+        ) if given]
+        if clash:
+            raise BridgeError(
+                f"--release resumes a held target and returns at once, so {' and '.join(clash)} "
+                "does not apply; `pry wait --timeout N` waits for its next stop"
+            )
+        return _call(args, "release", text_renderer=_render_release_text, stem="continue")
     ep, tt = _exec_params(args)
     renderer = _render_background_text if ep.get("_background") else _render_stop_text
     return _call(
@@ -2474,6 +2528,8 @@ def _jump(args: argparse.Namespace) -> int:
 
 
 def _interrupt(args: argparse.Namespace) -> int:
+    if args.hold:
+        return _call(args, "hold", text_renderer=_render_hold_text, stem="interrupt")
     return _call(args, "interrupt", text_renderer=_render_interrupt_text, stem="interrupt")
 
 
@@ -3516,6 +3572,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_timeout_arg(cont)
     _add_output_arg(cont)
     cont.add_argument("--background", action="store_true", help="Return immediately while the inferior keeps running")
+    cont.add_argument(
+        "--release", action="store_true",
+        help="End a `pry interrupt --hold`: resume the target it stopped (one that was "
+             "stopped already stays stopped) and return at once",
+    )
     cont.set_defaults(handler=_continue)
 
     # --- step ---
@@ -3573,6 +3634,12 @@ def build_parser() -> argparse.ArgumentParser:
     # --- interrupt ---
     interrupt = subparsers.add_parser("interrupt", help="Interrupt the running inferior")
     _common_io_options(interrupt)
+    interrupt.add_argument(
+        "--hold", action="store_true",
+        help="Stop the target for a caller (e.g. qmu around a snapshot save) without "
+             "ending a `pry wait` or foreground `continue` already waiting; it stays "
+             "stopped, and no execution starts, until `pry continue --release`",
+    )
     interrupt.set_defaults(handler=_interrupt)
 
     # --- status ---
@@ -3610,8 +3677,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resync_cmd.add_argument(
         "--symbols", metavar="PATH",
-        help="Symbol file to reload with --base (default: the last one `pry load` "
-             "read, else the main executable)",
+        help="Symbol file to reload with --base (default: the loaded kernel image, as "
+             "`pry kbase` picks it; without one, the last one `pry load` read, else the "
+             "main executable)",
     )
     resync_cmd.set_defaults(handler=_resync)
 
