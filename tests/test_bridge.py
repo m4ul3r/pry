@@ -3954,3 +3954,72 @@ def test_watchpoint_unreadable_new_value_keeps_old(monkeypatch):
     reason = bridge._bp_reason(bp_obj)
     assert reason["old_value"] == "42"
     assert reason["new_value"] == "<unreadable>"
+
+
+def _make_unresolved(fake_gdb, name):
+    """Have the fake GDB leave a breakpoint on *name* pending, as GDB does for
+    a location no loaded symbol file defines."""
+    real = fake_gdb.Breakpoint
+
+    def _breakpoint(location=None, **kw):
+        bp = real(location, **kw)
+        bp.pending = location == name
+        return bp
+
+    def _decode_line(location):
+        if location == name:
+            raise fake_gdb.error(f'Function "{name}" not defined.')
+        return None, None
+
+    fake_gdb.Breakpoint = _breakpoint
+    fake_gdb.decode_line = _decode_line
+
+
+def test_break_set_refuses_unresolved_location_and_leaves_no_breakpoint(monkeypatch):
+    # #85: a location nothing loaded resolves must not be reported as set.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    _make_unresolved(fake_gdb, "nosuchsymbol")
+
+    response = bridge.dispatch({"op": "break_set", "params": {"location": "nosuchsymbol"}})
+
+    assert response["ok"] is False
+    assert "--pending" in response["error"]
+    assert fake_gdb.breakpoints() == []
+
+
+def test_break_set_pending_keeps_unresolved_location(monkeypatch):
+    # #85: a symbol of a library or module that is not loaded yet stays settable.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    _make_unresolved(fake_gdb, "lib_fn")
+
+    response = bridge.dispatch(
+        {"op": "break_set", "params": {"location": "lib_fn", "pending": True}}
+    )
+
+    assert response["ok"] is True
+    assert response["result"]["pending"] is True
+    assert [bp.location for bp in fake_gdb.breakpoints()] == ["lib_fn"]
+
+
+def test_register_write_reports_the_thread_written(monkeypatch):
+    # #97: `registers write --thread N` must say which thread it wrote.
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    threads = fake_gdb.selected_inferior().threads()
+    selected = [threads[0]]
+    fake_gdb.selected_thread = lambda: selected[0]
+    real_execute = fake_gdb.execute
+
+    def _execute(cmd, to_string=False):
+        if cmd.startswith("thread "):
+            selected[0] = threads[int(cmd.split()[1]) - 1]
+            return ""
+        return real_execute(cmd, to_string=to_string)
+
+    fake_gdb.execute = _execute
+
+    assert bridge._dispatch_op("register_write", {"name": "rip", "value": "0x1"})["thread"] == 1
+    written = bridge._dispatch_op("register_write", {"name": "rip", "value": "0x1", "thread": 2})
+    assert written["thread"] == 2
