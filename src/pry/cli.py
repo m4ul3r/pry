@@ -2452,10 +2452,14 @@ def _run(args: argparse.Namespace) -> int:
 
 def _continue(args: argparse.Namespace) -> int:
     if args.release:
-        if getattr(args, "timeout", None) is not None:
+        clash = [flag for flag, given in (
+            ("--timeout", getattr(args, "timeout", None) is not None),
+            ("--background", args.background),
+        ) if given]
+        if clash:
             raise BridgeError(
-                "--release resumes a held target and returns at once, so --timeout does "
-                "not apply; `pry wait --timeout N` waits for its next stop"
+                f"--release resumes a held target and returns at once, so {' and '.join(clash)} "
+                "does not apply; `pry wait --timeout N` waits for its next stop"
             )
         return _call(args, "release", text_renderer=_render_release_text, stem="continue")
     ep, tt = _exec_params(args)

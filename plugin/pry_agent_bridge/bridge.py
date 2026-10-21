@@ -1715,6 +1715,11 @@ class GdbBridge:
         # --release`: {"pause": what _pause_for_breakpoint_change returned,
         # None when the target was stopped already}. No execution starts then.
         self._hold: dict[str, Any] | None = None
+        # Why the last hold ended without its release (a resume pry did not
+        # make), for the release that comes too late to end it.
+        self._hold_ended: str | None = None
+        # Inferior calls in flight (`pry call`): they resume and come back.
+        self._inferior_calls = 0
         # Set by _finish just before running `finish` so the stop handler can
         # recover the return value: the frame that is finishing (to confirm it
         # actually returned vs. stopping at an intervening breakpoint) and its
@@ -1743,6 +1748,8 @@ class GdbBridge:
             gdb.events.exited.connect(self._on_exited)
         if hasattr(gdb.events, "cont"):
             gdb.events.cont.connect(self._on_cont)
+        if hasattr(gdb.events, "inferior_call"):
+            gdb.events.inferior_call.connect(self._on_inferior_call)
         if hasattr(gdb.events, "connection_removed"):
             gdb.events.connection_removed.connect(self._on_connection_removed)
         if hasattr(gdb.events, "executable_changed"):
@@ -1908,7 +1915,18 @@ class GdbBridge:
                 return
         reason["trap_in_memory"] = False
 
+    def _on_inferior_call(self, event):
+        """Count inferior calls in flight: one resumes the target and comes
+        back to the same stop, so it does not end a caller's hold."""
+        if hasattr(gdb, "InferiorCallPreEvent") and isinstance(event, gdb.InferiorCallPreEvent):
+            self._inferior_calls += 1
+        else:
+            self._inferior_calls = max(0, self._inferior_calls - 1)
+
     def _on_cont(self, event):
+        # A resume pry did not make ends a caller's hold (#99).
+        if self._hold is not None and not self._inferior_calls:
+            self._end_hold_resumed_elsewhere()
         # Existing waiters retain their own job even when new execution starts.
         if self._background_job is not None and self._background_job["completion"].is_set():
             self._background_job = None
@@ -2650,6 +2668,29 @@ class GdbBridge:
         settled = job.get("pause_settled")
         return settled is not None and not settled.is_set()
 
+    def _end_hold_resumed_elsewhere(self) -> None:
+        """A resume pry did not make (a raw `pry gdb 'continue &'`, or
+        `py exec`) ends a caller's hold. Whoever waited through the hold gets
+        an error saying so, not the hold's own stop: the target runs now, in
+        an execution pry does not track (as after any raw resume)."""
+        hold, self._hold = self._hold, None
+        why = (
+            "a command pry does not track (a raw `pry gdb continue &`?) resumed the "
+            "target during a caller's hold (`pry interrupt --hold`), which ended the "
+            "hold; pry follows no execution for it: `pry status`, `pry interrupt`"
+        )
+        self._hold_ended = why
+        pause = hold["pause"] if hold is not None else None
+        if pause is None or pause["settled"].is_set():
+            return
+        if pause["job"] is not None:
+            done = threading.Event()
+            done.set()
+            pause["job"]["superseded_by"] = {
+                "completion": done, "response": _json_response(ok=False, error=why), "restored": [],
+            }
+        pause["settled"].set()
+
     def _dispatch_hold(self) -> dict[str, Any]:
         """`pry interrupt --hold`: stop the target for a caller and keep it
         stopped until `pry continue --release` (#99).
@@ -2695,7 +2736,7 @@ class GdbBridge:
                 raise RuntimeError("nothing to hold: no live target (run, attach or connect first)")
             hold: dict[str, Any] = {"pause": None}
             # Set first: no execution starts while this stops the target.
-            self._hold = hold
+            self._hold, self._hold_ended = hold, None
             try:
                 pause = self._pause_for_breakpoint_change(
                     always=True, job=self._inflight_job(), purpose="hold it"
@@ -2704,6 +2745,12 @@ class GdbBridge:
                 self._hold = None
                 raise
             hold["pause"] = pause
+            if self._hold is not hold:
+                # Resumed elsewhere as it was taken: end it so, waiters included.
+                self._hold = hold
+                self._end_hold_resumed_elsewhere()
+                ended, self._hold_ended = self._hold_ended, None
+                raise RuntimeError(ended)
             run_state: dict[str, Any] = {
                 "was_running": pause is not None,
                 "interrupted": pause is not None,
@@ -2735,10 +2782,16 @@ class GdbBridge:
         with self._lock.write():
             hold = self._hold
             if hold is None:
-                raise RuntimeError(
+                ended, self._hold_ended = self._hold_ended, None
+                raise RuntimeError(ended or (
                     "nothing is held: `pry continue --release` ends a hold "
                     "`pry interrupt --hold` took (`pry continue` resumes a stopped target)"
-                )
+                ))
+            if self._running:
+                # Resumed by something that raised no `cont` event.
+                self._end_hold_resumed_elsewhere()
+                ended, self._hold_ended = self._hold_ended, None
+                raise RuntimeError(ended)
             self._hold = None
             pause = hold["pause"]
             if pause is None or not pause["resume"]:
@@ -2751,13 +2804,6 @@ class GdbBridge:
                 result = _run_on_gdb_thread(self._execution_state)
                 return _json_response(
                     ok=True, result={**result, "released": True, "run_state": run_state}
-                )
-            if self._running:
-                pause["settled"].set()
-                raise RuntimeError(
-                    "the hold is released, but the target runs already: something "
-                    "resumed it during the hold (a raw `pry gdb continue`?), so pry did "
-                    "not resume it"
                 )
             pending_before = _run_on_gdb_thread(_pending_locations)
             run_state = self._finish_pause(pause)
@@ -3081,6 +3127,7 @@ class GdbBridge:
         `pry wait` does, until the timeout it was given runs out.
         """
         first = job
+        response = None
         while True:
             settled = job.get("pause_settled")
             if settled is None:
@@ -3096,11 +3143,12 @@ class GdbBridge:
                 break
             job = successor
             if not job["completion"].wait(timeout=max(0.0, deadline - time.monotonic())):
-                return self._interrupt_for_timeout(job)
+                response = self._interrupt_for_timeout(job)
+                break
         if job is not first and self._background_job is job:
             # Answered here, like any foreground execution; not a background result.
             self._background_job = None
-        return job["response"]
+        return response or job["response"]
 
     @staticmethod
     def _parse_addr(addr) -> int:

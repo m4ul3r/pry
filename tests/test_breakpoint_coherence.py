@@ -684,6 +684,54 @@ def test_a_release_gdb_cannot_resume_fails_and_ends_the_hold(monkeypatch):
     assert bridge.dispatch({"op": "release", "params": {}})["ok"] is False  # nothing held now
 
 
+def test_a_raw_resume_during_a_hold_ends_it_and_waiters_get_no_stop(monkeypatch):
+    """`pry gdb 'continue &'` resumes a held target behind pry's back. The
+    operator's wait must not answer with the hold's own SIGINT stop while
+    the target runs."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    waiter, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+    assert bridge.dispatch({"op": "hold", "params": {}})["ok"] is True
+    execute = fake_gdb.execute
+
+    def raw_resume(cmd, to_string=False):
+        if cmd == "continue &":
+            fake_gdb.events.cont.fire(None)
+        return execute(cmd, to_string=to_string)
+
+    fake_gdb.execute = raw_resume
+
+    assert bridge.dispatch({"op": "gdb_exec", "params": {"command": "continue &"}})["ok"] is True
+
+    waiter.join(timeout=5)
+    assert responses[0]["ok"] is False
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "running"
+    assert bridge.dispatch({"op": "release", "params": {}})["ok"] is False
+
+
+def test_a_foreground_timeout_after_the_release_leaves_no_background_result(monkeypatch):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _resume_like_gdb(fake_gdb, stub)
+    runner, responses = _in_flight(bridge, "continue", {"_timeout": 1.5})
+    for _ in range(500):
+        if bridge._foreground_job is not None:
+            break
+        threading.Event().wait(0.01)
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+    assert bridge.dispatch({"op": "hold", "params": {}})["ok"] is True
+    assert bridge.dispatch({"op": "release", "params": {}})["ok"] is True
+    # The deadline runs out in the execution the release resumed.
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    runner.join(timeout=10)
+
+    assert responses[0]["result"]["timeout_interrupt"] is True
+    assert "last_background_result" not in bridge.dispatch({"op": "status"})["result"]
+
+
 def test_failed_op_while_running_keeps_the_run_state(monkeypatch):
     """#68: a read the running stub refuses does not make pry think it stopped,
     so the next breakpoint change still stops, applies and resumes."""
