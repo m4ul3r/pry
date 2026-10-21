@@ -30,7 +30,7 @@ pry kill                                                     # Kill the GDB sess
 
 ### Multiple concurrent sessions
 
-Each `pry launch` creates a separate GDB instance with its own socket at `~/.cache/pry/instances/<pid>.sock`. Commands auto-select the instance when only one is running. With multiple instances, use `--instance <pid>`:
+Each `pry launch` creates a separate GDB instance with its own socket at `~/.cache/pry/instances/<pid>.sock`. Commands auto-select the instance when only one is running. With multiple instances, use `--instance <pid-or-name>` (the name is the one given with `pry launch --instance-id`; a command without `--instance` refuses and lists each running instance by name and pid):
 
 ```bash
 pry launch ./binary_a        # Returns pid=12345
@@ -72,7 +72,7 @@ sleep 99999 | gdb -q ./binary -x /path/to/bridge.gdb
 pry launch --symbols ./vmlinux --connect localhost:1234
 ```
 
-This launches GDB, loads the symbol file, and connects to the remote target in one step.
+This launches GDB, loads the symbol file, and connects to the remote target in one step. If the load or the connect fails, `pry launch` exits 1 and leaves the GDB session up: the error names it (pid and instance name) with the commands to retry the step (`pry --instance <name> connect …`) or to end it (`pry kill --instance <name>`). JSON keeps `launched: true` and the message in `post_launch_error`.
 
 **Server binding:** some `gdbserver` builds ignore the HOST in `127.0.0.1:PORT` and listen on all interfaces. Verify the actual listener with `ss -ltnp`; do not treat the supplied HOST as an access restriction. Use a stdio transport, a verified loopback-only adapter, or an isolated network when exposing a debugger is not intended.
 
@@ -93,7 +93,7 @@ pry continue                        # Continue execution
 > ```
 > **What `pry kbase` guarantees:** exit 0 only with a **validated** base: the guest's bytes at `linux_banner`'s link address plus the slide equal the symbol file's. Candidates, most specific first: the IDT[0] (x86-64) or VBAR (arm64) handler mapped back through the symbol table (exact on any layout), pwndbg's page-table walk, the handler rounded down to 2 MiB (only an upper bound: on x86-64 5.11–6.6 the handler is 14–24 MiB above `_text`). With no kernel symbol file, or a vmlinux that is not the running kernel's, it exits 1 with `could not determine the kernel base` and lists the unvalidated hints; it never prints an unchecked number as the base. Without `--symbols` it validates against the loaded symbol file that is a kernel image (it has `linux_banner` and `_text`), whatever was loaded after it: module symbols added with `pry load mod.ko --base` do not get in the way. `--symbols PATH` validates against a file that is not loaded and prints the `pry load PATH --base ...` that applies it. Like `load`, it stops a running remote target and resumes it afterwards. JSON: `base`, `slide`, `method` (`idt`/`vbar`/`pwndbg`), `derivation` (`symbol`/`page-tables`/`rounded`), `validated{symbols, symbol, address, text}`, `apply{path, applied, previous_slide, reason, command, load}`.
 >
-> Base from elsewhere (`qmu kbase`, kallsyms `_text`)? `pry load ./vmlinux --base 0x<kbase>` offsets every image section by one slide, so text and data resolve. Zero-based per-CPU sections (`.data..percpu` on x86-64 6.x: `current_task`, …) hold per-CPU offsets that KASLR does not move, so they stay at their link address (`unslid_sections`): read one as `*(unsigned long *)($gs_base + (unsigned long)&current_task)` while stopped in the kernel. A later plain `pry load ./vmlinux` replaces the slid copy: one table again, at link-time addresses. Rebasing (with `load --base`, `kbase` or `resync --base`) a vmlinux GDB holds as its main symbol file (`pry launch --symbols`, a plain `pry load`) keeps every other file added with `--base`/`--slide`, such as module symbols, loaded at its address; one pry cannot put back (added by a raw `add-symbol-file`, a shared library) is listed in the JSON `dropped` (`apply.load.dropped` for `kbase`, `symbols.dropped` for `resync`).
+> Base from elsewhere (`qmu kbase`, kallsyms `_text`)? `pry load ./vmlinux --base 0x<kbase>` offsets every image section by one slide, so text and data resolve. Zero-based per-CPU sections (`.data..percpu` on x86-64 6.x: `current_task`, …) hold per-CPU offsets that KASLR does not move, so they stay at their link address (`unslid_sections`): read one as `*(unsigned long *)($gs_base + (unsigned long)&current_task)` while stopped in the kernel. A later plain `pry load ./vmlinux` replaces the slid copy: one table again, at link-time addresses. Rebasing (with `load --base`, `kbase` or `resync --base`) a vmlinux GDB holds as its main symbol file (`pry launch --symbols`, a plain `pry load`) keeps every other file added with `--base`/`--slide`, such as module symbols, loaded at its address; one pry cannot put back (added by a raw `add-symbol-file`, a shared library) is listed in the JSON `dropped` (`apply.load.dropped` for `kbase`, `symbols.dropped` for `resync`), and the text output names it on a `symbols: dropped <path>` line with how to add it back (`pry load <path> --base/--slide`).
 >
 > Prefer `pry kbase` over `pry gdb kbase` (raw pwndbg, which fails under `kernel.yama.ptrace_scope=1` when pry's GDB is not QEMU's parent). Do **not** use `kbase -r` for rebasing — it leaves a stale duplicate and skips data symbols (see [reference/pwndbg.md](reference/pwndbg.md)).
 
@@ -325,12 +325,13 @@ Execution commands report the **stop reason** when available:
 pry break set main                          # Break at function
 pry break set main.c:42                     # Break at file:line
 pry break set *0x401000                     # Break at address
+pry break set dlopened_fn --pending         # Keep it pending until a library/module defining it loads
 pry break set *0x1234 --rebase myprog       # PIE: offset from module load base (see PIE/ASLR rebasing)
 pry break set main --condition "argc > 1"   # Conditional breakpoint
 pry break set main --temporary              # One-shot breakpoint
 pry break set main --ignore 5               # Skip the next 5 hits before stopping
 pry break set *0x401000 --hardware          # Hardware breakpoint (read-only/remote/kernel memory)
-pry break list                              # List all breakpoints (shows thread/ignore/condition; catchpoints show their "what")
+pry break list                              # List all breakpoints with the site GDB armed (@ ADDR FUNC FILE:LINE; shows thread/ignore/condition; catchpoints show their "what")
 pry break delete 1                          # Delete breakpoint #1
 pry break enable 1                          # Enable breakpoint #1
 pry break disable 1                         # Disable breakpoint #1
@@ -344,6 +345,8 @@ pry watch list                              # List all (same as break list)
 ```
 
 **Multi-location breakpoints:** GDB can resolve one symbolic breakpoint to several sites (common with inlined callees — e.g. `free_msg` may also land inside `load_msg`). `pry break set` / `pry break list` report `location_count` and a full `locations[]` of `{address,file,line,function}` (text lists every site). Do not assume the top-level `address`/`function` is the only hit site; inspect `locations` when `location_count > 1`.
+
+**Unresolved locations:** a location no loaded symbol file resolves (a typo, a function in nothing loaded) is refused: `pry break set` exits 1 with GDB's reason (`Function "x" not defined.`) and sets nothing. For a symbol in a shared library or kernel module that is not loaded yet, pass `--pending`: the breakpoint is kept pending (`pending: true`) and GDB places it when that file loads.
 
 **Running remote targets:** an all-stop remote stub (QEMU gdbstub, gdbserver) accepts no packets while it runs, and GDB edits its breakpoint table before it talks to the target. So when the target is running, `break set/delete/enable/disable`, `watch set/delete/enable/disable` and `load` stop it, apply the change at that stop, and resume it. JSON results carry `run_state: {was_running, interrupted, resumed}` and text ends with a `note:` line. GDB inserts breakpoints only when it resumes: a location it gives up on then (`<PENDING>`) is listed in `run_state.pending_after_resume` (`"N.M"`), marked pending in the returned breakpoint, and added to `load`'s `pending_breakpoints`. If the target stopped on its own meanwhile (a breakpoint hit racing the stop), it is left stopped and `run_state.stop` holds that stop. If the resume fails (GDB could not insert a breakpoint), the change still stands, `run_state.error` carries GDB's reason (e.g. `Cannot insert breakpoint 6. Cannot access memory at address …`), and the target is left stopped with no trap of GDB's in memory. If pry cannot stop the target, or the running execution is a background `finish`/`until`/`step`/`next` that a stop would cancel, the command exits 1 and nothing is changed. A `pry wait` already waiting keeps waiting through this internal stop. A command that failed while the target runs (e.g. `pry print '$pc'`: `Selected thread is running`) does not change any of this. Native targets take these changes live (no `run_state`). Raw `pry gdb 'delete 3'` bypasses all of this.
 
@@ -423,7 +426,7 @@ pry registers                    # General-purpose registers
 pry registers --all              # All registers (including FP/SIMD)
 pry registers read rip rdi       # Named registers only (aliases pc/sp, sub-registers eax; leading $ optional)
 pry registers write rip 0x401234 # Set a register ($pc/$rsp/etc.; leading $ optional)
-pry registers write --thread 2 r15 0x4141  # ...in thread 2 (read/write both take --thread)
+pry registers write --thread 2 r15 0x4141  # ...in thread 2 (read/write both take --thread); the result's `thread` is the thread written (text names it with --thread)
 pry mappings                     # Process memory map (structured vmmap)
 pry mappings --contains 0x7ffff7d00000   # Mapping that holds an address
 pry mappings --name libc         # Mappings whose objfile matches a substring
@@ -532,7 +535,7 @@ pry info target                  # Show target connection info
 ## Known Quirks
 
 - **No shell stdin redirect via `pry gdb 'run < file'`**: launch disables `startup-with-shell`, so `<` and the path become argv. Use `pry run --stdin-file PATH` for true file-as-stdin (raw bytes, no PTY).
-- **Multiple sessions require `--instance`**: commands auto-select the bridge only when exactly one `pry launch` session is alive. The moment a second one exists, every command needs `pry --instance <pid> ...` or it hard-errors — copying a bare example will fail. Run `pry doctor` to list live PIDs.
+- **Multiple sessions require `--instance`**: commands auto-select the bridge only when exactly one `pry launch` session is alive. The moment a second one exists, every command needs `pry --instance <pid-or-name> ...` or it hard-errors (the error lists each running instance by name and pid) — copying a bare example will fail.
 - **Socket timeout vs bridge timeout**: without `--timeout`, the CLI socket gives up at 30s while the bridge only auto-interrupts at 120s — so a plain `pry continue` on a program that runs >30s returns a transport error even though the inferior is still running. For long runs pass `--timeout N` (the bridge honors it and auto-interrupts) or use `--background` + `pry wait`.
 - **Execution commands block**: `pry run`, `pry continue`, `pry finish` block until the inferior stops. Use `--timeout` for auto-interrupt recovery, or `--background` to return immediately and poll with `pry status`/`pry wait`.
 - **Thread safety**: The bridge posts all GDB commands onto GDB's main thread. This means GDB stays responsive, but only one op executes at a time.

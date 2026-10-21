@@ -37,6 +37,7 @@ from .transport import (
     _socket_is_live,
     list_instances,
     match_instance,
+    multiple_instances_message,
     send_request,
 )
 from .version import VERSION, build_id_for_file
@@ -890,7 +891,15 @@ def _render_breakpoint_list_text(value: Any) -> str:
             prep = _bp_target_preposition(bp)
         enabled = "enabled" if bp.get("enabled") else "disabled"
         hits = bp.get("hits", 0)
-        line = f"#{num} {kind} {prep} {target} [{enabled}] hits={hits}"
+        loc_count = _bp_location_count(bp)
+        # The site GDB armed, as `break set` reports it: the requested spec
+        # (`prog.c:8`) may resolve elsewhere (`prog.c:9`).
+        site = ""
+        if loc_count <= 1 and not bp.get("pending"):
+            detail = _format_bp_location_detail(bp)
+            if detail:
+                site = f" {detail}"
+        line = f"#{num} {kind} {prep} {target} [{enabled}]{site} hits={hits}"
         if bp.get("pending"):
             line += " (pending)"
         if bp.get("temporary"):
@@ -907,7 +916,6 @@ def _render_breakpoint_list_text(value: Any) -> str:
         # Multi-location breakpoints (inlined sites, etc.): announce the count
         # and list every resolved address so agents don't assume the first is
         # the real hit site.
-        loc_count = _bp_location_count(bp)
         if loc_count > 1:
             line += f" ({loc_count} locations)"
         lines.append(line)
@@ -1095,14 +1103,15 @@ def _render_args_text(value: Any) -> str:
     return _render_locals_text(value)
 
 
-def _render_register_write_text(value: Any) -> str:
+def _render_register_write_text(value: Any, show_thread: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     name = value.get("register", "?")
     readback = value.get("readback")
-    if readback is not None:
-        return f"${name} = {readback}"
-    return f"${name} set to {value.get('value', '?')}"
+    text = f"${name} = {readback}" if readback is not None else f"${name} set to {value.get('value', '?')}"
+    if show_thread and value.get("thread") is not None:
+        text += f" (thread {value['thread']})"
+    return text
 
 
 def _render_mappings_text(value: Any) -> str:
@@ -1442,6 +1451,7 @@ def _render_kbase_text(value: Any) -> str:
             numbers = ", ".join(f"#{n}" for n in pending)
             lines.append(f"warning: GDB could not place breakpoint(s) {numbers}: they are "
                          "pending and will not fire (see `pry break list`)")
+        lines.extend(_dropped_lines(load.get("dropped")))
         notes.update(baked_traps=load.get("baked_traps"), pending_breakpoints=pending)
     elif apply.get("command"):
         lines.append(f"symbols: {path} is {apply.get('reason')}; apply with: {apply['command']}")
@@ -1731,8 +1741,6 @@ def _render_launch_text(result: dict[str, Any]) -> str:
             lines.append(f"target status: {result['target_status']}")
     lines.append(f"socket: {result['socket_path']}")
     lines.append(f"log: {result['log_path']}")
-    if result.get("post_launch_error"):
-        lines.append(f"error: {result['post_launch_error']}")
     if result.get("hint"):
         lines.append(f"hint: {result['hint']}")
     return "\n".join(lines)
@@ -1987,24 +1995,49 @@ def _launch(args: argparse.Namespace) -> int:
         started_at=None,
         meta={},
     )
+    selector = instance_id or str(pid)
+    symbols_path = (
+        str(Path(args.symbols).expanduser().resolve()) if getattr(args, "symbols", None) else None
+    )
+    connect = getattr(args, "connect", None)
+    # The commands that finish the launch from wherever it failed.
+    retry: list[str] = []
+    if symbols_path:
+        retry.append(shlex.join(["pry", "--instance", selector, "load", symbols_path]))
+    if connect:
+        retry.append(shlex.join(["pry", "--instance", selector, "connect", connect]))
+    step = ""
     try:
-        if getattr(args, "symbols", None):
-            symbols_path = str(Path(args.symbols).expanduser().resolve())
+        if symbols_path:
+            step = f"load symbols from {symbols_path}"
             _send_request_to_instance(
                 _post_instance, "load", params={"path": symbols_path},
             )
             result["symbols"] = symbols_path
-        if getattr(args, "connect", None):
+            retry.pop(0)
+        if connect:
+            step = f"connect to {connect}"
             connect_resp = _send_request_to_instance(
-                _post_instance, "connect", params={"target": args.connect},
+                _post_instance, "connect", params={"target": connect},
                 timeout=20,
             )
-            result["connected"] = args.connect
+            result["connected"] = connect
             connect_result = connect_resp.get("result")
             if isinstance(connect_result, dict):
                 result["target_status"] = connect_result.get("status")
     except BridgeError as exc:
-        result["post_launch_error"] = str(exc)
+        # GDB's own messages may already lead with "error:" (and a failed
+        # connect with "could not connect:", which this message says already).
+        reason = re.sub(
+            r"^(?:error:\s*|could not connect:\s*)+", "", str(exc), flags=re.IGNORECASE
+        ).rstrip()
+        who = f"pid={pid}, instance {instance_id}" if instance_id else f"pid={pid}"
+        result["post_launch_error"] = (
+            f"GDB launched ({who}) but could not {step}: {reason}"
+            f"{'' if reason.endswith('.') else '.'} The session is still up: retry with "
+            f"`{'` then `'.join(retry)}`, or end it with "
+            f"`{shlex.join(['pry', 'kill', '--instance', selector])}`"
+        )
 
     hint = _multiarch_gdb_hint(result, gdb_binary)
     if hint:
@@ -2016,6 +2049,9 @@ def _launch(args: argparse.Namespace) -> int:
         )
     else:
         _render_result(result, fmt=args.format, out_path=args.out, stem="launch")
+    if result.get("post_launch_error"):
+        # Part of what was asked failed: exit non-zero, the error on stderr.
+        raise BridgeError(result["post_launch_error"])
     return 0
 
 
@@ -2058,11 +2094,7 @@ def _kill(args: argparse.Namespace) -> int:
         if not instances:
             raise BridgeError("No running GDB session found to kill.")
         if len(instances) > 1:
-            pids = ", ".join(str(i.pid) for i in instances)
-            raise BridgeError(
-                f"Multiple bridge instances running (pids: {pids}). "
-                f"Use --instance <pid|name> to select one, or 'pry kill --all'."
-            )
+            raise BridgeError(multiple_instances_message(instances, ", or 'pry kill --all'"))
         target = instances[0]
     else:
         # Resolve an explicit --instance (pid or unique live name) so we don't
@@ -2137,10 +2169,7 @@ def _logs(args: argparse.Namespace) -> int:
         if not instances:
             raise BridgeError("No running GDB session found. Launch one with 'pry launch <binary>'.")
         if len(instances) > 1:
-            pids = ", ".join(str(i.pid) for i in instances)
-            raise BridgeError(
-                f"Multiple bridge instances running (pids: {pids}). Use --instance <pid|name>."
-            )
+            raise BridgeError(multiple_instances_message(instances))
         target_pid = instances[0].pid
     else:
         target_pid = match_instance(list_instances(), selector).pid
@@ -2261,6 +2290,15 @@ def resolve_gdb_scripts_path(
     )
 
 
+def _dropped_lines(dropped: Any) -> list[str]:
+    """Text lines for the symbol files a vmlinux rebase dropped and could not put back."""
+    return [
+        f"symbols: dropped {path} (the rebase unloaded it and pry cannot put it back; "
+        f"re-add it with `pry load {shlex.quote(str(path))} --base <ADDR>` or `--slide <OFFSET>`)"
+        for path in dropped or []
+    ]
+
+
 def _render_load_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2290,6 +2328,8 @@ def _render_load_text(value: Any) -> str:
         numbers = ", ".join(f"#{n}" for n in pending)
         line += (f"\nwarning: GDB could not place breakpoint(s) {numbers}: they are "
                  "pending and will not fire (see `pry break list`)")
+    for dropped in _dropped_lines(value.get("dropped")):
+        line += f"\n{dropped}"
     return _with_notes(line, value)
 
 
@@ -2608,6 +2648,7 @@ def _render_resync_text(value: Any) -> str:
     if isinstance(symbols, dict):
         lines.append(f"symbols: reloaded {symbols.get('loaded')} @ "
                      f"{symbols.get('base')} (slide {symbols.get('slide')})")
+        lines.extend(_dropped_lines(symbols.get("dropped")))
     for path in value.get("reloaded") or []:
         lines.append(f"symbols: re-read {path} so GDB re-resolves breakpoints it had given up on")
     summary = value.get("summary") or {}
@@ -2702,6 +2743,8 @@ def _break_set(args: argparse.Namespace) -> int:
         params["temporary"] = True
     if args.hardware:
         params["hardware"] = True
+    if getattr(args, "pending", False):
+        params["pending"] = True
     if getattr(args, "ignore", None) is not None:
         params["ignore"] = args.ignore
     rebase = getattr(args, "rebase", None)
@@ -2855,11 +2898,12 @@ def _registers(args: argparse.Namespace) -> int:
 
 
 def _register_write(args: argparse.Namespace) -> int:
+    show_thread = getattr(args, "thread", None) is not None
     return _call(
         args,
         "register_write",
         {"name": args.name, "value": args.value},
-        text_renderer=_render_register_write_text,
+        text_renderer=lambda value: _render_register_write_text(value, show_thread=show_thread),
         stem="register_write",
     )
 
@@ -3693,6 +3737,11 @@ def build_parser() -> argparse.ArgumentParser:
     brk_set.add_argument("--condition", help="Conditional expression")
     brk_set.add_argument("--temporary", action="store_true", help="Temporary breakpoint (deleted on hit)")
     brk_set.add_argument("--hardware", action="store_true", help="Hardware breakpoint")
+    brk_set.add_argument(
+        "--pending", action="store_true",
+        help="Keep a location no loaded symbol file resolves pending until a shared library "
+             "or module defining it loads (without it, such a location is refused)",
+    )
     brk_set.add_argument("--ignore", type=int, metavar="N", help="Skip the next N hits before stopping")
     brk_set.add_argument("--rebase", metavar="MODULE", help="Treat location as offset from MODULE's load base (PIE/ASLR rebasing)")
     brk_set.add_argument("--image-base", type=lambda x: int(x, 0), default=0, metavar="ADDR",

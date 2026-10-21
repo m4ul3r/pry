@@ -251,3 +251,38 @@ def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeyp
         server.shutdown()
         server.server_close()
         socket_path.unlink(missing_ok=True)
+
+
+def _instance(pid: int, name: str | None, tmp_path: Path):
+    from pry.transport import BridgeInstance
+
+    return BridgeInstance(
+        pid=pid,
+        socket_path=tmp_path / f"{pid}.sock",
+        registry_path=tmp_path / f"{pid}.json",
+        plugin_name="pry_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id=name,
+    )
+
+
+@pytest.mark.parametrize("command", [["status"], ["logs"], ["kill"]])
+def test_multiple_instances_refusal_names_each_instance(tmp_path, monkeypatch, capsys, command):
+    # #87: the refusal must name the instances the way --instance accepts them
+    # (the launch name, with its pid), not by pid alone.
+    import pry.cli
+
+    instances = [_instance(111, "vp-a", tmp_path), _instance(222, None, tmp_path)]
+    monkeypatch.setattr("pry.transport.list_instances", lambda: instances)
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: instances)
+
+    with pytest.raises(Exception) as excinfo:
+        choose_instance()
+    message = str(excinfo.value)
+    assert "vp-a" in message and "111" in message and "222" in message
+
+    assert pry.cli.main(command) == 1
+    err = capsys.readouterr().err
+    assert "vp-a" in err and "111" in err and "222" in err

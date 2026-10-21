@@ -3080,3 +3080,111 @@ def test_registers_subcommands_keep_options_given_before_them(monkeypatch, capsy
     assert pry.cli.main(["registers", "write", "--thread", "2", "r15", "0x4242"]) == 0
     assert cap["params"]["thread"] == 2
     assert cap["params"]["name"] == "r15"
+
+
+def _fake_live_launch(monkeypatch, tmp_path, pid=31337):
+    """Make `pry launch` spawn nothing and find its bridge up at once."""
+    monkeypatch.setenv("PRY_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(pry.cli, "_resolve_gdb_binary", lambda explicit: "gdb")
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: tmp_path)
+    monkeypatch.setattr(pry.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(pry.cli, "_socket_is_live", lambda path: True)
+    monkeypatch.setattr(pry.cli, "_annotate_registry_instance_id", lambda pid, name: None)
+    stopped = []
+
+    class _Proc:
+        def __init__(self, *a, **k):
+            self.pid = pid
+            pry.cli.bridge_socket_path(pid).touch()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            stopped.append("terminate")
+
+        def kill(self):
+            stopped.append("kill")
+
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _Proc)
+    return stopped
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_launch_connect_failure_exits_nonzero_and_keeps_the_session(monkeypatch, capsys, tmp_path, fmt):
+    # #82: the connect is part of what was asked; its failure is not success.
+    stopped = _fake_live_launch(monkeypatch, tmp_path)
+    killed = []
+    monkeypatch.setattr(pry.cli, "_kill_instance", lambda pid: killed.append(pid))
+
+    def _send(instance, op, params=None, **kw):
+        if op == "connect":
+            raise pry.cli.BridgeError("error: could not connect: Connection timed out.")
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(pry.cli, "_send_request_to_instance", _send)
+
+    rc = pry.cli.main(["launch", "--instance-id", "p14x", "--connect", "127.0.0.1:24199",
+                       "--format", fmt])
+
+    assert rc == 1
+    assert stopped == [] and killed == []  # the GDB session stays up
+    captured = capsys.readouterr()
+    assert "31337" in captured.out
+    assert "error: error:" not in captured.err
+    # The error names the session to retry in or to kill.
+    assert "pry --instance p14x connect 127.0.0.1:24199" in captured.err
+    assert "pry kill --instance p14x" in captured.err
+
+
+def test_launch_without_post_launch_failure_exits_zero(monkeypatch, capsys, tmp_path):
+    _fake_live_launch(monkeypatch, tmp_path)
+    monkeypatch.setattr(pry.cli, "_send_request_to_instance",
+                        lambda instance, op, params=None, **kw: {"ok": True, "result": {"status": "stopped"}})
+
+    assert pry.cli.main(["launch", "--connect", "127.0.0.1:1234"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_break_list_text_shows_the_resolved_site():
+    # #86: `prog.c:8` (a blank line) is armed at prog.c:9; the list must say so.
+    value = [{
+        "number": 2, "kind": "breakpoint", "type": 1, "enabled": True, "hits": 0,
+        "location": "prog.c:8", "address": "0x1193", "file": "prog.c", "line": 9,
+        "function": "main", "pending": False,
+        "locations": [{"address": "0x1193", "file": "prog.c", "line": 9, "function": "main"}],
+        "location_count": 1,
+    }]
+    text = pry.cli._render_breakpoint_list_text(value)
+    assert "prog.c:9" in text and "0x1193" in text and "main" in text
+
+
+def test_register_write_text_names_the_thread_only_with_thread_flag(monkeypatch, capsys):
+    # #97: text says which thread was written when --thread was given.
+    monkeypatch.setattr(
+        pry.cli, "send_request",
+        lambda op, params=None, **kw: {"ok": True, "result": {
+            "register": "r14", "value": "0x1414", "readback": "5140", "thread": 2}},
+    )
+    assert pry.cli.main(["registers", "write", "--thread", "2", "r14", "0x1414"]) == 0
+    assert "thread 2" in capsys.readouterr().out
+    assert pry.cli.main(["registers", "write", "r14", "0x1414"]) == 0
+    assert "thread" not in capsys.readouterr().out
+
+
+def test_rebase_text_lists_dropped_symbol_files():
+    # #104: a symbol file the rebase dropped is named in text, not only JSON.
+    dropped = ["/tmp/pry21/loop2"]
+    load = pry.cli._render_load_text({"loaded": "/k/vmlinux", "slide": "0x31c00000", "dropped": dropped})
+    kbase = pry.cli._render_kbase_text({
+        "base": "0xffffffffb2c00000", "slide": "0x31c00000",
+        "apply": {"applied": True, "path": "/k/vmlinux",
+                  "load": {"slide": "0x31c00000", "dropped": dropped}},
+    })
+    resync = pry.cli._render_resync_text({
+        "state": "stopped",
+        "symbols": {"loaded": "/k/vmlinux", "base": "0xffffffffb2c00000",
+                    "slide": "0x31c00000", "dropped": dropped},
+    })
+    for text in (load, kbase, resync):
+        assert "/tmp/pry21/loop2" in text

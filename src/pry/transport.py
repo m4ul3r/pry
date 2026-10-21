@@ -183,6 +183,22 @@ def match_instance(instances: list[BridgeInstance], selector: int | str) -> Brid
     raise BridgeError(f"No running GDB bridge instance named {sel!r}")
 
 
+def multiple_instances_message(instances: list[BridgeInstance], also: str = "") -> str:
+    """The refusal when a command needs ``--instance`` to pick among *instances*.
+
+    Names each instance the way ``--instance`` accepts it: its name (given at
+    launch with ``--instance-id``) with its pid, or its pid alone.
+    """
+    listed = ", ".join(
+        f"{inst.instance_id} (pid {inst.pid})" if inst.instance_id else f"pid {inst.pid}"
+        for inst in instances
+    )
+    return (
+        f"Multiple bridge instances running: {listed}. "
+        f"Use --instance <pid-or-name> to select one{also}."
+    )
+
+
 def choose_instance(pid: int | str | None = None) -> BridgeInstance:
     """Pick the target instance for a request.
 
@@ -196,11 +212,7 @@ def choose_instance(pid: int | str | None = None) -> BridgeInstance:
     if pid is not None:
         return match_instance(instances, pid)
     if len(instances) > 1:
-        pids = ", ".join(str(i.pid) for i in instances)
-        raise BridgeError(
-            f"Multiple bridge instances running (pids: {pids}). "
-            f"Use --instance <pid> to select one."
-        )
+        raise BridgeError(multiple_instances_message(instances))
     return instances[0]
 
 
