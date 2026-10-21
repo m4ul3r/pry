@@ -612,11 +612,12 @@ def _elf_code_symbols(path: str, parsed) -> dict[int, list[int]]:
     return {index: sorted(values) for index, values in found.items()}
 
 
-def _elf_file_bytes(path: str, link_addr: int, length: int) -> bytes | None:
+def _elf_file_bytes(path: str, link_addr: int, length: int, *, executable: bool = False) -> bytes | None:
     """File bytes of an allocated ELF section at a link-time address.
 
     Returns at most ``length`` bytes (fewer at a section end), or ``None`` when
-    no file-backed allocated section covers ``link_addr``.
+    no file-backed allocated section (with *executable*, no code section)
+    covers ``link_addr``.
     """
     parsed = _elf_sections(path)
     if parsed is None:
@@ -624,6 +625,8 @@ def _elf_file_bytes(path: str, link_addr: int, length: int) -> bytes | None:
     _hdr, sections = parsed
     for s in sections:
         if not s["flags"] & _ELF_SHF_ALLOC or s["type"] == _ELF_SHT_NOBITS:
+            continue
+        if executable and not s["flags"] & _ELF_SHF_EXECINSTR:
             continue
         start, size = s["addr"], s["size"]
         if size and start <= link_addr < start + size:
@@ -1348,7 +1351,7 @@ def _op_timeout_message(progress: dict[str, Any], *, stuck: bool) -> str:
             text += f"; not done: {', '.join(rest)}"
     if op == "resync" and not stuck:
         text += (". The report it would have given is lost: rerun `pry resync` with a "
-                 "longer `--timeout` (or none)")
+                 "longer `--timeout`")
     elif op == "py_exec" and not stuck:
         text += " (a runaway loop in the script?)"
     return text
@@ -1925,9 +1928,11 @@ class GdbBridge:
         # How far the op running on GDB's thread got (GdbBridge._progress),
         # for the message of a timeout that stops it.
         self._op_progress: dict[str, Any] = {}
-        # Raw-address breakpoint number -> {"path", "slide"}: the slide of the
-        # symbol file it lies in, from before pry first moved that file.
-        self._raw_bp_slides: dict[int, dict[str, Any]] = {}
+        # Raw-address breakpoint number -> {"path", "slide"}: the symbol file
+        # whose code target memory held there, at the slide pry gave it, when
+        # the breakpoint was set (or before pry first moved that file); None
+        # when pry's symbols did not describe the target there (#112).
+        self._raw_bp_slides: dict[int, dict[str, Any] | None] = {}
         gdb.events.stop.connect(self._on_stop)
         if hasattr(gdb.events, "exited"):
             gdb.events.exited.connect(self._on_exited)
@@ -3107,23 +3112,28 @@ class GdbBridge:
         self._resolve_pending_stop()
         result = _stop_info()
         result["state"] = result["status"]
-        if self._last_stop_reason:
-            if result["state"] == "stopped":
-                self._last_stop_reason = self._stale_hit(self._last_stop_reason) or self._last_stop_reason
-            result["reason"] = self._last_stop_reason
+        reason = self._last_stop_reason
+        if reason:
+            if result["state"] == "stopped" and self._remember_remote_connection():
+                # Judged at each read, from the stop's own reason: the PC may
+                # move again, or back.
+                reason = self._stale_hit(reason) or reason
+            result["reason"] = reason
         if self._displays and result["state"] == "stopped":
             result["displays"] = self._eval_displays()
         return result
 
     def _stale_hit(self, reason: dict[str, Any]) -> dict[str, Any] | None:
-        """GDB thread, at a stop: the ``stale`` reason replacing a breakpoint
-        hit the frame no longer matches, else None (#100).
+        """GDB thread, at a stop of a remote target: the ``stale`` reason
+        replacing a breakpoint hit the frame no longer matches, else None (#100).
 
         GDB leaves the PC at the breakpoint's address (x86, arm64). Once the
         stop thread's PC is at none of the breakpoint's locations, the target
-        ran without GDB seeing it: a VM resumed outside it (`qmu cont`) and
-        halted again by the next packet GDB sent. A breakpoint since deleted,
-        or another thread selected since, says nothing either way.
+        moved without pry seeing it run: most often a VM resumed outside GDB
+        (`qmu cont`) and halted again by the next packet GDB sent, or a PC
+        written since. A breakpoint since deleted, or another thread selected
+        since, says nothing either way. A native process runs only under GDB,
+        so there only a PC write moves it, and the hit is left as it was.
         """
         if reason.get("kind") != "breakpoint-hit":
             return None
@@ -4321,24 +4331,51 @@ class GdbBridge:
 
     def _stamp_raw_breakpoints(self, real: str) -> None:
         """GDB thread, before symbol file *real* (a realpath) moves: remember
-        its slide under each raw-address breakpoint inside it (#112).
+        its slide under each raw-address breakpoint pry has not judged yet (#112).
 
         A ``*0x…`` location is an absolute address: no rebase moves it. A
-        later resync that finds it unreadable names where the same
-        instruction is at the slide the file has then. Only the first slide
-        is kept, the one the breakpoint was set under.
+        later resync names where the same instruction is at the slide the
+        file has then, but only when the slide described the target at that
+        address: see :meth:`_raw_slide_at`. `break set` judges its own raw
+        breakpoints when it sets them; this catches the ones raw commands set.
         """
-        if not self._file_is_loaded(real):
-            return
-        slide = self._elf_slide(real)
-        if slide is None:
-            return
         for bp in gdb.breakpoints() or []:
             addr = _raw_location_address(bp)
             if addr is None or bp.number in self._raw_bp_slides:
                 continue
-            if _elf_file_bytes(real, (addr - slide) & _ADDR_MASK, 1) is not None:
-                self._raw_bp_slides[bp.number] = {"path": real, "slide": slide}
+            stamp = self._raw_slide_at(addr)
+            if stamp is not None and stamp["path"] == real:
+                self._raw_bp_slides[bp.number] = stamp
+
+    def _raw_slide_at(self, addr: int) -> dict[str, Any] | None:
+        """GDB thread, at a stop: ``{"path", "slide"}`` of the symbol file
+        whose code target memory holds at *addr* under the slide pry gives
+        it now, else None.
+
+        A raw address typed while pry's symbols sit at a stale slide (a
+        link-time vmlinux before `pry kbase`) is the running kernel's, not
+        the symbol file's at that slide: its bytes there are not the file's
+        code, and no rebase of the symbols says anything about it.
+        """
+        try:
+            objfile = gdb.current_progspace().objfile_for_address(addr)
+        except Exception:
+            _raise_if_remote_lost(self)
+            return None
+        path = getattr(objfile, "filename", None) if objfile is not None else None
+        if not path or not os.path.isfile(path):
+            return None
+        real = os.path.realpath(path)
+        slide = self._elf_slide(real)
+        trap = self._trap_bytes()
+        if slide is None or trap is None:
+            return None
+        elf = _elf_file_bytes(real, (addr - slide) & _ADDR_MASK,
+                              len(trap) + _TRAP_CONFIRM_BYTES, executable=True)
+        if elf is None:
+            return None
+        site = classify_trap_site(self._raw_read(addr, len(elf)), elf, trap)
+        return {"path": real, "slide": slide} if site.get("elf_match") else None
 
     @staticmethod
     def _add_symbol_file(path: str, slide_int: int) -> dict[str, int]:
@@ -4806,6 +4843,11 @@ class GdbBridge:
         baked = self._baked_traps(self._trap_sites([bp], repair=True))
         if baked:
             result["baked_traps"] = baked
+        raw = _raw_location_address(bp)
+        if raw is not None:
+            # Judged under the slide it is set at (#112); None: the symbols
+            # do not describe the target there (stale, or nothing readable).
+            self._raw_bp_slides[bp.number] = self._raw_slide_at(raw)
         return result
 
     def _break_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5550,6 +5592,15 @@ class GdbBridge:
         unreadable = {
             tuple(int(p) for p in loc.split(".")) for loc, s in sites.items() if not s["readable"]
         }
+        for bp in bps:
+            # A raw breakpoint pry could not judge when it was set (its
+            # symbols were stale, or nothing was readable) is judged again
+            # once they describe the target there, e.g. after `pry kbase` (#112).
+            raw = _raw_location_address(bp)
+            if raw is not None and self._raw_bp_slides.get(bp.number) is None:
+                stamp = self._raw_slide_at(raw)
+                if stamp is not None:
+                    self._raw_bp_slides[bp.number] = stamp
         self._progress(_RESYNC_SCAN)
         result["stray_traps"], result["scan"] = self._stray_traps(
             {int(s["address"], 16) for s in sites.values()}, stop_at
@@ -5717,8 +5768,8 @@ class GdbBridge:
         if getattr(bp, "condition", None):
             flags += f" --condition {shlex.quote(bp.condition)}"
         rebased = (
-            f"pry has moved {os.path.basename(stamp['path'])} from slide {stamp['slide']:#x} "
-            f"to {now:#x} since it was set, so the same instruction is now at "
+            f"Target memory held {os.path.basename(stamp['path'])}'s code there at slide "
+            f"{stamp['slide']:#x}; pry has moved it to {now:#x} since, so the same instruction is now at "
             f"{moved:#x}{f' ({label})' if label else ''}: `pry break delete {bp.number}` and "
             f"`pry break set '*{moved:#x}'{flags}`"
         )
