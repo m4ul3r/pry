@@ -249,6 +249,13 @@ _A64 = bytes.fromhex("fd7bbfa9" "fd030091" "e00313aa" "c0035fd6")
         ("5e415f5dc3cccccccc0f0b658b052c25ce", "5e415f5de95dfecc000f0b658b052c25ce", "cc", 0x1000, []),
         # A trap planted right after such a rewritten jmp is still found.
         ("c3cccccccc0f1f4000cc8b7f70e9b7ebff", "e934b1f7000f1f4000488b7f70e9b7ebff", "cc", 0x1000, [9]),
+        # #88: a static call retargeted at boot keeps its `call` opcode; a 0xcc
+        # in its new rel32 is not an instruction start of the ELF.
+        ("e85390cc00488b7f70e9b7ebffff", "e85390f600488b7f70e9b7ebffff", "cc", 0x1000, []),
+        # ...nor in a retargeted static-call trampoline's `jmp rel32`.
+        ("e9c3ccfeff488b7f70e9b7ebffff", "e9c3adfeff488b7f70e9b7ebffff", "cc", 0x1000, []),
+        # A trap planted after a retargeted call whose operand holds e8 is found.
+        ("e899999900cc8b7f70e9b7ebffff", "e812e83400488b7f70e9b7ebffff", "cc", 0x1000, [5]),
         # Alternatives turned a NOP run into `jmp +12; int3 x12`: the last
         # int3 has the ELF's next instruction after it, but is jumped over.
         ("eb0c" + "cc" * 12 + "90488d7c2408", "90" * 15 + "488d7c2408", "cc", 0x1000, []),
@@ -264,8 +271,18 @@ _A64 = bytes.fromhex("fd7bbfa9" "fd030091" "e00313aa" "c0035fd6")
 )
 def test_stray_trap_offsets(monkeypatch, guest, elf, trap, start, found):
     bridge_mod, _ = _load_bridge(monkeypatch)
-    as_bytes = lambda v: v if isinstance(v, bytes) else bytes.fromhex(v)  # noqa: E731
-    assert bridge_mod.stray_trap_offsets(as_bytes(guest), as_bytes(elf), as_bytes(trap), start) == found
+    guest, elf, trap = (v if isinstance(v, bytes) else bytes.fromhex(v) for v in (guest, elf, trap))
+    starts = bridge_mod.insn_start_checker(trap, elf, start, [0], True)
+    assert bridge_mod.stray_trap_offsets(guest, elf, trap, starts) == found
+
+
+def test_x86_trap_with_no_code_symbol_before_it_is_not_found(monkeypatch):
+    """Without a symbol to decode from, nothing proves a byte starts an
+    instruction, so nothing is written there (#88)."""
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    guest, elf = bytes.fromhex("0f1f4000cc8b7f70e9b7ebffff"), bytes.fromhex("0f1f4000488b7f70e9b7ebffff")
+    starts = bridge_mod.insn_start_checker(b"\xcc", elf, 0x1000, [6], True)
+    assert bridge_mod.stray_trap_offsets(guest, elf, b"\xcc", starts) == []
 
 
 # --- <PENDING> locations --------------------------------------------------------
@@ -936,6 +953,58 @@ def test_resync_does_not_judge_residency_where_the_stub_hides_traps(monkeypatch)
     assert "reseated" not in entry
 
 
+class _Watch(_Bp):
+    """A write watchpoint as GDB keeps it: the value it compares a trapped
+    write with is read again only when GDB re-parses it (on enable)."""
+
+    def __init__(self, stub, number, address, expression):
+        super().__init__(stub, number, address, bp_type=7)
+        self.locations = []
+        self.location = None
+        self.expression = expression
+        self.address = address
+        self.val = stub.mem[address]
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value):
+        if value and not self._enabled:
+            self.val = self._stub.mem[self.address]
+        self._enabled = value
+
+    def trap_write(self, byte: int) -> bool:
+        """The target writes *byte*; True when GDB reports it, False when it
+        resumes silently because the value equals the one it holds."""
+        self._stub.mem[self.address] = byte
+        changed, self.val = byte != self.val, byte
+        return changed
+
+
+def test_resync_has_gdb_reread_each_watchpoints_value(monkeypatch):
+    """#98: a snapshot load puts 'l' back behind GDB's back. GDB still holds
+    the 'q' it saw before the load and would swallow the next 'l' -> 'q'."""
+    nodename = 0xFFFFFFFF82A59CC1
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, {nodename: ord("l")})
+    monkeypatch.setattr(fake_gdb, "parse_and_eval", lambda expression: stub.mem[nodename])
+    watch = _Watch(stub, 2, nodename, "init_uts_ns.name.nodename[0]")
+    assert watch.trap_write(ord("q"))  # iteration 1 stops
+    bridge._snapshot_watchpoints()  # pry resumes the target after that stop
+    stub.mem[nodename] = ord("l")  # the snapshot load
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    [entry] = result["breakpoints"]
+    assert entry["status"] == "unverified"
+    assert entry["value"] == str(ord("l"))
+    assert watch.trap_write(ord("q"))  # iteration 2 stops too
+    fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([watch]))
+    reason = bridge.dispatch({"op": "status"})["result"]["reason"]
+    assert (reason["old_value"], reason["new_value"]) == (str(ord("l")), str(ord("q")))
+
+
 def test_resync_restores_a_baked_trap_away_from_every_breakpoint(monkeypatch):
     """#63: a canary armed when the snapshot was saved and deleted before the
     load left its int3 baked in; no breakpoint site leads to it."""
@@ -943,7 +1012,9 @@ def test_resync_restores_a_baked_trap_away_from_every_breakpoint(monkeypatch):
     start = TRAP_SITE - len(lead)
     guest = lead + b"\xcc" + ELF_WINDOW[1:]
     _, _, bridge, stub = _remote_target(monkeypatch, {start + i: b for i, b in enumerate(guest)})
-    bridge._code_regions = lambda: [("/k/vmlinux", start, lead + ELF_WINDOW)]
+    bridge._code_regions = lambda: [{
+        "path": "/k/vmlinux", "start": start, "code": lead + ELF_WINDOW, "anchors": [0], "mode64": True,
+    }]
 
     result = bridge.dispatch({"op": "resync", "params": {}})["result"]
 
@@ -968,7 +1039,9 @@ def test_resync_scans_only_code_that_stays_code(monkeypatch, tmp_path):
         memory.update({base + i: b for i, b in enumerate(planted)})
     _, fake_gdb, bridge, stub = _remote_target(monkeypatch, memory)
     vmlinux = tmp_path / "vmlinux"
-    _write_kernel_elf(vmlinux, symbols={"__init_begin": init, "__init_end": 0xFFFFFFFF869D8000}, sections=[
+    _write_kernel_elf(vmlinux, symbols={
+        "_stext": text, "__init_begin": init, "__init_end": 0xFFFFFFFF869D8000,
+    }, sections=[
         (".text", _ALLOC | _EXEC, text, lead + ELF_WINDOW),
         (".data", _WRITE | _ALLOC | _EXEC, data, lead + ELF_WINDOW),
         (".init.text", _ALLOC | _EXEC, init, lead + ELF_WINDOW),
@@ -983,6 +1056,27 @@ def test_resync_scans_only_code_that_stays_code(monkeypatch, tmp_path):
     for base in (data, init, aux):
         assert stub.mem[base + len(lead)] == 0xCC  # not the debugger's, untouched
     assert result["scan"]["bytes"] == len(planted)
+
+
+def test_resync_leaves_a_call_the_kernel_retargeted_alone(monkeypatch, tmp_path):
+    """#88: a static call retargeted at boot keeps its `call` opcode, and a
+    0xcc in its new rel32 has the ELF's bytes on both sides, like a planted
+    trap. It is no instruction start of the ELF, so resync writes nothing."""
+    call = TRAP_SITE - 5
+    guest = bytes.fromhex("e85390cc00") + ELF_WINDOW
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, {call + i: b for i, b in enumerate(guest)})
+    vmlinux = tmp_path / "vmlinux"
+    _write_kernel_elf(vmlinux, symbols={"flush_to_ldisc": call}, sections=[
+        (".text", _ALLOC | _EXEC, call, bytes.fromhex("e85390f600") + ELF_WINDOW),
+    ])
+    monkeypatch.setattr(fake_gdb, "objfiles", lambda: [types.SimpleNamespace(filename=str(vmlinux))],
+                        raising=False)
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    assert result["stray_traps"] == []
+    assert result["scan"]["bytes"] == len(guest)
+    assert bytes(stub.mem[call + i] for i in range(len(guest))) == guest
 
 
 def test_resync_drops_the_orphan_the_target_last_stopped_on(monkeypatch):
