@@ -871,16 +871,35 @@ def test_launch_pry_flag_after_binary_errors(monkeypatch, capsys, tmp_path):
     assert "before the binary" in stderr
 
 
-@pytest.mark.parametrize("option", ["--instance-id", "--gdb-binary"])
-def test_launch_any_launch_option_after_binary_errors(monkeypatch, capsys, tmp_path, option):
+@pytest.mark.parametrize("gdb_args", [
+    ["--instance-id", "x"], ["--gdb-binary", "x"], ["-q", "--instance-id", "x"],
+    ["--instance-i", "x"], ["-nx", "--format=json"], ["-q", "--instance-id", "x", "--", "-nx"],
+])
+def test_launch_any_launch_option_after_binary_errors(monkeypatch, capsys, tmp_path, gdb_args):
     monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
     monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
     monkeypatch.setattr(pry.cli.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned GDB"))
     binary = tmp_path / "bin"
     binary.write_text("")
 
-    assert pry.cli.main(["launch", str(binary), option, "x"]) == 1
-    assert option in capsys.readouterr().err
+    assert pry.cli.main(["launch", str(binary), *gdb_args]) == 1
+    assert next(tok for tok in gdb_args if tok.startswith("--")) in capsys.readouterr().err
+
+
+def test_launch_option_after_later_separator_reaches_gdb(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(pry.cli.shutil, "which", lambda cmd: "/usr/bin/gdb")
+    monkeypatch.setattr(pry.cli, "_resolve_plugin_path", lambda: pry.cli.Path("/tmp"))
+    binary = tmp_path / "bin"
+    binary.write_text("")
+    spawned = {}
+
+    def _record(cmd, *a, **k):
+        spawned["cmd"] = cmd
+        raise RuntimeError("stop before real spawn")
+
+    monkeypatch.setattr(pry.cli.subprocess, "Popen", _record)
+    pry.cli.main(["launch", str(binary), "-q", "--", "--instance-id", "x"])
+    assert spawned["cmd"][-4:] == ["-q", "--", "--instance-id", "x"]
 
 
 def test_launch_double_dash_passes_gdb_args(monkeypatch, capsys, tmp_path):
@@ -2920,6 +2939,83 @@ def test_run_unknown_token_before_run_gets_no_sentinel_rewrite(capsys):
         pry.cli.main(["--instance", "zz", "--bogus", "run", "-x"])
     assert exc.value.code == 2
     assert "-- run" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [["--h"], ["--hel"], ["--instance", "zz", "--h", "status"]])
+def test_ambiguous_prefix_before_subcommand_names_candidates(capsys, argv):
+    with pytest.raises(SystemExit) as exc:
+        pry.cli.main(argv)
+    assert exc.value.code == 2
+    error_line = capsys.readouterr().err.strip().splitlines()[-1]
+    assert "--help" in error_line.replace("--help-full", "") and "--help-full" in error_line
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["--instance", "zz", "--timeout", "5", "run", "-x"],
+     {"handler": pry.cli._run, "timeout": 5.0, "args": ["-x"], "instance_global": "zz"}),
+    (["--stdin-file", "/x", "run", "-a"], {"handler": pry.cli._run, "stdin_file": "/x", "args": ["-a"]}),
+    (["--timeout", "5", "continue"], {"handler": pry.cli._continue, "timeout": 5.0}),
+    (["--format", "json", "status"], {"handler": pry.cli._status, "format": "json"}),
+    (["--format=json", "status"], {"handler": pry.cli._status, "format": "json"}),
+    (["--format", "json", "break", "list"], {"handler": pry.cli._break_list, "format": "json"}),
+    (["break", "--format", "json", "list"], {"handler": pry.cli._break_list, "format": "json"}),
+])
+def test_subcommand_option_before_subcommand_gets_working_fix(monkeypatch, capsys, argv, expected):
+    cap = _capture_send(monkeypatch)
+    fixed = _suggested_run_command(capsys, argv)
+    assert cap == {}
+    args = pry.cli.build_parser().parse_args(fixed)
+    assert {key: getattr(args, key) for key in expected} == expected
+
+
+def test_separator_before_subcommand_is_dropped(monkeypatch, capsys):
+    fixed = _suggested_run_command(capsys, ["--instance", "zz", "--", "run", "-x"])
+    args = pry.cli.build_parser().parse_args(fixed)
+    assert (args.instance_global, args.handler, args.args) == ("zz", pry.cli._run, ["-x"])
+
+    cap = _capture_send(monkeypatch, result={"state": "stopped"})
+    assert pry.cli.main(["--", "status"]) == 0
+    assert cap["op"] == "status"
+
+
+@pytest.mark.parametrize("program_args", [
+    ["-hide_banner", "-i", "crash.avi", "-f", "null", "-"], ["-hwaccel", "cuda", "-i", "crash.avi"],
+])
+def test_run_hint_names_program_args_in_order(capsys, program_args):
+    with pytest.raises(SystemExit):
+        pry.cli.main(["run", *program_args])
+    message = capsys.readouterr().err.strip().splitlines()[-1].rsplit(": ", 1)[0]
+    assert shlex.join(program_args) in message
+
+
+@pytest.mark.parametrize("argv, command", [
+    (["gdb", "info", "breakpoints"], "info breakpoints"),
+    (["gdb", "delete", "2"], "delete 2"),
+    (["gdb", "--", "x/4gx", "-8"], "x/4gx -8"),
+    (["gdb", "info", "proc", "mappings", "--format", "json"], "info proc mappings"),
+    (["gdb", "info breakpoints"], "info breakpoints"),
+    (["gdb", "with", "print", "pretty", "--", "print", "g"], "with print pretty -- print g"),
+    (["gdb", "--", "with", "print", "pretty", "--", "print", "g"], "with print pretty -- print g"),
+    (["gdb", "--format", "json", "p", "g", "--"], "p g --"),
+])
+def test_gdb_unquoted_command_words_are_joined(monkeypatch, capsys, argv, command):
+    cap = _capture_send(monkeypatch, result={"output": ""})
+    assert pry.cli.main(argv) == 0
+    assert cap["params"]["command"] == command
+
+
+@pytest.mark.parametrize("argv, command", [
+    (["gdb", "--timeout", "3", "info", "-x"], "info -x"),
+    (["gdb", "--timeout", "3", "print", "-pretty", "--", "g"], "print -pretty -- g"),
+    (["gdb", "--timeout", "3", "frame", "apply", "all", "-q", "--", "p", "g"], "frame apply all -q -- p g"),
+])
+def test_gdb_dash_word_gets_quoted_fix(monkeypatch, capsys, argv, command):
+    cap = _capture_send(monkeypatch, result={"output": ""})
+    fixed = _suggested_run_command(capsys, argv)
+    assert cap == {}
+    assert pry.cli.main(fixed) == 0
+    assert cap["params"]["command"] == command
+    assert cap["params"]["_timeout"] == 3.0
 
 
 

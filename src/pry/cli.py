@@ -94,6 +94,7 @@ class PryArgumentParser(argparse.ArgumentParser):
         # An ambiguous prefix is left as an unknown token on strict parsers
         # and on the top-level parser, which on Python < 3.12 classifies the
         # subcommand's tokens too (`pry run --h` must reach the run hint).
+        # main() reports an ambiguous prefix given before the subcommand.
         if (self.strict_options or self.ambiguous_is_unknown) and len({t[0] for t in tuples}) > 1:
             return []
         return tuples
@@ -1832,23 +1833,26 @@ def _launch(args: argparse.Namespace) -> int:
     gdb_cmd.extend(["-ex", shell_off_ex, "-ex", keepalive_ex, "-ex", bridge_ex])
 
     gdb_extra = args.gdb_args or []
-    explicit_separator = "--" in getattr(args, "_raw_argv", [])
+    raw_argv = getattr(args, "_raw_argv", [])
     if gdb_extra and gdb_extra[0] == "--":
         gdb_extra = gdb_extra[1:]  # defensive: a second, literal `--`
-    elif gdb_extra and not explicit_separator:
-        # Without an explicit `--` separator, anything after the binary is
-        # forwarded to GDB. A pry option placed there (e.g.
-        # `pry launch ./bin --format json`) would silently leak to GDB and
-        # break the launch. Catch the common case with an actionable message.
-        launch_options = {
-            o for o in args._parser._option_string_actions if o.startswith("--")
-        }
-        first = gdb_extra[0].split("=", 1)[0]
-        if first in launch_options:
+    elif gdb_extra and raw_argv[-len(gdb_extra) - 1:-len(gdb_extra)] != ["--"]:
+        # argparse drops a `--` given right after the binary, hence the raw
+        # argv check. Without it, anything after the binary is forwarded to
+        # GDB. A pry option placed there (e.g. `pry launch ./bin --format
+        # json`) would silently leak to GDB and break the launch. Check every
+        # token up to a later `--` as argparse would match it: exact name,
+        # `--opt=value` or unambiguous prefix.
+        end = gdb_extra.index("--") if "--" in gdb_extra else len(gdb_extra)
+        for tok in gdb_extra[:end]:
+            action = _match_option(args._parser, tok) if tok.startswith("--") else None
+            if action is None:
+                continue
+            name = next(o for o in action.option_strings if o.startswith("--"))
             raise BridgeError(
-                f"'{gdb_extra[0]}' is a pry option but appears after the binary, "
+                f"'{tok}' is a pry option but appears after the binary, "
                 f"so it would be forwarded to GDB. Put pry options before the "
-                f"binary (e.g. `pry launch {first} ... <binary>`), or separate "
+                f"binary (e.g. `pry launch {name} ... <binary>`), or separate "
                 f"GDB args with `--` (e.g. `pry launch <binary> -- <gdb-args>`)."
             )
     gdb_cmd.extend(gdb_extra)
@@ -3124,7 +3128,7 @@ def _map_gdb_exec_result(command: str, result: Any) -> Any:
 
 
 def _gdb_exec(args: argparse.Namespace) -> int:
-    command = args.command
+    command = " ".join(args.command)
     timeout = getattr(args, "timeout", None)
     params: dict[str, Any] = {"command": command}
     if timeout is not None:
@@ -3873,7 +3877,12 @@ def build_parser() -> argparse.ArgumentParser:
     gdb_cmd = subparsers.add_parser("gdb", help="Execute a raw GDB command (supports pwndbg, custom scripts, etc.)")
     _common_io_options(gdb_cmd)
     _add_timeout_arg(gdb_cmd)
-    gdb_cmd.add_argument("command", help="GDB command to execute (e.g. 'kbase', 'info proc mappings')")
+    gdb_cmd.add_argument(
+        "command", nargs="+",
+        help="GDB command to execute, as one quoted argument or as its words "
+             "(e.g. 'kbase', info proc mappings); put it after `--` when a word "
+             "begins with '-'",
+    )
     gdb_cmd.set_defaults(handler=_gdb_exec)
 
     # --- kbase ---
@@ -3927,7 +3936,7 @@ def _match_option(parser: argparse.ArgumentParser, tok: str) -> argparse.Action 
     options = parser._option_string_actions
     name = tok.split("=", 1)[0]
     action = options.get(name)
-    if action is None and name.startswith("--"):
+    if action is None and name.startswith("--") and name != "--":
         matches = {options[o] for o in options if o.startswith(name)}
         action = matches.pop() if len(matches) == 1 else None
     return action
@@ -3951,100 +3960,197 @@ def _run_option_typos(run_parser: argparse.ArgumentParser, extras: list[str]) ->
     return typos
 
 
-def _split_before_run(
-    parser: argparse.ArgumentParser, raw_argv: list[str],
+def _subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices
+    return {}
+
+
+def _split_before_command(
+    parser: argparse.ArgumentParser, argv: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
-    """Split `raw_argv` into the known global tokens, the unknown tokens
-    before the `run` subcommand, and the tokens from `run` on."""
+    """Split `argv` into the options `parser` knows (with their values), the
+    unknown tokens before its subcommand, and the tokens from the subcommand on."""
+    choices = _subcommands(parser)
     head: list[str] = []
     unknown: list[str] = []
     i = 0
-    while i < len(raw_argv) and raw_argv[i] != "run":
-        tok = raw_argv[i]
+    while i < len(argv) and argv[i] not in choices:
+        tok = argv[i]
         action = _match_option(parser, tok)
         if action is None:
             unknown.append(tok)
         else:
             head.append(tok)
-            if action.nargs != 0 and "=" not in tok and i + 1 < len(raw_argv):
+            if action.nargs != 0 and "=" not in tok and i + 1 < len(argv):
                 i += 1
-                head.append(raw_argv[i])
+                head.append(argv[i])
         i += 1
-    return head, unknown, raw_argv[i:]
+    return head, unknown, argv[i:]
 
 
-def _run_extras_error(
+def _ambiguous_prefix_error(parser: argparse.ArgumentParser, tokens: list[str]) -> None:
+    """Report an ambiguous prefix of a top-level option given before the
+    subcommand, which the top-level parser itself leaves unknown."""
+    options = parser._option_string_actions
+    for tok in tokens:
+        name = tok.split("=", 1)[0]
+        if not name.startswith("--"):
+            continue
+        matches = [o for o in options if o.startswith(name)]
+        if len({options[o] for o in matches}) > 1:
+            parser.error(f"ambiguous option: {tok} could match {', '.join(matches)}")
+
+
+def _option_names(parser: argparse.ArgumentParser, tokens: list[str]) -> list[str] | None:
+    """Return the option names in `tokens` if all of them are options of
+    `parser`, each followed by its value when it takes one."""
+    names: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        action = _match_option(parser, tok)
+        if action is None:
+            return None
+        names.append(tok.split("=", 1)[0])
+        i += 1
+        if action.nargs != 0 and "=" not in tok:
+            if i == len(tokens):
+                return None
+            i += 1
+    return names
+
+
+def _misplaced_options(
+    parser: argparse.ArgumentParser, argv: list[str], carried: list[str] | None = None,
+) -> tuple[list[str], list[str], list[str], argparse.ArgumentParser] | None:
+    """Find options given before the subcommand that takes them.
+
+    Returns the command line with them moved behind that subcommand, their
+    names, the subcommand path and its parser; None when no subcommand on the
+    line takes them all.
+    """
+    head, before, rest = _split_before_command(parser, argv)
+    if not rest:
+        return None
+    child = _subcommands(parser)[rest[0]]
+    pending = [*(carried or []), *before]
+    names = _option_names(child, pending) if pending else None
+    if names:
+        return [*head, rest[0], *pending, *rest[1:]], names, [rest[0]], child
+    if not _subcommands(child):
+        return None
+    found = _misplaced_options(child, rest[1:], pending)
+    if found is None:
+        return None
+    fixed, names, path, taker = found
+    return [*head, rest[0], *fixed], names, [rest[0], *path], taker
+
+
+def _misplaced_message(names: list[str], command: str, fix: str) -> str:
+    one = len(names) == 1
+    return (
+        f"{', '.join(names)} {'is a' if one else 'are'} pry {command} "
+        f"option{'' if one else 's'}: put {'it' if one else 'them'} after "
+        f"`{command}`: {fix}"
+    )
+
+
+def _split_command_line(
+    parser: argparse.ArgumentParser,
+    command_parser: argparse.ArgumentParser,
+    argv: list[str],
+) -> tuple[list[str], list[str], list[str], list[str] | None]:
+    """Split a command line into the tokens up to the subcommand, the
+    subcommand's own options with their values, and its other tokens before
+    and after an explicit `--` (None without one), each in their order."""
+    head: list[str] = []
+    tokens = iter(argv)
+    for tok in tokens:
+        head.append(tok)
+        action = _match_option(parser, tok)
+        if action is None:
+            break  # the subcommand itself
+        if action.nargs != 0 and "=" not in tok:
+            head.extend(itertools.islice(tokens, 1))
+    opts: list[str] = []
+    loose: list[str] = []
+    for tok in tokens:
+        if tok == "--":
+            return head, opts, loose, list(tokens)
+        action = _match_option(command_parser, tok)
+        if action is None:
+            loose.append(tok)
+            continue
+        opts.append(tok)
+        if action.nargs != 0 and "=" not in tok:
+            opts.extend(itertools.islice(tokens, 1))
+    return head, opts, loose, None
+
+
+def _run_hint_error(
     parser: argparse.ArgumentParser,
     run_parser: argparse.ArgumentParser,
-    raw_argv: list[str],
-    extras: list[str],
+    argv: list[str],
+    moved: list[str] | None = None,
 ) -> NoReturn:
-    """Report leftover tokens of a `pry run` command line, with the fix."""
-    head, before, tail = _split_before_run(parser, raw_argv)
-    after = list(extras)
-    for tok in before:
-        if tok in after:
-            after.remove(tok)
-    if not all(_match_option(run_parser, tok) for tok in before):
-        parser.error(f"unrecognized arguments: {' '.join(extras)}")
-    typos = _run_option_typos(run_parser, after)
+    """Report a rejected `pry run` command line with a working rewrite.
+
+    `argv` already has the pry run options given before `run` (`moved`)
+    behind it. Every token after `run` that is not a pry run option is a
+    program argument and keeps its order, after a `--` when any begins
+    with '-'.
+    """
+    head, opts, loose, guarded = _split_command_line(parser, run_parser, argv)
+    typos = _run_option_typos(run_parser, loose)
     if typos:
         run_parser.error(
             f"unrecognized pry run options: {', '.join(typos)}. If these are "
             "program arguments, put them after a `--` sentinel"
         )
-    if before:
-        fixed = [*head, tail[0], *before, *tail[1:]]
-        fix = (
-            _run_sentinel_fix(parser, run_parser, fixed)
-            if after else shlex.join(["pry", *fixed])
-        )
-        names = ", ".join(tok.split("=", 1)[0] for tok in before)
-        run_parser.error(
-            f"{names} {'is a pry run option' if len(before) == 1 else 'are pry run options'}: "
-            f"put {'it' if len(before) == 1 else 'them'} after `run`: {fix}"
-        )
+    program = [*loose, *(guarded or [])]
+    sentinel = ["--"] if any(tok.startswith("-") for tok in program) else []
+    fix = shlex.join(["pry", *head, *opts, *sentinel, *program])
+    if moved:
+        run_parser.error(_misplaced_message(moved, "run", fix))
     run_parser.error(
-        f"unrecognized arguments: {' '.join(after)}. Program arguments "
-        "go after pry's own options, behind a `--` sentinel when any "
-        f"begins with '-': {_run_sentinel_fix(parser, run_parser, raw_argv)}"
+        f"program arguments {shlex.join(program)} go after pry's own options, "
+        f"behind a `--` sentinel when any begins with '-': {fix}"
     )
 
 
-def _run_sentinel_fix(
+def _gdb_command_words(
     parser: argparse.ArgumentParser,
-    run_parser: argparse.ArgumentParser,
-    raw_argv: list[str],
-) -> str:
-    """Rewrite a rejected `pry run` command line with program args after `--`.
+    gdb_parser: argparse.ArgumentParser,
+    argv: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Split a `pry gdb` command line into the tokens up to `gdb`, its pry
+    options, and the words of the GDB command.
 
-    Global options before the subcommand and tokens naming a `pry run` option
-    stay in front with their values; every other token after `run` is a
-    program argument and keeps its order.
+    A `--` before the first word separates pry's options from the command;
+    one after a word belongs to the GDB command (`with print pretty -- p x`).
+    argparse drops either, so the words are taken from the command line.
     """
-    head: list[str] = []
-    tokens = iter(raw_argv)
-    for tok in tokens:
-        head.append(tok)
-        action = _match_option(parser, tok)
-        if action is None:
-            break  # the `run` subcommand itself
-        if action.nargs != 0 and "=" not in tok:
-            head.extend(itertools.islice(tokens, 1))
-    pry_opts: list[str] = []
-    program: list[str] = []
-    for tok in tokens:
-        if tok == "--":
-            program.extend(tokens)
-            break
-        action = _match_option(run_parser, tok)
-        if action is None:
-            program.append(tok)
-            continue
-        pry_opts.append(tok)
-        if action.nargs != 0 and "=" not in tok:
-            pry_opts.extend(itertools.islice(tokens, 1))
-    return shlex.join(["pry", *head, *pry_opts, "--", *program])
+    head, opts, loose, guarded = _split_command_line(parser, gdb_parser, argv)
+    if guarded is None:
+        return head, opts, loose
+    return head, opts, [*loose, *(["--"] if loose else []), *guarded]
+
+
+def _gdb_hint_error(
+    parser: argparse.ArgumentParser,
+    gdb_parser: argparse.ArgumentParser,
+    argv: list[str],
+    extras: list[str],
+) -> NoReturn:
+    """Report a `pry gdb` command whose words argparse took as options."""
+    head, opts, words = _gdb_command_words(parser, gdb_parser, argv)
+    fix = shlex.join(["pry", *head, *opts, " ".join(words)])
+    gdb_parser.error(
+        f"unrecognized arguments: {' '.join(extras)}. Pass the GDB command as "
+        f"one quoted argument: {fix}"
+    )
 
 
 def _emit_error(args: argparse.Namespace, message: str) -> None:
@@ -4062,11 +4168,32 @@ def _emit_error(args: argparse.Namespace, message: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    args, extras = parser.parse_known_args(argv)
+    _, before, rest = _split_before_command(parser, raw_argv)
+    if "--" in before:
+        # A `--` before the subcommand separates nothing: drop it.
+        lead = raw_argv[: len(raw_argv) - len(rest)]
+        raw_argv = [*(tok for tok in lead if tok != "--"), *rest]
+        before = [tok for tok in before if tok != "--"]
+    _ambiguous_prefix_error(parser, before)
+    # Options of a subcommand given before it: argparse would reject them (or
+    # their value as the subcommand); name them and the fixed command instead.
+    misplaced = _misplaced_options(parser, raw_argv)
+    if misplaced is not None:
+        fixed, names, path, taker = misplaced
+        if taker.get_default("handler") is _run:
+            _run_hint_error(parser, taker, fixed, names)
+        taker.error(_misplaced_message(names, " ".join(path), shlex.join(["pry", *fixed])))
+    args, extras = parser.parse_known_args(raw_argv)
     if extras:
-        if getattr(args, "handler", None) is _run:
-            _run_extras_error(parser, args._parser, raw_argv, extras)
+        handler = getattr(args, "handler", None)
+        if not before and handler is _run:
+            _run_hint_error(parser, args._parser, raw_argv)
+        if not before and handler is _gdb_exec:
+            _gdb_hint_error(parser, args._parser, raw_argv, extras)
         parser.error(f"unrecognized arguments: {' '.join(extras)}")
+    if getattr(args, "handler", None) is _gdb_exec:
+        # argparse drops a GDB-level `--` from the words (`with ... -- p x`).
+        args.command = _gdb_command_words(parser, args._parser, raw_argv)[2]
     # argparse strips the first `--` separator, so by parse time we can no
     # longer tell `launch ./bin --format json` (a misplaced pry flag) from
     # `launch ./bin -- --format json` (a genuine GDB arg). Stash the raw argv
