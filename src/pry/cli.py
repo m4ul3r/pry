@@ -540,6 +540,15 @@ def _format_stop_reason(reason: Any) -> str | None:
     if kind == "held":
         return ("held (a caller stopped the target with `pry interrupt --hold`; "
                 "`pry continue --release` resumes it)")
+    if kind == "stale":
+        previous = _format_stop_reason(reason.get("previous")) or "the last stop reason"
+        where = reason.get("address") or "?"
+        number = (reason.get("previous") or {}).get("number", "?")
+        return (f"stale: {previous} no longer describes this stop, since the PC ({where}) is "
+                f"at none of breakpoint #{number}'s locations: the target ran without GDB "
+                "seeing it (a VM resumed outside the debugger, e.g. `qmu cont`, and halted "
+                "again). `pry resync` re-reads the state and re-arms the breakpoints; "
+                "`pry continue` resumes the target under GDB")
     return kind or None
 
 

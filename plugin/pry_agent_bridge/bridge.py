@@ -6,6 +6,7 @@ import bisect
 import contextlib
 import ctypes
 import errno
+import functools
 import json
 import os
 import re
@@ -107,6 +108,37 @@ READ_LOCKED_OPS = {
     "mappings",
     "display_list",
 }
+
+# Read-locked ops that always read the target's memory or registers. An
+# all-stop remote stub refuses every read while it runs, and GDB 15 aborts
+# when such a failed read unwinds through its disassembler (`disassemble`,
+# `x/i`): the bridge dies with it and every trap GDB inserted stays in target
+# memory (#111). So while such a target runs they are refused before they
+# reach GDB (GdbBridge._invoke_op), whichever GDB path they would take.
+TARGET_READ_OPS = {
+    "backtrace",
+    "frame_info",
+    "frame_select",
+    "frame_up",
+    "frame_down",
+    "locals",
+    "args",
+    "registers",
+    "memory_read",
+    "disasm",
+    "examine",
+}
+
+# CLI spelling of an op, for messages that name it.
+_OP_COMMANDS = {
+    "gdb_exec": "gdb", "list_threads": "threads", "list_inferiors": "inferior list",
+    "target_info": "info target", "register_write": "registers write",
+}
+
+
+def _op_command(op: str | None) -> str:
+    return _OP_COMMANDS.get(op or "", (op or "operation").replace("_", " "))
+
 
 EXEC_OPS = {
     "run",
@@ -505,6 +537,43 @@ def _elf_zero_based_percpu_sections(path: str) -> dict[str, int]:
         and s["name"].startswith(b".data..percpu")
         and s["addr"] < image_start
     }
+
+
+def _elf_init_percpu_sections(path: str) -> list[tuple[int, int, str]]:
+    """``(start, end, name)`` link ranges of the per-CPU sections linked
+    inside the image's init range (``__init_begin``..``__init_end``, #109).
+
+    x86-64 7.0 links ``.data..percpu`` there: it slides with the image, but
+    it is only the template each CPU's area is copied from at boot, and the
+    kernel frees init memory after boot. A plain read of a per-CPU symbol
+    then reads whatever owns those pages now. Cached per file version.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return []
+    return _elf_init_percpu_cached(path, stat.st_mtime_ns, stat.st_size)
+
+
+@functools.lru_cache(maxsize=8)
+def _elf_init_percpu_cached(path: str, _mtime: int, _size: int) -> list[tuple[int, int, str]]:
+    parsed = _elf_sections(path)
+    if parsed is None:
+        return []
+    percpu = [
+        s for s in parsed[1]
+        if s["flags"] & _ELF_SHF_ALLOC and s["name"].startswith(b".data..percpu") and s["size"]
+    ]
+    if not percpu:
+        return []  # no kernel image: spare the symbol table read
+    bounds = _elf_symbol_vaddrs(path, ("__init_begin", "__init_end"))
+    begin, end = bounds.get("__init_begin"), bounds.get("__init_end")
+    if begin is None or end is None:
+        return []
+    return [
+        (s["addr"], s["addr"] + s["size"], s["name"].decode("ascii", "replace"))
+        for s in percpu if s["addr"] < end and begin < s["addr"] + s["size"]
+    ]
 
 
 _ELF_SHT_SYMTAB = 2
@@ -1206,6 +1275,9 @@ def _parse_info_variables(output: str) -> list[dict[str, Any]]:
 # callback). Captured on first callback so a timed-out runaway can be
 # interrupted by injecting an async exception into that exact thread.
 _gdb_main_thread_ident: int | None = None
+# The holder of the callback running on GDB's main thread now (see
+# _run_on_gdb_thread): ``timed_out`` once its caller gave up on it.
+_gdb_call: dict[str, Any] | None = None
 
 
 class _AsyncTimeout(Exception):
@@ -1214,13 +1286,72 @@ class _AsyncTimeout(Exception):
     A regular Exception (not KeyboardInterrupt) so it is caught by the same
     ``except Exception`` paths as any other op error and reported cleanly,
     rather than escaping into the socket server and dropping the connection.
+    An op's own handler that swallows it raises it again through
+    :func:`_raise_if_remote_lost`, until :func:`_timeout_handled`.
     """
 
     def __str__(self) -> str:
-        return (
-            "operation exceeded its timeout and was interrupted "
-            "(a runaway loop in `py exec`?)"
-        )
+        return "operation exceeded its timeout and was interrupted"
+
+
+class OpTimeout(RuntimeError):
+    """An op outran its ``--timeout``: the message names it, its budget and
+    how far it got (:func:`_op_timeout_message`)."""
+
+
+def _raise_if_timed_out() -> None:
+    """GDB thread: raise again a timeout the running op swallowed."""
+    call = _gdb_call
+    if (call is not None and call.get("timed_out") and not call.get("timeout_handled")
+            and threading.get_ident() == _gdb_main_thread_ident):
+        raise _AsyncTimeout()
+
+
+def _timeout_handled() -> None:
+    """GDB thread: the running op has answered its timeout; stop raising it."""
+    if _gdb_call is not None:
+        _gdb_call["timeout_handled"] = True
+
+
+def _op_timeout_message(progress: dict[str, Any], *, stuck: bool) -> str:
+    """Why an op came back without its answer: which op, its budget, and the
+    state it left (*progress*, recorded by ``GdbBridge._progress``).
+
+    *stuck*: it did not return within the grace after it was interrupted
+    (GDB's C code does not see the interrupt until it returns to Python).
+    """
+    op = progress.get("op")
+    budget = progress.get("timeout")
+    name = f"`pry {_op_command(op)}`"
+    text = f"{name} did not finish within its {budget:g} s timeout" if budget else f"{name} timed out"
+    if not progress.get("started"):
+        return (f"{text}: it never started, because GDB's main thread was still busy with "
+                "earlier work, so it changed nothing")
+    if stuck:
+        text += (f" and is still running inside GDB: it did not return within "
+                 f"{_TIMEOUT_GRACE:g} s of being interrupted, so its answer is lost and the "
+                 "bridge takes the next command once GDB returns")
+    else:
+        text += " and was interrupted"
+    phase = progress.get("phase")
+    if phase:
+        current = phase
+        if phase == _RESYNC_SCAN and progress.get("scan_total"):
+            current += (f" ({progress.get('scan_read', 0) / 2**20:.1f} of "
+                        f"{progress['scan_total'] / 2**20:.1f} MiB read)")
+        text += f" during the {current}"
+        done = progress.get("done") or []
+        rest = [step for step in progress.get("plan") or [] if step != phase and step not in done]
+        if done:
+            text += f"; done: {', '.join(done)}"
+        if rest:
+            text += f"; not done: {', '.join(rest)}"
+    if op == "resync" and not stuck:
+        text += (". The report it would have given is lost: rerun `pry resync` with a "
+                 "longer `--timeout` (or none)")
+    elif op == "py_exec" and not stuck:
+        text += " (a runaway loop in the script?)"
+    return text
 
 
 def _async_raise(thread_ident: int | None, exc_type: type) -> bool:
@@ -1244,19 +1375,32 @@ def _async_raise(thread_ident: int | None, exc_type: type) -> bool:
     return res == 1
 
 
-def _run_on_gdb_thread(func, *, timeout: float = 120.0):
-    """Execute *func* on GDB's main thread via gdb.post_event and wait."""
+# How long a timed-out callback gets to unwind after it is interrupted.
+_TIMEOUT_GRACE = 5.0
+
+
+def _run_on_gdb_thread(func, *, timeout: float = 120.0, progress: dict[str, Any] | None = None):
+    """Execute *func* on GDB's main thread via gdb.post_event and wait.
+
+    *progress*: an op's ``{"op", "timeout", ...}`` record, for the
+    :class:`OpTimeout` message when it outruns *timeout*.
+    """
     holder: dict[str, Any] = {}
     event = threading.Event()
 
     def _callback():
-        global _gdb_main_thread_ident
+        global _gdb_main_thread_ident, _gdb_call
         _gdb_main_thread_ident = threading.get_ident()
+        outer, _gdb_call = _gdb_call, holder
         try:
+            if holder.get("timed_out"):
+                raise _AsyncTimeout()  # its caller gave up before it started
             holder["result"] = func()
         except BaseException as exc:  # noqa: BLE001 — also catch injected _AsyncTimeout
             holder["error"] = exc
             holder["traceback"] = traceback.format_exc()
+        finally:
+            _gdb_call = outer
         event.set()
 
     gdb.post_event(_callback)
@@ -1264,15 +1408,23 @@ def _run_on_gdb_thread(func, *, timeout: float = 120.0):
         # The callback is still running on GDB's main thread and would wedge
         # the bridge indefinitely (e.g. an infinite loop in `py exec`). Try to
         # break a runaway Python loop, then give it a short grace period to
-        # unwind so the bridge stays responsive for subsequent commands.
-        _async_raise(_gdb_main_thread_ident, _AsyncTimeout)
-        if not event.wait(timeout=5.0):
+        # unwind so the bridge stays responsive for subsequent commands. One
+        # that has not started yet does not run at all; whatever else runs
+        # on GDB's thread meanwhile is not interrupted.
+        holder["timed_out"] = True
+        if _gdb_call is holder:
+            _async_raise(_gdb_main_thread_ident, _AsyncTimeout)
+        if not event.wait(timeout=_TIMEOUT_GRACE):
+            if progress is not None:
+                raise OpTimeout(_op_timeout_message(progress, stuck=True))
             raise RuntimeError(
                 f"Timed out waiting for GDB main thread after {timeout:.0f}s "
                 "(the operation may still be running in GDB)"
             )
 
     if "error" in holder:
+        if isinstance(holder["error"], _AsyncTimeout) and progress is not None:
+            raise OpTimeout(_op_timeout_message(progress, stuck=False))
         raise holder["error"]
     return holder.get("result")
 
@@ -1342,7 +1494,9 @@ def _raise_if_remote_lost(bridge=None):
     failure is different: swallowing it can leave a Frame whose next method
     aborts GDB itself, so fallback handlers must propagate that terminal state.
     The module singleton covers shared serializers and static value helpers.
+    A timeout the swallowing handler caught is raised again, too.
     """
+    _raise_if_timed_out()
     if bridge is None:
         bridge = _bridge
     if bridge is None:
@@ -1588,6 +1742,16 @@ def _restored_note(traps: list[dict[str, Any]]) -> str:
 _NOT_ARMED = ("pending", "unreadable", "insert-failed", "not-resident")
 
 
+# resync's steps, as a timeout message names them (GdbBridge._progress).
+_RESYNC_FLUSH = "drop of the stale stop state and caches"
+_RESYNC_SYMBOLS = "symbol reload at the new base"
+_RESYNC_REREAD = "re-read of rebased symbol files"
+_RESYNC_WATCH = "watchpoint re-read"
+_RESYNC_SITES = "breakpoint-site check"
+_RESYNC_SCAN = "stray-trap scan"
+_RESYNC_ARM = "breakpoint re-arm and read-back"
+
+
 def _resync_summary(entries: list[dict[str, Any]], strays: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "breakpoints": len(entries),
@@ -1628,6 +1792,21 @@ def _mark_locations_pending(bp: dict[str, Any], pending: set[tuple[int, int]]) -
         bp["pending"] = True
         for key in ("address", "file", "line"):
             bp.pop(key, None)
+
+
+_RAW_LOCATION_RE = re.compile(r"^\*\s*(0[xX][0-9a-fA-F]+|[0-9]+)\s*$")
+
+
+def _raw_location_address(bp) -> int | None:
+    """The address of a code breakpoint set at a literal ``*ADDR``, else None.
+
+    GDB re-evaluates a ``*EXPR`` that names symbols when they move; a bare
+    number stays where it is (#112).
+    """
+    if _bp_kind(bp.type) not in ("breakpoint", "hw-breakpoint"):
+        return None
+    match = _RAW_LOCATION_RE.match(str(getattr(bp, "location", None) or ""))
+    return int(match.group(1), 0) & _ADDR_MASK if match else None
 
 
 def _raw_command_leaves_target_alone(command: str) -> bool:
@@ -1743,6 +1922,12 @@ class GdbBridge:
         # stop: resync arms them there for the resume that follows. Any other
         # stop has them out (GDB removes them), unless always-inserted is on.
         self._breakpoints_held = False
+        # How far the op running on GDB's thread got (GdbBridge._progress),
+        # for the message of a timeout that stops it.
+        self._op_progress: dict[str, Any] = {}
+        # Raw-address breakpoint number -> {"path", "slide"}: the slide of the
+        # symbol file it lies in, from before pry first moved that file.
+        self._raw_bp_slides: dict[int, dict[str, Any]] = {}
         gdb.events.stop.connect(self._on_stop)
         if hasattr(gdb.events, "exited"):
             gdb.events.exited.connect(self._on_exited)
@@ -1871,6 +2056,11 @@ class GdbBridge:
         self._has_run = True
         self._has_exited = False
         self._inactive_reason = None
+        # The thread the stop selected: a breakpoint hit is checked against its
+        # PC later (#100), not against another thread selected since.
+        self._stop_thread = None
+        with contextlib.suppress(Exception):
+            self._stop_thread = gdb.selected_thread().num
         reason = {"kind": "step"}
         if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
             if event.breakpoints:
@@ -2143,14 +2333,35 @@ class GdbBridge:
                 lock = self._lock.write()
             elif op in READ_LOCKED_OPS:
                 lock = self._lock.read()
+            progress = {"op": op, "timeout": gdb_timeout}
             with lock:
-                return _run_on_gdb_thread(lambda: self._invoke_op(op, params), timeout=gdb_timeout)
+                return _run_on_gdb_thread(
+                    lambda: self._invoke_op(op, params, progress), timeout=gdb_timeout,
+                    progress=progress,
+                )
         except Exception as exc:
             return _json_response(ok=False, error=self._augment_error(exc))
 
-    def _invoke_op(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Run one op on GDB's thread and wrap its result or error."""
+    def _invoke_op(
+        self, op: str, params: dict[str, Any], progress: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Run one op on GDB's thread and wrap its result or error.
+
+        *progress* (``{"op", "timeout"}``) is where the op records how far it
+        got (:meth:`_progress`), for the message of a timeout that stops it.
+        """
+        progress = progress if progress is not None else {"op": op}
+        progress["started"] = True
+        self._op_progress = progress
         try:
+            if op in TARGET_READ_OPS and self._remote_target_running():
+                raise RuntimeError(
+                    f"`pry {_op_command(op)}` reads target memory or registers, which the "
+                    "running all-stop remote target cannot serve, so it was not run: GDB "
+                    "aborts when such a read fails in its disassembler, taking pry's bridge "
+                    "with it and leaving its breakpoints' traps in target memory (the "
+                    "inferior is running — `pry interrupt` (or `pry wait`) first)"
+                )
             if op in READ_LOCKED_OPS or op in {
                 "register_write", "thread_select", "call", "display_add", "py_exec", "kbase",
             }:
@@ -2160,8 +2371,21 @@ class GdbBridge:
             if self._remote_failure and op in READ_LOCKED_OPS:
                 raise RuntimeError(self._remote_failure)
             return _json_response(ok=True, result=result)
+        except _AsyncTimeout:
+            _timeout_handled()
+            return self._error_response(OpTimeout(_op_timeout_message(progress, stuck=False)))
         except Exception as exc:
             return self._error_response(exc)
+        finally:
+            self._op_progress = {}
+
+    def _progress(self, phase: str, **details: Any) -> None:
+        """GDB thread: the running op reached *phase* (a timeout message names it)."""
+        progress = self._op_progress
+        if progress.get("phase") and progress["phase"] != phase:
+            progress.setdefault("done", []).append(progress["phase"])
+        progress["phase"] = phase
+        progress.update(details)
 
     def _dispatch_breakpoint_op(
         self, op: str, params: dict[str, Any], gdb_timeout: float
@@ -2182,15 +2406,17 @@ class GdbBridge:
                     "_was_running": pause is not None,
                     "_will_resume": pause is not None and pause["resume"],
                 }
+            progress = {"op": op, "timeout": gdb_timeout}
             try:
                 response = _run_on_gdb_thread(
-                    lambda: self._invoke_op(op, params), timeout=gdb_timeout
+                    lambda: self._invoke_op(op, params, progress), timeout=gdb_timeout,
+                    progress=progress,
                 )
             except BaseException as exc:
                 if pause is None:
                     raise
                 pause["settled"].set()
-                raise RuntimeError(
+                raise (OpTimeout if isinstance(exc, OpTimeout) else RuntimeError)(
                     f"{exc} (the target was interrupted to apply this change "
                     "and has been left stopped)"
                 ) from exc
@@ -2529,7 +2755,9 @@ class GdbBridge:
             "the program has no registers now.",
         ):
             hint = _state_hint()
-        elif "selected thread is running" in low:
+        elif "selected thread is running" in low or low.startswith(
+            "cannot execute this command while the target is running"
+        ):
             hint = "the inferior is running — `pry interrupt` (or `pry wait`) first"
         elif re.match(r'^no symbol ".*" in current context\.$', low):
             hint = (
@@ -2878,10 +3106,45 @@ class GdbBridge:
         result = _stop_info()
         result["state"] = result["status"]
         if self._last_stop_reason:
+            if result["state"] == "stopped":
+                self._last_stop_reason = self._stale_hit(self._last_stop_reason) or self._last_stop_reason
             result["reason"] = self._last_stop_reason
         if self._displays and result["state"] == "stopped":
             result["displays"] = self._eval_displays()
         return result
+
+    def _stale_hit(self, reason: dict[str, Any]) -> dict[str, Any] | None:
+        """GDB thread, at a stop: the ``stale`` reason replacing a breakpoint
+        hit the frame no longer matches, else None (#100).
+
+        GDB leaves the PC at the breakpoint's address (x86, arm64). Once the
+        stop thread's PC is at none of the breakpoint's locations, the target
+        ran without GDB seeing it: a VM resumed outside it (`qmu cont`) and
+        halted again by the next packet GDB sent. A breakpoint since deleted,
+        or another thread selected since, says nothing either way.
+        """
+        if reason.get("kind") != "breakpoint-hit":
+            return None
+        bp = next((b for b in gdb.breakpoints() or [] if b.number == reason.get("number")), None)
+        if bp is None or _bp_kind(bp.type) not in ("breakpoint", "hw-breakpoint"):
+            return None
+        addresses = {
+            int(loc.address) & _ADDR_MASK for loc in getattr(bp, "locations", None) or []
+            if getattr(loc, "address", None) is not None
+        }
+        if not addresses:
+            return None
+        try:
+            thread = gdb.selected_thread()
+            if thread is None or thread.num != getattr(self, "_stop_thread", thread.num):
+                return None
+            pc = int(gdb.newest_frame().pc()) & _ADDR_MASK
+        except Exception:
+            _raise_if_remote_lost(self)
+            return None
+        if pc in addresses:
+            return None
+        return {"kind": "stale", "previous": reason, "address": hex(pc)}
 
     def _dispatch_status(self) -> dict[str, Any]:
         """Running status needs no GDB call; all stopped reads use its thread."""
@@ -2943,7 +3206,22 @@ class GdbBridge:
             # Keep the terminal response until a new execution replaces it:
             # both late waiters and waiters already holding this job see the
             # same result.
-            return job["response"]
+            return self._unless_stale(job["response"])
+
+    def _unless_stale(self, response: dict[str, Any]) -> dict[str, Any]:
+        """A finished execution's breakpoint-hit answer, or the current stop
+        when that hit no longer matches the frame (#100)."""
+        result = response.get("result") if response.get("ok") else None
+        if (self._running or not isinstance(result, dict)
+                or (result.get("reason") or {}).get("kind") != "breakpoint-hit"):
+            return response
+        try:
+            state = _run_on_gdb_thread(self._execution_state)
+        except Exception:
+            return response  # the stop cannot be re-read: the answer stands as it was
+        if (state.get("reason") or {}).get("kind") != "stale":
+            return response
+        return _json_response(ok=True, result=state)
 
     def _dispatch_exec(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
         exec_timeout: float = params.pop("_timeout", 120.0)
@@ -3936,6 +4214,7 @@ class GdbBridge:
             # of the same file (a slid `load`, `kbase` rebase or raw command)
             # would stay beside it and names would resolve to two addresses.
             # Drop those copies so the link-time table is the only one.
+            self._stamp_raw_breakpoints(os.path.realpath(path))
             enabled = [bp for bp in (gdb.breakpoints() or []) if bp.enabled]
             removed = False
             try:
@@ -4012,6 +4291,7 @@ class GdbBridge:
         # and GDB disables any breakpoint it fails to re-resolve then; keep the
         # ones the user had enabled enabled.
         real = os.path.realpath(path)
+        self._stamp_raw_breakpoints(real)
         enabled = [bp for bp in (gdb.breakpoints() or []) if bp.enabled]
         with contextlib.suppress(gdb.error):
             gdb.execute(f"remove-symbol-file {path}", to_string=True)
@@ -4036,6 +4316,27 @@ class GdbBridge:
         self._symbol_file = path
         dropped = [name for name in dict.fromkeys(others) if not self._file_is_loaded(name)]
         return list(unslid), dropped
+
+    def _stamp_raw_breakpoints(self, real: str) -> None:
+        """GDB thread, before symbol file *real* (a realpath) moves: remember
+        its slide under each raw-address breakpoint inside it (#112).
+
+        A ``*0x…`` location is an absolute address: no rebase moves it. A
+        later resync that finds it unreadable names where the same
+        instruction is at the slide the file has then. Only the first slide
+        is kept, the one the breakpoint was set under.
+        """
+        if not self._file_is_loaded(real):
+            return
+        slide = self._elf_slide(real)
+        if slide is None:
+            return
+        for bp in gdb.breakpoints() or []:
+            addr = _raw_location_address(bp)
+            if addr is None or bp.number in self._raw_bp_slides:
+                continue
+            if _elf_file_bytes(real, (addr - slide) & _ADDR_MASK, 1) is not None:
+                self._raw_bp_slides[bp.number] = {"path": real, "slide": slide}
 
     @staticmethod
     def _add_symbol_file(path: str, slide_int: int) -> dict[str, int]:
@@ -4788,6 +5089,7 @@ class GdbBridge:
         for offset in range(0, size, _SCAN_CHUNK):
             length = min(_SCAN_CHUNK, size - offset)
             data = read(start + offset, length)
+            self._op_progress["scan_read"] = self._op_progress.get("scan_read", 0) + length
             if data is not None:
                 keep(offset, data)
                 continue
@@ -4947,6 +5249,7 @@ class GdbBridge:
         scan: dict[str, Any] = {
             "files": sorted({region["path"] for region in regions}), "bytes": 0, "unreadable": 0,
         }
+        self._op_progress["scan_total"] = sum(len(region["code"]) for region in regions)
         for region in regions:
             start, elf = region["start"], region["code"]
             runs, unreadable = self._read_code(start, len(elf))
@@ -5201,13 +5504,20 @@ class GdbBridge:
             job = self._background_job
             if job is not None and job["completion"].is_set() and not self._paused(job):
                 self._background_job = None
+        base = params.get("base")
+        reread = base is None and bool(_pending_locations()) and bool(self._symbol_loads)
+        self._progress(_RESYNC_FLUSH, plan=[
+            _RESYNC_FLUSH, *([_RESYNC_SYMBOLS] if base is not None else []),
+            *([_RESYNC_REREAD] if reread else []),
+            _RESYNC_WATCH, _RESYNC_SITES, _RESYNC_SCAN, _RESYNC_ARM,
+        ])
         for command in ("maintenance flush register-cache", "maintenance flush dcache"):
             with contextlib.suppress(gdb.error):
                 gdb.execute(command, to_string=True)
 
         result: dict[str, Any] = {"resynced": True}
-        base = params.get("base")
         if base is not None:
+            self._progress(_RESYNC_SYMBOLS)
             path = params.get("symbols")
             if not path:
                 # The loaded kernel image, as kbase picks it (#105): `pry load
@@ -5221,23 +5531,28 @@ class GdbBridge:
             if not path:
                 raise ValueError("no symbol file to reload at the new base; pass --symbols PATH")
             result["symbols"] = self._load_symbols({"path": path, "base": base})
-        elif _pending_locations() and self._symbol_loads:
+        elif reread:
             # GDB never retries a location it failed to insert in a rebased
             # objfile; re-reading the file at the same slide re-resolves it.
+            self._progress(_RESYNC_REREAD)
             result["reloaded"] = []
             for record in list(self._symbol_loads.values()):
                 self._add_symbols_at(record["path"], record["slide"])
                 result["reloaded"].append(record["path"])
 
+        self._progress(_RESYNC_WATCH)
         watched = self._reread_watchpoints()
+        self._progress(_RESYNC_SITES)
         bps = list(gdb.breakpoints() or [])
         sites = {s["location"]: s for s in self._trap_sites(bps, repair=True, skip=_pending_locations())}
         unreadable = {
             tuple(int(p) for p in loc.split(".")) for loc, s in sites.items() if not s["readable"]
         }
+        self._progress(_RESYNC_SCAN)
         result["stray_traps"], result["scan"] = self._stray_traps(
             {int(s["address"], 16) for s in sites.values()}, stop_at
         )
+        self._progress(_RESYNC_ARM)
         verify = self._verify_insertion(bps, unreadable, keep_inserted=will_resume)
         result["breakpoints"] = self._resync_entries(bps, sites, verify, watched)
         result["summary"] = _resync_summary(result["breakpoints"], result["stray_traps"])
@@ -5339,10 +5654,14 @@ class GdbBridge:
                                        "reload the symbols (resync --base) or set it again")
                 elif site and not site["readable"]:
                     entry["status"] = "unreadable"
-                    entry["detail"] = ("target memory at this address cannot be read, so "
-                                       "no trap can be placed there: the code moved (KASLR "
-                                       "re-slid on a reset or reboot: resync --base) or is "
-                                       "not mapped yet")
+                    raw = _raw_location_address(bp)
+                    if raw is None:
+                        entry["detail"] = ("target memory at this address cannot be read, so "
+                                           "no trap can be placed there: the code moved (KASLR "
+                                           "re-slid on a reset or reboot: resync --base) or is "
+                                           "not mapped yet")
+                    else:
+                        entry.update(self._raw_unreadable(bp, raw))
                 elif bp.number in verify["errors"]:
                     entry["status"] = "insert-failed"
                     entry["detail"] = verify["errors"][bp.number]
@@ -5363,6 +5682,39 @@ class GdbBridge:
                     entry["reseated"] = True
                 entries.append(entry)
         return entries
+
+    def _raw_unreadable(self, bp, addr: int) -> dict[str, Any]:
+        """``detail`` (and ``rebased_address``) for an unreadable breakpoint
+        set at the raw address *addr* (#112).
+
+        A raw address does not follow a rebase, so `resync --base` cannot
+        move it. When pry moved the symbol file it lay in since it was set,
+        the same instruction is now at ``addr - previous slide + current slide``.
+        """
+        text = (f"target memory at this address cannot be read, so no trap can be placed "
+                f"there. It was set at the raw address `{bp.location}`, which does not "
+                "follow a rebase: reloading the symbols (`resync --base`) cannot move it")
+        stamp = self._raw_bp_slides.get(bp.number)
+        now = self._elf_slide(stamp["path"]) if stamp and self._file_is_loaded(stamp["path"]) else None
+        if stamp is None or now is None or now == stamp["slide"]:
+            return {"detail": text + (
+                ". If the code moved (KASLR re-slid on a reset or reboot), delete it and set "
+                "it at the new address (once `pry kbase` has rebased the kernel's symbols, "
+                "the next `pry resync` names it); otherwise it is not mapped yet"
+            )}
+        moved = (addr - stamp["slide"] + now) & _ADDR_MASK
+        label = self._symbolize(moved)
+        flags = " --hardware" if _bp_kind(bp.type) == "hw-breakpoint" else ""
+        if bp.temporary:
+            flags += " --temporary"
+        if getattr(bp, "condition", None):
+            flags += f" --condition {shlex.quote(bp.condition)}"
+        return {"rebased_address": hex(moved), "detail": text + (
+            f". pry has moved {os.path.basename(stamp['path'])} from slide "
+            f"{stamp['slide']:#x} to {now:#x} since it was set, so the same instruction "
+            f"is now at {moved:#x}{f' ({label})' if label else ''}: `pry break delete "
+            f"{bp.number}` and `pry break set '*{moved:#x}'{flags}`"
+        )}
 
     # ------------------------------------------------------------------
     # Inspection
@@ -5567,7 +5919,40 @@ class GdbBridge:
                 "no live inferior — value read from the static binary image, "
                 "not live memory"
             )
+        else:
+            section = self._freed_percpu_template(val)
+            if section is not None:
+                result["note"] = (
+                    f"this reads the {section} template the image links inside its init "
+                    "memory (x86-64 7.0 and later), which the kernel frees after boot: the "
+                    "value is whatever owns those pages now, not a CPU's. Read a CPU's copy "
+                    "as `*(TYPE *)($gs_base + (unsigned long)&VAR)` (the CPU stopped in the "
+                    "kernel) or `*(TYPE *)(__per_cpu_offset[CPU] + (unsigned long)&VAR)`"
+                )
         return result
+
+    def _freed_percpu_template(self, val) -> str | None:
+        """GDB thread: the per-CPU section inside a loaded kernel image's
+        init range that the lvalue *val* lies in, or None (#109)."""
+        try:
+            address = val.address
+            if address is None:
+                return None
+            addr = int(address) & _ADDR_MASK
+            objfile = gdb.current_progspace().objfile_for_address(addr)
+        except Exception:
+            _raise_if_remote_lost(self)
+            return None
+        path = getattr(objfile, "filename", None) if objfile is not None else None
+        if not path or not os.path.isfile(path):
+            return None
+        real = os.path.realpath(path)
+        slide = self._elf_slide(real)
+        if slide is None:
+            return None
+        link = (addr - slide) & _ADDR_MASK
+        return next((name for start, end, name in _elf_init_percpu_sections(real)
+                     if start <= link < end), None)
 
     def _call(self, params: dict[str, Any]) -> dict[str, Any]:
         # Call an inferior function and return its value. GDB's `call` is just
@@ -6589,6 +6974,8 @@ class GdbBridge:
         try:
             sys.stdout = captured
             exec(code, exec_globals)
+        except _AsyncTimeout:
+            raise  # its --timeout ran out: _invoke_op names the op
         except Exception as exc:
             # Surface the full traceback (file/line of the failing user code),
             # not just "Type: message" — multi-line scripts are otherwise very

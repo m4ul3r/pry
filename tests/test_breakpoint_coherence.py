@@ -9,7 +9,7 @@ import types
 import pytest
 
 import pry.cli
-from tests.test_bridge import _ALLOC, _EXEC, _WRITE, _load_bridge, _write_kernel_elf
+from tests.test_bridge import _ALLOC, _EXEC, _WRITE, _load_bridge, _objfile_table, _write_kernel_elf
 
 TRAP_SITE = 0xFFFFFFFF810881D0
 # `mov 0x70(%rdi),%rdi; jmp ...` as the ELF has it at the breakpoint site.
@@ -625,6 +625,7 @@ def test_nothing_resumes_a_held_target_but_its_release(monkeypatch):
     _Bp(stub, 1, TRAP_SITE)
     _resume_like_gdb(fake_gdb, stub)
     bridge._last_stop_reason = {"kind": "breakpoint-hit", "number": 1}
+    fake_gdb.selected_frame()._pc = TRAP_SITE  # GDB leaves the PC at the breakpoint
 
     held = bridge.dispatch({"op": "hold", "params": {}})["result"]
 
@@ -1326,6 +1327,162 @@ def test_resync_cli_sends_base_and_symbols(monkeypatch, tmp_path):
 def test_resync_cli_rejects_symbols_without_base(monkeypatch):
     monkeypatch.setattr(pry.cli, "send_request", lambda *a, **k: pytest.fail("sent"))
     assert pry.cli.main(["resync", "--symbols", "/x/vmlinux"]) == 1
+
+
+def test_resync_names_where_a_raw_address_breakpoint_went_after_a_rebase(monkeypatch, tmp_path):
+    """#112: `*ADDR` does not follow a rebase. Once pry moved the kernel image
+    under it, the address of the same instruction is old - previous slide +
+    current slide; a symbol location, or one set after the move, gets none."""
+    link, old_slide, new_slide = 0xFFFFFFFF81000000, 0xBE00000, 0x23200000
+    old = link + 0x1C4 + old_slide
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    vmlinux = tmp_path / "vmlinux"
+    _write_kernel_elf(vmlinux, symbols={"_text": link}, sections=[
+        (".text", _ALLOC | _EXEC, link, bytes(0x1000)),
+    ])
+    _objfile_table(fake_gdb, str(vmlinux))
+    bridge._dispatch_op("load", {"path": str(vmlinux), "slide": hex(old_slide)})
+    raw = _Bp(stub, 1, old)
+    raw.location = f"*{old:#x}"
+    _Bp(stub, 2, old)  # resolves through a symbol
+    # The reset re-slid KASLR: `pry kbase` rebases the image.
+    bridge._dispatch_op("load", {"path": str(vmlinux), "slide": hex(new_slide)})
+    late = _Bp(stub, 3, old)
+    late.location = f"*{old:#x}"
+
+    result = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    entries = {e["number"]: e for e in result["breakpoints"]}
+    assert [entries[n]["status"] for n in (1, 2, 3)] == ["unreadable"] * 3
+    assert entries[1]["rebased_address"] == hex(old - old_slide + new_slide)
+    assert "rebased_address" not in entries[2]
+    assert "rebased_address" not in entries[3]
+
+
+def test_a_breakpoint_hit_the_frame_no_longer_matches_is_reported_stale(monkeypatch):
+    """#100: the VM ran outside GDB (`qmu cont`) and was halted again; GDB's
+    PC is at none of breakpoint 1's locations, so the hit is not current."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    hit = _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([hit]))
+    assert bridge.dispatch({"op": "wait", "params": {}})["result"]["reason"]["kind"] == "breakpoint-hit"
+    assert bridge.dispatch({"op": "status"})["result"]["reason"]["kind"] == "breakpoint-hit"
+
+    fake_gdb.selected_frame()._pc = 0xFFFFFFFF8102FA89  # amd_e400_idle
+
+    for op in ("status", "wait"):
+        reason = bridge.dispatch({"op": op, "params": {}})["result"]["reason"]
+        assert reason["kind"] == "stale", op
+        assert reason["previous"]["number"] == 1
+        assert reason["address"] == "0xffffffff8102fa89"
+
+
+@pytest.mark.parametrize("op, params, command", [
+    ("disasm", {"location": "__x64_sys_syncfs", "count": 3}, "x/"),
+    ("disasm", {"start": hex(TRAP_SITE), "end": hex(TRAP_SITE + 16)}, "disassemble"),
+    ("examine", {"address": hex(TRAP_SITE), "spec": "3i"}, "x/"),
+    ("memory_read", {"address": hex(TRAP_SITE), "length": 8}, None),
+    ("backtrace", {}, None),
+])
+def test_reads_of_a_running_remote_target_never_reach_gdb(monkeypatch, op, params, command):
+    """#111: GDB 15 aborts when a read of a running all-stop stub fails in its
+    disassembler; the bridge dies and its traps stay in guest memory."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    fake_gdb._execute_log.clear()
+    reads = []
+    inferior = fake_gdb.selected_inferior()
+    read_memory = inferior.read_memory
+    inferior.read_memory = lambda addr, length: reads.append(addr) or read_memory(addr, length)
+    frames = []
+    monkeypatch.setattr(fake_gdb, "newest_frame", lambda: frames.append(1))
+    monkeypatch.setattr(fake_gdb, "selected_frame", lambda: frames.append(1))
+
+    response = bridge.dispatch({"op": op, "params": params})
+
+    assert response["ok"] is False
+    assert "pry interrupt" in response["error"]
+    assert reads == [] and frames == []
+    assert not any(c.startswith(("x/", "disassemble")) for c in fake_gdb._execute_log)
+    # Still running, its traps still GDB's.
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "running"
+
+
+def _gdb_thread(fake_gdb):
+    """Run posted callbacks on a thread of their own, as GDB's main thread does."""
+    import queue
+
+    callbacks = queue.Queue()
+    fake_gdb.post_event = callbacks.put
+
+    def serve():
+        while True:
+            callback = callbacks.get()
+            if callback is None:
+                return
+            callback()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return lambda: callbacks.put(None)
+
+
+def test_a_resync_that_outruns_its_timeout_says_how_far_it_got(monkeypatch):
+    """#110: a slow stray-trap scan, not a `py exec` runaway. The scan swallows
+    each failed read; the timeout still ends it at once."""
+    import time
+
+    bridge_mod, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    region = 0xFFFFFFFF90000000
+    monkeypatch.setattr(bridge, "_code_regions", lambda: [{
+        "path": "/k/vmlinux", "start": region, "code": bytes(16 << 20), "anchors": [], "mode64": True,
+    }])
+    inferior = fake_gdb.selected_inferior()
+    read_memory = inferior.read_memory
+
+    def slow_read(addr, length):
+        if addr >= region:
+            time.sleep(0.002)
+        return read_memory(addr, length)
+
+    inferior.read_memory = slow_read
+    stop = _gdb_thread(fake_gdb)
+    try:
+        started = time.monotonic()
+        response = bridge.dispatch({"op": "resync", "params": {"_timeout": 0.5}})
+        elapsed = time.monotonic() - started
+    finally:
+        stop()
+
+    assert response["ok"] is False
+    error = response["error"]
+    assert error.startswith("OpTimeout:") and "resync" in error
+    assert "py exec" not in error
+    done, _, not_done = error.partition("not done:")
+    assert bridge_mod._RESYNC_SCAN in done  # the step it was in
+    assert bridge_mod._RESYNC_ARM in not_done
+    assert elapsed < bridge_mod._TIMEOUT_GRACE  # it did not run on behind the timeout
+
+
+def test_an_op_stuck_in_gdb_past_the_grace_names_itself(monkeypatch):
+    import time
+
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge_mod, "_TIMEOUT_GRACE", 0.2)
+    bridge = bridge_mod.GdbBridge()
+    monkeypatch.setattr(fake_gdb, "execute", lambda cmd, to_string=False: time.sleep(1.0) or "")
+    stop = _gdb_thread(fake_gdb)
+    try:
+        response = bridge.dispatch({"op": "gdb_exec", "params": {"command": "kdmesg", "_timeout": 0.2}})
+    finally:
+        stop()
+
+    assert response["ok"] is False
+    assert "`pry gdb`" in response["error"]
+    assert "still running inside GDB" in response["error"]
 
 
 # --- pry kill -----------------------------------------------------------------------

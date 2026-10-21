@@ -294,6 +294,12 @@ def _load_bridge(monkeypatch):
             self._handlers[:] = [h for h in self._handlers if h is not handler]
 
         def fire(self, event):
+            if isinstance(event, _FakeBreakpointEvent) and event.breakpoints:
+                # GDB reports a breakpoint stop with the PC at its address.
+                hit = event.breakpoints[0]
+                locs = getattr(hit, "locations", None) or []
+                if getattr(hit, "type", None) in (1, 2) and locs and getattr(locs[0], "address", None):
+                    _current_frame._pc = locs[0].address
             # GDB calls a snapshot of the callbacks: a handler that
             # disconnects another one mid-emit does not skip it.
             for handler in list(self._handlers):
@@ -3038,6 +3044,46 @@ def test_print_no_note_when_inferior_live(monkeypatch):
     result = bridge._dispatch_op("print", {"expression": "argc"})
     assert "note" not in result
     assert "live" not in result
+
+
+@pytest.mark.parametrize("layout", ["7.0", "6.x"])
+def test_print_flags_a_per_cpu_template_in_freed_init_memory(monkeypatch, tmp_path, layout):
+    """#109: x86-64 7.0 links .data..percpu between __init_begin and
+    __init_end, freed after boot: a plain read of a per-CPU symbol there is
+    garbage. 6.x links it at 0, where the read fails loudly instead."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    text, data = 0xFFFFFFFF81000000, 0xFFFFFFFF82000000
+    init_begin, init_end = 0xFFFFFFFF863B0000, 0xFFFFFFFF869DB000
+    percpu = 0xFFFFFFFF869A3000 if layout == "7.0" else 0
+    vmlinux = tmp_path / "vmlinux"
+    _write_kernel_elf(vmlinux, symbols={
+        "_text": text, "__init_begin": init_begin, "__init_end": init_end,
+    }, sections=[
+        (".text", _ALLOC | _EXEC, text, 0x1000),
+        (".data", _ALLOC | _WRITE, data, 0x1000),
+        (".data..percpu", _ALLOC | _WRITE, percpu, 0x36F98),
+    ])
+    slide = 0x6C00000
+    objfile = types.SimpleNamespace(filename=str(vmlinux))
+    fake_gdb.current_progspace = lambda: types.SimpleNamespace(
+        filename=str(vmlinux), objfile_for_address=lambda addr: objfile,
+    )
+
+    class Value:
+        def __init__(self, address):
+            self.address, self.type = address, "struct task_struct *"
+
+        def __str__(self):
+            return "0xb70ffffffd7c840f"
+
+    current_task = percpu + 0x18 + (slide if layout == "7.0" else 0)
+    addresses = {"current_task": current_task, "init_task": data + 0x640 + slide}
+    fake_gdb.parse_and_eval = lambda expr: Value(addresses[expr])
+    bridge = bridge_mod.GdbBridge()
+    bridge._symbol_loads[str(vmlinux.resolve())] = {"path": str(vmlinux), "slide": slide}
+
+    assert ("note" in bridge._dispatch_op("print", {"expression": "current_task"})) is (layout == "7.0")
+    assert "note" not in bridge._dispatch_op("print", {"expression": "init_task"})
 
 
 def test_register_write(monkeypatch):
