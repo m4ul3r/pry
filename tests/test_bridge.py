@@ -1364,7 +1364,8 @@ def _write_kernel_elf(path: Path, *, sections, symbols: dict[str, int], e_type: 
     """ELF64-LE (ET_EXEC unless *e_type*) with allocated *sections* plus .symtab/.strtab/.shstrtab.
 
     Each section is ``(name, flags, addr, data)``; an int ``data`` is the size
-    of a NOBITS section (no file bytes).
+    of a NOBITS section (no file bytes). A symbol inside a section is defined
+    there: a function in an executable one, an object elsewhere.
     """
     names = [s[0] for s in sections] + [".symtab", ".strtab", ".shstrtab"]
     shstrtab = bytearray(b"\x00")
@@ -1377,6 +1378,10 @@ def _write_kernel_elf(path: Path, *, sections, symbols: dict[str, int], e_type: 
     for name, value in symbols.items():
         sym = bytearray(24)
         struct.pack_into("<I", sym, 0, len(strtab))
+        for index, (_, flags, addr, data) in enumerate(sections, 1):
+            if addr <= value < addr + (data if isinstance(data, int) else len(data)):
+                struct.pack_into("<BxH", sym, 4, 2 if flags & _EXEC else 1, index)
+                break
         struct.pack_into("<Q", sym, 8, value)
         symdata += bytes(sym)
         strtab += name.encode() + b"\x00"
@@ -1572,6 +1577,76 @@ def test_kbase_rebases_the_loaded_symbol_file(monkeypatch, tmp_path):
     assert again["apply"]["applied"] is False
     assert again["apply"]["previous_slide"] == hex(_X86_SLIDE)
     assert not any(c.startswith("add-symbol-file") for c in fake_gdb._execute_log)
+
+
+def _module_elf(path: Path) -> Path:
+    _write_kernel_elf(path, sections=[(".text", _ALLOC | _EXEC, 0, b"\x90" * 16)], symbols={"tock": 0})
+    return path
+
+
+def _objfile_table(fake_gdb, primary: str) -> list:
+    """GDB's objfiles under the symbol commands pry runs: ``[primary, *added]``.
+
+    `remove-symbol-file` removes only an added copy; `symbol-file` with no
+    argument discards every objfile, the added ones too.
+    """
+    table = [primary]
+    execute = fake_gdb.execute
+
+    def run(cmd, to_string=False):
+        words = cmd.split()
+        if words[0] == "add-symbol-file":
+            table.append(words[1])
+        elif words[0] == "remove-symbol-file":
+            if words[1] not in table[1:]:
+                raise fake_gdb.error(f"No symbol file found for {words[1]}")
+            del table[table.index(words[1], 1)]
+        elif cmd == "symbol-file":
+            table[:] = [None]
+        return execute(cmd, to_string=to_string)
+
+    fake_gdb.execute = run
+    fake_gdb.objfiles = lambda: [types.SimpleNamespace(filename=f) for f in table if f]
+    fake_gdb.current_progspace = lambda: types.SimpleNamespace(filename=table[0])
+    return table
+
+
+def test_rebasing_the_primary_vmlinux_keeps_the_files_added_beside_it(monkeypatch, tmp_path):
+    """#90: `symbol-file` discards every objfile; a module added with --slide
+    comes back at its slide, and one pry cannot put back is reported."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    vmlinux = _x86_kernel_elf(tmp_path / "vmlinux")
+    module = _module_elf(tmp_path / "mod.ko")
+    table = _objfile_table(fake_gdb, str(vmlinux))
+    bridge = bridge_mod.GdbBridge()
+    bridge._dispatch_op("load", {"path": str(module), "slide": "0xffffffffc0000000"})
+    fake_gdb.execute("add-symbol-file /raw/helper.o -o 0x1000")
+    fake_gdb._execute_log.clear()
+
+    result = bridge._dispatch_op("load", {"path": str(vmlinux), "base": hex(_X86_RUNTIME_TEXT)})
+
+    assert table == [None, str(vmlinux), str(module)]
+    assert f"add-symbol-file {module} -o 0xffffffffc0000000" in fake_gdb._execute_log
+    assert result["dropped"] == ["/raw/helper.o"]
+
+
+def test_kbase_validates_against_the_loaded_kernel_after_a_module_load(monkeypatch, tmp_path):
+    """#91: `load mod --slide` does not make the module the kernel: kbase finds
+    the vmlinux among the objfiles and rebases it, keeping the module (#90)."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    vmlinux = _x86_kernel_elf(tmp_path / "vmlinux")
+    module = _module_elf(tmp_path / "mod.ko")
+    _x86_guest(fake_gdb)
+    table = _objfile_table(fake_gdb, str(vmlinux))
+    bridge = bridge_mod.GdbBridge()
+    bridge._dispatch_op("load", {"path": str(module), "slide": "0xffffffffc0000000"})
+
+    result = bridge._dispatch_op("kbase", {})
+
+    assert result["validated"]["symbols"] == str(vmlinux)
+    assert result["apply"]["applied"] is True
+    assert result["apply"]["load"]["slide"] == hex(_X86_SLIDE)
+    assert table == [None, str(vmlinux), str(module)]
 
 
 def test_kbase_all_methods_fail(monkeypatch):
@@ -1884,6 +1959,102 @@ def test_interrupt_when_idle_is_noop(monkeypatch):
     assert response["result"]["interrupted"] is False
     assert response["result"]["state"] == "stopped"
     assert "interrupt" not in fake_gdb._execute_log
+
+
+def _session(monkeypatch, connection="remote"):
+    """An all-stop session whose selected thread runs while ``running[0]``."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    fake_gdb.selected_inferior().connection = types.SimpleNamespace(type=connection)
+    running = [False]
+    monkeypatch.setattr(fake_gdb.selected_thread(), "is_running", lambda: running[0])
+    return bridge_mod.GdbBridge(), fake_gdb, running
+
+
+def test_raw_resume_gdb_aborted_leaves_the_target_stopped(monkeypatch):
+    """#77: GDB raises its `cont` event before it inserts its breakpoints. A
+    failed insert aborts a raw `continue` with no stop to follow; the target
+    never moved, so status, interrupt and `pry kill` find it stopped."""
+    bridge, fake_gdb, _ = _session(monkeypatch)
+    execute = fake_gdb.execute
+
+    def abort_resume(cmd, to_string=False):
+        if cmd == "continue":
+            fake_gdb.events.cont.fire(None)
+            raise fake_gdb.error("Command aborted.")
+        return execute(cmd, to_string=to_string)
+
+    fake_gdb.execute = abort_resume
+
+    assert bridge.dispatch({"op": "gdb_exec", "params": {"command": "continue"}})["ok"] is False
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "stopped"
+    assert bridge.dispatch({"op": "prepare_kill", "params": {}})["result"] == {"was_running": False}
+    response = bridge.dispatch({"op": "interrupt", "params": {}})
+    assert response["ok"] is True and response["result"]["interrupted"] is False
+    assert "interrupt" not in fake_gdb._execute_log
+
+
+def test_failed_op_keeps_a_raw_resume_gdb_says_runs(monkeypatch):
+    """#68 under #77's rule: a read the running stub refuses fails, and GDB
+    says the thread runs, so pry still knows the target runs."""
+    bridge, fake_gdb, running = _session(monkeypatch)
+    execute = fake_gdb.execute
+
+    def resume(cmd, to_string=False):
+        if cmd == "continue &":
+            fake_gdb.events.cont.fire(None)
+            running[0] = True
+        return execute(cmd, to_string=to_string)
+
+    def parse_and_eval(expression):
+        raise fake_gdb.error("Selected thread is running.")
+
+    fake_gdb.execute = resume
+    fake_gdb.parse_and_eval = parse_and_eval
+    assert bridge.dispatch({"op": "gdb_exec", "params": {"command": "continue &"}})["ok"] is True
+
+    assert bridge.dispatch({"op": "print", "params": {"expression": "$pc"}})["ok"] is False
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "running"
+
+
+@pytest.mark.parametrize(("command", "passes"), [
+    ("x/i $pc", False),
+    ("disassemble", False),
+    ("info registers", False),
+    ("print $pc", False),
+    ("telescope $sp", False),
+    ("show convenience", False),
+    ("detach", False),
+    ("interrupt", True),
+    ("info breakpoints", True),
+    ("i b", True),
+    ("maint info breakpoints", True),
+    ("info display", True),
+    ("show version", True),
+    ("help x", True),
+])
+def test_raw_gdb_runs_only_what_reads_nothing_while_a_remote_target_runs(monkeypatch, command, passes):
+    """#89: GDB 15 aborts on some reads of a running all-stop stub (`x/i`),
+    killing the bridge and leaving its traps in target memory."""
+    bridge, fake_gdb, running = _session(monkeypatch)
+    fake_gdb.events.cont.fire(None)
+    running[0] = True
+
+    response = bridge.dispatch({"op": "gdb_exec", "params": {"command": command}})
+
+    assert response["ok"] is passes
+    assert (command in fake_gdb._execute_log) is passes
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "running"
+
+
+@pytest.mark.parametrize("connection", ["remote", "native"])
+def test_raw_gdb_reads_where_no_running_stub_can_abort(monkeypatch, connection):
+    """A stopped remote target, or a running native one, takes any command."""
+    bridge, fake_gdb, running = _session(monkeypatch, connection)
+    if connection == "native":
+        fake_gdb.events.cont.fire(None)
+        running[0] = True
+
+    assert bridge.dispatch({"op": "gdb_exec", "params": {"command": "x/i $pc"}})["ok"] is True
 
 
 def test_dispatch_exec_respects_timeout_param(monkeypatch):
