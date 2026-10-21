@@ -47,6 +47,7 @@ The bridge runs a threaded socket server inside GDB, but the GDB Python API is o
 - **EXEC_OPS** (`run`, `continue`, `step`, ...): take the write lock; they block until the inferior stops (via `gdb.events.stop`) or return immediately with `--background`. `--timeout` auto-interrupts and returns stop info with `timeout_interrupt: true`.
 - **READ_LOCKED_OPS** (`backtrace`, `locals`, ...): take the read lock, so inspection commands can run concurrently with each other but not during a mutation.
 - **BREAKPOINT_OPS** (`break_set/delete/enable/disable`, `watch_set`, `load`, `resync`): take the write lock via `_dispatch_breakpoint_op()`. An all-stop remote stub refuses packets while it runs, so a running remote target is interrupted, the op applied at that stop, and the target resumed (`run_state` in the result); `resync` always works at a stop. Never let GDB edit its breakpoint table against a running remote target: it changes the table first and fails to reach the target second.
+- **HOLD_OPS** (`hold`, `release`: `pry interrupt --hold` / `pry continue --release`): a caller's stop that does not end the operator's `wait` or foreground `continue`; they wait through it and follow the execution the release resumes, and no execution starts while it holds. Both take the write lock, except that `hold` goes ahead beside a foreground execution, which holds the lock while it waits for that stop and lets it go once stopped.
 
 ### Output Spilling (src/pry/output.py)
 

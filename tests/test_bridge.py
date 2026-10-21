@@ -1649,6 +1649,38 @@ def test_kbase_validates_against_the_loaded_kernel_after_a_module_load(monkeypat
     assert table == [None, str(vmlinux), str(module)]
 
 
+def test_resync_base_rebases_the_loaded_kernel_not_the_last_module_load(monkeypatch, tmp_path):
+    """#105: like kbase (#91), `resync --base` without --symbols rebases the
+    loaded kernel image; the module added with --slide stays where it is."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    vmlinux = _x86_kernel_elf(tmp_path / "vmlinux")
+    module = _module_elf(tmp_path / "mod.ko")
+    table = _objfile_table(fake_gdb, str(vmlinux))
+    bridge = bridge_mod.GdbBridge()
+    bridge._dispatch_op("load", {"path": str(module), "slide": "0xffffffffc0000000"})
+    fake_gdb._execute_log.clear()
+
+    result = bridge._dispatch_op("resync", {"base": hex(_X86_RUNTIME_TEXT)})
+
+    assert result["symbols"]["loaded"] == str(vmlinux)
+    assert result["symbols"]["slide"] == hex(_X86_SLIDE)
+    assert table == [None, str(vmlinux), str(module)]
+    assert f"add-symbol-file {module} -o 0xffffffffc0000000" in fake_gdb._execute_log
+
+
+def test_resync_base_without_a_kernel_image_rebases_the_last_load(monkeypatch, tmp_path):
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    module = _module_elf(tmp_path / "mod.ko")
+    _objfile_table(fake_gdb, None)
+    bridge = bridge_mod.GdbBridge()
+    bridge._dispatch_op("load", {"path": str(module), "slide": "0xffffffffc0000000"})
+
+    result = bridge._dispatch_op("resync", {"base": "0xffffffffd0000000"})
+
+    assert result["symbols"]["loaded"] == str(module)
+    assert result["symbols"]["base"] == "0xffffffffd0000000"
+
+
 def test_kbase_all_methods_fail(monkeypatch):
     bridge_mod, fake_gdb = _load_bridge(monkeypatch)
     bridge = bridge_mod.GdbBridge()
@@ -2031,6 +2063,11 @@ def test_failed_op_keeps_a_raw_resume_gdb_says_runs(monkeypatch):
     ("info display", True),
     ("show version", True),
     ("help x", True),
+    # #103: gdb.execute runs every line, so every line must pass.
+    ("info breakpoints\nx/i __x64_sys_newuname", False),
+    ("info breakpoints\nprint $pc", False),
+    ("x/i $pc\ninfo breakpoints", False),
+    ("info breakpoints\n\nshow version\n", True),
 ])
 def test_raw_gdb_runs_only_what_reads_nothing_while_a_remote_target_runs(monkeypatch, command, passes):
     """#89: GDB 15 aborts on some reads of a running all-stop stub (`x/i`),

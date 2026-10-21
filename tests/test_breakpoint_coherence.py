@@ -176,8 +176,8 @@ def _memory(window: bytes) -> dict[int, int]:
     return {TRAP_SITE + i: b for i, b in enumerate(window)}
 
 
-def _start_background(bridge, fake_gdb, stub):
-    """`pry continue --background`: GDB inserts its breakpoints and resumes."""
+def _resume_like_gdb(fake_gdb, stub):
+    """GDB inserts its breakpoints when it resumes and removes them at a stop."""
     original = fake_gdb.execute
 
     def execute(cmd, to_string=False):
@@ -196,6 +196,11 @@ def _start_background(bridge, fake_gdb, stub):
         return original(cmd, to_string=to_string)
 
     fake_gdb.execute = execute
+
+
+def _start_background(bridge, fake_gdb, stub):
+    """`pry continue --background`: GDB inserts its breakpoints and resumes."""
+    _resume_like_gdb(fake_gdb, stub)
     response = bridge.dispatch({"op": "continue", "params": {"_background": True}})
     assert response["result"]["state"] == "running"
 
@@ -249,6 +254,8 @@ _A64 = bytes.fromhex("fd7bbfa9" "fd030091" "e00313aa" "c0035fd6")
         ("5e415f5dc3cccccccc0f0b658b052c25ce", "5e415f5de95dfecc000f0b658b052c25ce", "cc", 0x1000, []),
         # A trap planted right after such a rewritten jmp is still found.
         ("c3cccccccc0f1f4000cc8b7f70e9b7ebff", "e934b1f7000f1f4000488b7f70e9b7ebff", "cc", 0x1000, [9]),
+        # ...and one planted on the very instruction after it.
+        ("c3cccccccccc8b7f70e9b7ebff", "e934b1f700488b7f70e9b7ebff", "cc", 0x1000, [5]),
         # #88: a static call retargeted at boot keeps its `call` opcode; a 0xcc
         # in its new rel32 is not an instruction start of the ELF.
         ("e85390cc00488b7f70e9b7ebffff", "e85390f600488b7f70e9b7ebffff", "cc", 0x1000, []),
@@ -274,6 +281,19 @@ def test_stray_trap_offsets(monkeypatch, guest, elf, trap, start, found):
     guest, elf, trap = (v if isinstance(v, bytes) else bytes.fromhex(v) for v in (guest, elf, trap))
     starts = bridge_mod.insn_start_checker(trap, elf, start, [0], True)
     assert bridge_mod.stray_trap_offsets(guest, elf, trap, starts) == found
+
+
+def test_return_thunk_rewrites_are_told_without_a_decode(monkeypatch):
+    """#106: a kernel has tens of thousands of `ret; int3 x4` return sites,
+    and decoding each one's function up to it doubled resync's time."""
+    bridge_mod, _ = _load_bridge(monkeypatch)
+    guest = bytes.fromhex("5e415f5dc3cccccccc0f0b658b052c25ce" * 3)
+    elf = bytes.fromhex("5e415f5de95dfecc000f0b658b052c25ce" * 3)
+
+    def decode(offset):
+        raise AssertionError(f"decoded up to {offset}")
+
+    assert bridge_mod.stray_trap_offsets(guest, elf, b"\xcc", decode) == []
 
 
 def test_x86_trap_with_no_code_symbol_before_it_is_not_found(monkeypatch):
@@ -525,6 +545,143 @@ def test_waiter_follows_the_resumed_execution(monkeypatch):
     waiter.join(timeout=5)
     assert responses[0]["result"]["reason"]["kind"] == "breakpoint-hit"
     assert responses[0]["result"]["reason"]["number"] == 1
+
+
+# --- a caller's hold (#99) ---------------------------------------------------
+
+def _in_flight(bridge, op, params):
+    """*op* on its own thread, as the operator's `pry wait` or foreground `continue`."""
+    responses = []
+    thread = threading.Thread(
+        target=lambda: responses.append(bridge.dispatch({"op": op, "params": params})),
+        daemon=True,
+    )
+    thread.start()
+    return thread, responses
+
+
+def test_a_held_stop_is_not_the_waiters_and_the_release_resumes(monkeypatch):
+    """qmu holds the target across a savevm (or a KASLR rebase): the
+    operator's `pry wait` must not return that stop, a SIGINT nobody sent."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    hit = _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    waiter, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    held = bridge.dispatch({"op": "hold", "params": {}})
+
+    assert held["ok"] is True, held
+    assert held["result"]["state"] == "stopped"
+    assert held["result"]["run_state"]["will_resume"] is True
+    assert stub.inserted == {}  # a savevm at this stop holds no int3
+    status = bridge.dispatch({"op": "status"})["result"]
+    assert status["reason"] == {"kind": "held"}
+    assert "last_background_result" not in status
+    waiter.join(timeout=0.2)
+    assert waiter.is_alive(), "the waiter returned the hold's own stop"
+
+    released = bridge.dispatch({"op": "release", "params": {}})
+
+    assert released["ok"] is True, released
+    assert released["result"]["state"] == "running"
+    assert released["result"]["run_state"]["resumed"] is True
+    assert stub.mem[TRAP_SITE] == 0xCC
+    waiter.join(timeout=0.2)
+    assert waiter.is_alive()
+    fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([hit]))
+    waiter.join(timeout=5)
+    assert responses[0]["result"]["reason"]["kind"] == "breakpoint-hit"
+
+
+def test_a_foreground_continue_waits_through_a_hold_while_the_holder_works(monkeypatch):
+    """A foreground `continue` holds the write lock while it waits; the hold
+    stops it anyway, and the holder's own ops (resync, kbase) run at the stop."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    hit = _Bp(stub, 1, TRAP_SITE)
+    _resume_like_gdb(fake_gdb, stub)
+    runner, responses = _in_flight(bridge, "continue", {"_timeout": 10})
+    for _ in range(500):
+        if bridge._foreground_job is not None:
+            break
+        threading.Event().wait(0.01)
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    assert bridge.dispatch({"op": "hold", "params": {}})["ok"] is True
+    resync = bridge.dispatch({"op": "resync", "params": {}})
+
+    assert resync["ok"] is True, resync
+    assert resync["result"]["state"] == "stopped"
+    runner.join(timeout=0.2)
+    assert runner.is_alive(), "the foreground continue returned the hold's own stop"
+    assert bridge.dispatch({"op": "release", "params": {}})["result"]["run_state"]["resumed"] is True
+    fake_gdb.events.stop.fire(fake_gdb._FakeBreakpointEvent([hit]))
+    runner.join(timeout=5)
+    assert responses[0]["result"]["reason"]["kind"] == "breakpoint-hit"
+
+
+def test_nothing_resumes_a_held_target_but_its_release(monkeypatch):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _resume_like_gdb(fake_gdb, stub)
+    bridge._last_stop_reason = {"kind": "breakpoint-hit", "number": 1}
+
+    held = bridge.dispatch({"op": "hold", "params": {}})["result"]
+
+    # Stopped already: the operator's stop stays theirs, and stays put.
+    assert held["run_state"] == {"was_running": False, "interrupted": False, "will_resume": False}
+    assert held["reason"]["kind"] == "breakpoint-hit"
+    assert bridge.dispatch({"op": "hold", "params": {}})["ok"] is False
+    for op in ("continue", "step"):
+        assert bridge.dispatch({"op": op, "params": {}})["ok"] is False, op
+    assert not {"continue", "step"} & set(fake_gdb._execute_log)
+
+    released = bridge.dispatch({"op": "release", "params": {}})["result"]
+
+    assert released["state"] == "stopped"
+    assert released["run_state"]["resumed"] is False
+    assert "continue" not in fake_gdb._execute_log
+    assert bridge.dispatch({"op": "release", "params": {}})["ok"] is False
+    assert bridge.dispatch({"op": "continue", "params": {"_background": True}})["ok"] is True
+
+
+def test_a_stop_of_its_own_during_a_hold_goes_to_the_waiter_at_once(monkeypatch):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    hit = _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    waiter, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    # The breakpoint hit beats the hold's interrupt.
+    fake_gdb._pending_stop_event = fake_gdb._FakeBreakpointEvent([hit])
+    fake_gdb._execute_log.clear()
+
+    held = bridge.dispatch({"op": "hold", "params": {}})["result"]
+
+    assert held["run_state"]["will_resume"] is False
+    waiter.join(timeout=5)
+    assert responses[0]["result"]["reason"]["kind"] == "breakpoint-hit"
+    released = bridge.dispatch({"op": "release", "params": {}})["result"]
+    assert released["run_state"]["resumed"] is False
+    assert "continue" not in fake_gdb._execute_log
+
+
+def test_a_release_gdb_cannot_resume_fails_and_ends_the_hold(monkeypatch):
+    """A hold across a reset leaves the guest at the reset vector, where GDB
+    cannot insert a breakpoint at a kernel address, so it cannot resume."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    waiter, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+    assert bridge.dispatch({"op": "hold", "params": {}})["ok"] is True
+    stub.mem.clear()  # reset: nothing at the breakpoint's address is readable
+
+    released = bridge.dispatch({"op": "release", "params": {}})
+
+    assert released["ok"] is False
+    waiter.join(timeout=5)
+    assert responses[0]["ok"] is False
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "stopped"
+    assert bridge.dispatch({"op": "release", "params": {}})["ok"] is False  # nothing held now
 
 
 def test_failed_op_while_running_keeps_the_run_state(monkeypatch):
