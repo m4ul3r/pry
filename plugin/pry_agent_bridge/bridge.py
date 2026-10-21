@@ -4828,6 +4828,24 @@ class GdbBridge:
             bp_type = gdb.BP_HARDWARE_BREAKPOINT
 
         bp = gdb.Breakpoint(location, type=bp_type, temporary=temporary)
+        if getattr(bp, "pending", False) and not params.get("pending"):
+            # The Python API always lets GDB make an unresolved location
+            # pending, where `break` in batch mode refuses. A typo would be
+            # reported armed though it can never fire: refuse unless asked.
+            bp.delete()
+            try:
+                gdb.decode_line(location)
+                reason = ""
+            except Exception as exc:
+                reason = str(exc).strip()
+            reason = f"{reason} " if reason else ""
+            raise ValueError(
+                f"{reason}No breakpoint set: no loaded symbol file resolves "
+                f"{location!r}, so GDB would leave it pending (check the spelling: "
+                "`pry functions --query NAME`, `pry symbols --query NAME`; for a symbol "
+                "in a shared library or kernel module that is not loaded yet, pass "
+                "`--pending` to keep it pending until it loads)"
+            )
 
         condition = params.get("condition")
         if condition:
@@ -6124,6 +6142,10 @@ class GdbBridge:
         result: dict[str, Any] = {"register": name, "value": str(value)}
         if readback is not None:
             result["readback"] = readback
+        # The thread written (`--thread N` selects it for this op only).
+        thread = gdb.selected_thread()
+        if thread is not None:
+            result["thread"] = getattr(thread, "global_num", None) or thread.num
         return result
 
     @staticmethod
