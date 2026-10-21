@@ -2356,11 +2356,13 @@ class GdbBridge:
         try:
             if op in TARGET_READ_OPS and self._remote_target_running():
                 raise RuntimeError(
-                    f"`pry {_op_command(op)}` reads target memory or registers, which the "
-                    "running all-stop remote target cannot serve, so it was not run: GDB "
-                    "aborts when such a read fails in its disassembler, taking pry's bridge "
-                    "with it and leaving its breakpoints' traps in target memory (the "
-                    "inferior is running — `pry interrupt` (or `pry wait`) first)"
+                    f"`pry {_op_command(op)}` was not run: it reads target memory or "
+                    "registers, which a running all-stop remote target refuses, and GDB "
+                    "aborts when such a failed read unwinds through its disassembler "
+                    "(`disasm`, `x/i`), taking pry's bridge with it and leaving its "
+                    "breakpoints' traps in target memory; so pry refuses every such read "
+                    "while the target runs (the inferior is running — `pry interrupt` (or "
+                    "`pry wait`) first)"
                 )
             if op in READ_LOCKED_OPS or op in {
                 "register_write", "thread_select", "call", "display_add", "py_exec", "kbase",
@@ -5654,14 +5656,10 @@ class GdbBridge:
                                        "reload the symbols (resync --base) or set it again")
                 elif site and not site["readable"]:
                     entry["status"] = "unreadable"
-                    raw = _raw_location_address(bp)
-                    if raw is None:
-                        entry["detail"] = ("target memory at this address cannot be read, so "
-                                           "no trap can be placed there: the code moved (KASLR "
-                                           "re-slid on a reset or reboot: resync --base) or is "
-                                           "not mapped yet")
-                    else:
-                        entry.update(self._raw_unreadable(bp, raw))
+                    entry["detail"] = ("target memory at this address cannot be read, so "
+                                       "no trap can be placed there: the code moved (KASLR "
+                                       "re-slid on a reset or reboot: resync --base) or is "
+                                       "not mapped yet")
                 elif bp.number in verify["errors"]:
                     entry["status"] = "insert-failed"
                     entry["detail"] = verify["errors"][bp.number]
@@ -5672,6 +5670,9 @@ class GdbBridge:
                                        "it will not fire")
                 else:
                     entry["status"] = "armed"
+                raw = _raw_location_address(bp)
+                if raw is not None and entry["status"] not in ("disabled", "pending"):
+                    entry.update(self._raw_rebase(bp, raw, entry))
                 for k in ("guest_bytes", "elf_bytes", "elf_match", "baked_trap", "stub_record", "repaired"):
                     if k in site:
                         entry[k] = site[k]
@@ -5683,24 +5684,30 @@ class GdbBridge:
                 entries.append(entry)
         return entries
 
-    def _raw_unreadable(self, bp, addr: int) -> dict[str, Any]:
-        """``detail`` (and ``rebased_address``) for an unreadable breakpoint
-        set at the raw address *addr* (#112).
+    def _raw_rebase(self, bp, addr: int, entry: dict[str, Any]) -> dict[str, Any]:
+        """``detail`` (and ``rebased_address``) for a breakpoint set at the
+        raw address *addr* (#112), given its resync *entry*.
 
         A raw address does not follow a rebase, so `resync --base` cannot
         move it. When pry moved the symbol file it lay in since it was set,
-        the same instruction is now at ``addr - previous slide + current slide``.
+        the same instruction is now at ``addr - previous slide + current
+        slide``, and the trap at *addr*, if it can be placed at all, sits in
+        whatever the new layout put there.
         """
-        text = (f"target memory at this address cannot be read, so no trap can be placed "
-                f"there. It was set at the raw address `{bp.location}`, which does not "
-                "follow a rebase: reloading the symbols (`resync --base`) cannot move it")
+        unreadable = entry["status"] == "unreadable"
+        raw = (f"It was set at the raw address `{bp.location}`, which does not follow a "
+               "rebase: reloading the symbols (`resync --base`) cannot move it")
         stamp = self._raw_bp_slides.get(bp.number)
         now = self._elf_slide(stamp["path"]) if stamp and self._file_is_loaded(stamp["path"]) else None
         if stamp is None or now is None or now == stamp["slide"]:
-            return {"detail": text + (
-                ". If the code moved (KASLR re-slid on a reset or reboot), delete it and set "
-                "it at the new address (once `pry kbase` has rebased the kernel's symbols, "
-                "the next `pry resync` names it); otherwise it is not mapped yet"
+            if not unreadable:
+                return {}
+            return {"detail": (
+                "target memory at this address cannot be read, so no trap can be placed "
+                f"there. {raw}. If the code moved (KASLR re-slid on a reset or reboot), "
+                "delete it and set it at the new address (once `pry kbase` has rebased the "
+                "kernel's symbols, the next `pry resync` names it); otherwise it is not "
+                "mapped yet"
             )}
         moved = (addr - stamp["slide"] + now) & _ADDR_MASK
         label = self._symbolize(moved)
@@ -5709,12 +5716,22 @@ class GdbBridge:
             flags += " --temporary"
         if getattr(bp, "condition", None):
             flags += f" --condition {shlex.quote(bp.condition)}"
-        return {"rebased_address": hex(moved), "detail": text + (
-            f". pry has moved {os.path.basename(stamp['path'])} from slide "
-            f"{stamp['slide']:#x} to {now:#x} since it was set, so the same instruction "
-            f"is now at {moved:#x}{f' ({label})' if label else ''}: `pry break delete "
-            f"{bp.number}` and `pry break set '*{moved:#x}'{flags}`"
-        )}
+        rebased = (
+            f"pry has moved {os.path.basename(stamp['path'])} from slide {stamp['slide']:#x} "
+            f"to {now:#x} since it was set, so the same instruction is now at "
+            f"{moved:#x}{f' ({label})' if label else ''}: `pry break delete {bp.number}` and "
+            f"`pry break set '*{moved:#x}'{flags}`"
+        )
+        if unreadable:
+            detail = ("target memory at this address cannot be read, so no trap can be "
+                      f"placed there. {raw}. {rebased}")
+        else:
+            here = self._symbolize(addr)
+            detail = (f"{raw}, so its trap is not on the instruction it was set on but in "
+                      f"{here or 'whatever the new layout put at this address'}. {rebased}")
+            if entry.get("detail"):
+                detail = f"{entry['detail']}. {detail}"
+        return {"rebased_address": hex(moved), "detail": detail}
 
     # ------------------------------------------------------------------
     # Inspection
@@ -5924,7 +5941,7 @@ class GdbBridge:
             if section is not None:
                 result["note"] = (
                     f"this reads the {section} template the image links inside its init "
-                    "memory (x86-64 7.0 and later), which the kernel frees after boot: the "
+                    "memory (as x86-64 7.0 does), which the kernel frees after boot: the "
                     "value is whatever owns those pages now, not a CPU's. Read a CPU's copy "
                     "as `*(TYPE *)($gs_base + (unsigned long)&VAR)` (the CPU stopped in the "
                     "kernel) or `*(TYPE *)(__per_cpu_offset[CPU] + (unsigned long)&VAR)`"

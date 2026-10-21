@@ -1332,29 +1332,30 @@ def test_resync_cli_rejects_symbols_without_base(monkeypatch):
 def test_resync_names_where_a_raw_address_breakpoint_went_after_a_rebase(monkeypatch, tmp_path):
     """#112: `*ADDR` does not follow a rebase. Once pry moved the kernel image
     under it, the address of the same instruction is old - previous slide +
-    current slide; a symbol location, or one set after the move, gets none."""
-    link, old_slide, new_slide = 0xFFFFFFFF81000000, 0xBE00000, 0x23200000
-    old = link + 0x1C4 + old_slide
+    current slide, whether the old address is unmapped now or holds other
+    code; a symbol location, or one set after the move, gets none."""
+    link, old_slide, new_slide = 0xFFFFFFFF81000000, 0x80000, 0x23200000
+    gone = link + 0x1C4 + old_slide  # unmapped after the re-slide
     _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
     vmlinux = tmp_path / "vmlinux"
     _write_kernel_elf(vmlinux, symbols={"_text": link}, sections=[
-        (".text", _ALLOC | _EXEC, link, bytes(0x1000)),
+        (".text", _ALLOC | _EXEC, link, bytes(0x10000)),
     ])
     _objfile_table(fake_gdb, str(vmlinux))
     bridge._dispatch_op("load", {"path": str(vmlinux), "slide": hex(old_slide)})
-    raw = _Bp(stub, 1, old)
-    raw.location = f"*{old:#x}"
-    _Bp(stub, 2, old)  # resolves through a symbol
+    for number, address in ((1, gone), (4, TRAP_SITE)):  # TRAP_SITE: other code now
+        _Bp(stub, number, address).location = f"*{address:#x}"
+    _Bp(stub, 2, gone)  # resolves through a symbol
     # The reset re-slid KASLR: `pry kbase` rebases the image.
     bridge._dispatch_op("load", {"path": str(vmlinux), "slide": hex(new_slide)})
-    late = _Bp(stub, 3, old)
-    late.location = f"*{old:#x}"
+    _Bp(stub, 3, gone).location = f"*{gone:#x}"
 
     result = bridge.dispatch({"op": "resync", "params": {}})["result"]
 
     entries = {e["number"]: e for e in result["breakpoints"]}
-    assert [entries[n]["status"] for n in (1, 2, 3)] == ["unreadable"] * 3
-    assert entries[1]["rebased_address"] == hex(old - old_slide + new_slide)
+    assert [entries[n]["status"] for n in (1, 2, 3, 4)] == ["unreadable"] * 3 + ["armed"]
+    assert entries[1]["rebased_address"] == hex(gone - old_slide + new_slide)
+    assert entries[4]["rebased_address"] == hex(TRAP_SITE - old_slide + new_slide)
     assert "rebased_address" not in entries[2]
     assert "rebased_address" not in entries[3]
 

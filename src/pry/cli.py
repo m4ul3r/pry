@@ -3205,7 +3205,9 @@ def _gdb_exec(args: argparse.Namespace) -> int:
         text_renderer=_render_gdb_exec_text,
         map_result=lambda result: _map_gdb_exec_result(command, result),
         stem="gdb_exec",
-        timeout=timeout,
+        # Past the bridge's own timeout and its grace, as for `py exec`, so
+        # the bridge's answer naming the op arrives instead of a socket timeout.
+        timeout=(timeout + 10) if timeout is not None else None,
     )
 
 
