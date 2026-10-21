@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import bisect
 import contextlib
 import ctypes
 import errno
@@ -491,6 +492,42 @@ def _elf_zero_based_percpu_sections(path: str) -> dict[str, int]:
     }
 
 
+_ELF_SHT_SYMTAB = 2
+_ELF_STT_NOTYPE = 0
+_ELF_STT_FUNC = 2
+_ELF_SHN_LORESERVE = 0xFF00
+
+
+def _elf_code_symbols(path: str, parsed) -> dict[int, list[int]]:
+    """Sorted link addresses of the code symbols of *path*, by section index.
+
+    Functions and untyped labels (assembly entry points) from ``.symtab``
+    (*parsed* is :func:`_elf_sections`'s answer for *path*): each marks an
+    address where an instruction starts. ``{}`` without a symbol table.
+    """
+    hdr, sections = parsed
+    fmt = hdr["endian"] + ("IBBHQQ" if hdr["is64"] else "IIIBBH")
+    width = struct.calcsize(fmt)
+    found: dict[int, set[int]] = {}
+    try:
+        with open(path, "rb") as f:
+            for symtab in sections:
+                if symtab["type"] != _ELF_SHT_SYMTAB or symtab["entsize"] not in (0, width):
+                    continue
+                f.seek(symtab["offset"])
+                data = f.read(symtab["size"])
+                for entry in struct.iter_unpack(fmt, data[:len(data) - len(data) % width]):
+                    if hdr["is64"]:
+                        _, info, _, shndx, value, _ = entry
+                    else:
+                        _, value, _, info, _, shndx = entry
+                    if info & 0xF in (_ELF_STT_NOTYPE, _ELF_STT_FUNC) and 0 < shndx < _ELF_SHN_LORESERVE:
+                        found.setdefault(shndx, set()).add(value)
+    except (OSError, struct.error):
+        return {}
+    return {index: sorted(values) for index, values in found.items()}
+
+
 def _elf_file_bytes(path: str, link_addr: int, length: int) -> bytes | None:
     """File bytes of an allocated ELF section at a link-time address.
 
@@ -577,27 +614,198 @@ def classify_trap_site(guest: bytes | None, elf: bytes | None, trap: bytes) -> d
     return info
 
 
-# x86 opcodes of the rel32 branches Linux rewrites at boot (return thunks,
-# retpolines, static calls): `call`/`jmp rel32`, and `jcc rel32` after 0x0F.
-_X86_REL32_BRANCH = (0xE8, 0xE9)
-_X86_JCC_REL32 = range(0x80, 0x90)
+# x86 instruction lengths, enough to find where the symbol file's instructions
+# start (#88): checked against objdump on every function of Linux 5.11, 6.1,
+# 6.6 and 7.0 and on 32-bit libc.
+def _x86_byteset(spec):
+    out = set()
+    for part in spec.split():
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo, 16), int(hi or lo, 16) + 1))
+    return frozenset(out)
 
 
-def _inside_rewritten_branch(guest: bytes, elf: bytes, i: int) -> bool:
-    """x86: whether offset *i* lies inside a rel32 branch the target rewrote.
+_X86_PREFIXES = _x86_byteset("26 2E 36 3E 64-67 F0 F2 F3")
+_X86_INVALID64 = _x86_byteset("06 07 0E 16 17 1E 1F 27 2F 37 3F 60 61 82 9A CE D4-D6 EA")
+_X86_MODRM1 = _x86_byteset(
+    "00-03 08-0B 10-13 18-1B 20-23 28-2B 30-33 38-3B 62 63 69 6B 80-8F C0 C1 C4-C7 D0-D3 D8-DF F6 F7 FE FF"
+)
+# Immediate kinds for the one-byte map: an int is a fixed byte count; "z" operand-size
+# (2/4), "v" B8+r (2/4/8), "m" moffs, "p" far ptr16:z, "r" near rel z, "t" F6/F7 TEST.
+_X86_IMM1 = dict.fromkeys(_x86_byteset("04 0C 14 1C 24 2C 34 3C 6A 6B 70-7F 80 82 83 A8 B0-B7 C0 C1 C6 CD D4 D5 E0-E7 EB"), 1)
+_X86_IMM1.update(dict.fromkeys(_x86_byteset("05 0D 15 1D 25 2D 35 3D 68 69 81 A9 C7"), "z"))
+_X86_IMM1.update(dict.fromkeys(_x86_byteset("B8-BF"), "v"))
+_X86_IMM1.update(dict.fromkeys(_x86_byteset("A0-A3"), "m"))
+_X86_IMM1.update({0xC2: 2, 0xCA: 2, 0xC8: 3, 0x9A: "p", 0xEA: "p", 0xE8: "r", 0xE9: "r", 0xF6: "t", 0xF7: "t"})
+_X86_INVALID_0F = _x86_byteset("04 0A 0C 25 27 36 39 3B-3F 7A 7B")
+_X86_NOMODRM_0F = _x86_byteset("05-0B 0E 30-37 77 80-8F A0-A2 A8-AA C8-CF")
+_X86_IMM8_0F = _x86_byteset("0F 70-73 A4 AC BA C2 C4-C6")
+_X86_IMM8_VEX1 = _x86_byteset("70-73 C2 C4-C6")
+_X86_EVEX_MAPS = frozenset((1, 2, 3, 5, 6))
+_X86_XOP_IMM = {8: 1, 9: 0, 0xA: 4}
+# Farthest a candidate trap is decoded to from the symbol before it: four times
+# the largest function in Linux 7.0 (70 KiB). Farther, nothing proves it starts
+# an instruction.
+_X86_DECODE_MAX = 0x40000
 
-    Linux turns ``jmp __x86_return_thunk`` into ``ret; int3; int3; int3;
-    int3``: its last int3 has the symbol file's next instruction after it,
-    like a planted trap, but sits inside the 5-byte ``jmp`` the file has
-    (inside a 6-byte ``jcc`` for the 0x0F forms).
+
+def _x86_insn_length(code: bytes, i: int, mode64: bool) -> int | None:
+    """Length of the x86 instruction that starts at code[i]; None when it cannot be
+    decoded there (an opcode invalid in this mode, more than 15 bytes, or it runs
+    past the end of *code*)."""
+    n = len(code)
+    start = i
+    opsize16 = addrsize = repne = rex_w = False
+    while True:
+        if i >= n or i - start >= 15:
+            return None
+        op = code[i]
+        i += 1
+        if op in _X86_PREFIXES:
+            if op == 0x66:
+                opsize16 = True
+            elif op == 0x67:
+                addrsize = True
+            elif op == 0xF2:
+                repne = True
+            rex_w = False
+        elif mode64 and 0x40 <= op <= 0x4F:
+            rex_w = op & 8 != 0
+        else:
+            break
+    addr16 = addrsize and not mode64
+    zsize = 2 if opsize16 and not rex_w else 4
+    has_modrm = True
+    force_reg = False
+    imm = 0
+
+    if op == 0x0F:
+        if i >= n:
+            return None
+        op = code[i]
+        i += 1
+        if op == 0x38 or op == 0x3A:
+            if i >= n:
+                return None
+            i += 1
+            imm = 1 if op == 0x3A else 0
+        elif op in _X86_INVALID_0F or (mode64 and op in (0x24, 0x26)):
+            return None
+        elif op in _X86_NOMODRM_0F:
+            has_modrm = False
+            if 0x80 <= op <= 0x8F:
+                imm = 4 if mode64 else zsize
+        else:
+            force_reg = 0x20 <= op <= 0x26
+            if op in _X86_IMM8_0F:
+                imm = 1
+            elif op == 0x78 and (opsize16 or repne):
+                imm = 2
+    elif op in (0xC4, 0xC5, 0x62) and i < n and (mode64 or code[i] >= 0xC0):
+        evex = op == 0x62
+        if evex:
+            vmap = code[i] & 7
+            if vmap not in _X86_EVEX_MAPS:
+                return None
+            i += 3
+        elif op == 0xC4:
+            vmap = code[i] & 0x1F
+            if not 1 <= vmap <= 3:
+                return None
+            i += 2
+        else:
+            vmap = 1
+            i += 1
+        if i >= n:
+            return None
+        op = code[i]
+        i += 1
+        if vmap == 1 and op == 0x77 and not evex:
+            has_modrm = False
+        imm = 1 if vmap == 3 or (vmap == 1 and op in _X86_IMM8_VEX1) else 0
+    elif op == 0x8F and i < n and code[i] & 0x38:
+        imm = _X86_XOP_IMM.get(code[i] & 0x1F)
+        if imm is None:
+            return None
+        i += 3
+    else:
+        if mode64 and op in _X86_INVALID64:
+            return None
+        has_modrm = op in _X86_MODRM1
+        kind = _X86_IMM1.get(op, 0)
+        if kind == "z":
+            imm = zsize
+        elif kind == "t":
+            if i >= n:
+                return None
+            if code[i] & 0x30 == 0:
+                imm = 1 if op == 0xF6 else zsize
+        elif kind == "v":
+            imm = 8 if rex_w else zsize
+        elif kind == "m":
+            imm = (8 if mode64 else 4) if not addrsize else (4 if mode64 else 2)
+        elif kind == "r":
+            imm = 4 if mode64 else zsize
+        elif kind == "p":
+            imm = zsize + 2
+        else:
+            imm = kind
+
+    if has_modrm:
+        if i >= n:
+            return None
+        modrm = code[i]
+        i += 1
+        mod = modrm >> 6
+        rm = modrm & 7
+        if mod != 3 and not force_reg:
+            if addr16:
+                i += (2 if rm == 6 else 0) if mod == 0 else mod
+            else:
+                if rm == 4:
+                    if i >= n:
+                        return None
+                    rm = code[i] & 7
+                    i += 1
+                i += (4 if rm == 5 else 0) if mod == 0 else (1 if mod == 1 else 4)
+    i += imm
+    if i > n or i - start > 15:
+        return None
+    return i - start
+
+
+def _x86_insn_start(code: bytes, anchor: int, k: int, mode64: bool) -> bool:
+    """Whether offset *k* of *code* starts an instruction, decoding forward
+    from *anchor*, an offset known to start one (a symbol)."""
+    if k - anchor > _X86_DECODE_MAX:
+        return False
+    i = anchor
+    while i < k:
+        length = _x86_insn_length(code, i, mode64)
+        if length is None:
+            return False
+        i += length
+    return i == k
+
+
+def insn_start_checker(trap: bytes, code: bytes, start: int, anchors: list[int], mode64: bool):
+    """Predicate: whether an offset of *code* (the symbol file's bytes of
+    one section, at runtime address *start*) starts an instruction.
+
+    Fixed-width instructions (aarch64) start on every multiple of their
+    width. x86 instructions do not: the offset must be reached by decoding
+    the symbol file's bytes from the nearest code symbol before it
+    (*anchors*: sorted offsets of the section's code symbols); with none
+    before it, nothing proves it is one.
     """
-    for k in range(max(0, i - 4), i):
-        if elf[k] in _X86_REL32_BRANCH and guest[k] != elf[k]:
-            return True
-    for k in range(max(0, i - 5), i - 1):
-        if elf[k] == 0x0F and elf[k + 1] in _X86_JCC_REL32 and guest[k] != elf[k]:
-            return True
-    return False
+    if len(trap) > 1:
+        return lambda k: not (start + k) % len(trap)
+
+    def starts(k: int) -> bool:
+        j = bisect.bisect_right(anchors, k) - 1
+        return j >= 0 and _x86_insn_start(code, anchors[j], k, mode64)
+
+    return starts
 
 
 # Longest run of int3 padding looked back over for the jump that skips it.
@@ -623,19 +831,21 @@ def _inside_jumped_over_padding(guest: bytes, elf: bytes, i: int) -> bool:
     return False
 
 
-def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, start: int) -> list[int]:
+def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, insn_start) -> list[int]:
     """Offsets where *guest* holds a lone trap instruction nobody owns.
 
     *guest* is target code read at a stop, where GDB holds none of its
     breakpoints in memory; *elf* is the symbol file's bytes for the same
-    addresses, from runtime address *start*. A trap a debugger planted (and
-    a snapshot baked in, or GDB orphaned) replaces the first byte(s) of one
-    instruction: the symbol file has another instruction there and agrees
-    on the bytes that follow, as :func:`classify_trap_site` requires. Traps
-    the kernel writes itself are told apart: on x86 those inside a
-    rewritten rel32 branch (:func:`_inside_rewritten_branch`) or in padding
-    a rewritten jump skips (:func:`_inside_jumped_over_padding`), and with
-    fixed-width instructions (aarch64) a trap off an instruction boundary.
+    addresses. A trap a debugger planted (and a snapshot baked in, or GDB
+    orphaned) replaces the first byte(s) of one instruction: the symbol
+    file has another instruction there, *insn_start(offset)* says it starts
+    one (:func:`insn_start_checker`), and the bytes that follow agree, as
+    :func:`classify_trap_site` requires. That excludes a trap byte the
+    kernel left inside an instruction it rewrote at boot (the rel32 of a
+    retargeted `call`/`jmp`, a return thunk turned into `ret; int3…`).
+    The int3 padding a rewritten jump skips is excluded separately
+    (:func:`_inside_jumped_over_padding`): where it replaced single-byte
+    NOPs, each of its bytes starts an instruction of the symbol file.
     """
     n = len(trap)
     size = min(len(guest), len(elf))
@@ -657,7 +867,7 @@ def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, start: int) -> lis
         candidates = []
         i = guest.find(trap, 0, size)
         while i != -1:
-            if not (start + i) % n and elf[i:i + n] != trap:
+            if elf[i:i + n] != trap:
                 candidates.append(i)
             i = guest.find(trap, i + 1, size)
     found = []
@@ -665,9 +875,9 @@ def stray_trap_offsets(guest: bytes, elf: bytes, trap: bytes, start: int) -> lis
         confirm = min(size - i - n, _TRAP_CONFIRM_BYTES)
         if confirm < _TRAP_MIN_CONFIRM or guest[i + n:i + n + confirm] != elf[i + n:i + n + confirm]:
             continue
-        if trap == b"\xcc" and (
-            _inside_rewritten_branch(guest, elf, i) or _inside_jumped_over_padding(guest, elf, i)
-        ):
+        if trap == b"\xcc" and _inside_jumped_over_padding(guest, elf, i):
+            continue
+        if not insn_start(i):
             continue
         found.append(i)
     return found
@@ -1381,6 +1591,39 @@ def _mark_locations_pending(bp: dict[str, Any], pending: set[tuple[int, int]]) -
         bp["pending"] = True
         for key in ("address", "file", "line"):
             bp.pop(key, None)
+
+
+def _raw_command_leaves_target_alone(command: str) -> bool:
+    """Whether raw GDB *command* is one that reads nothing from the target (#89).
+
+    A read of a running all-stop remote target fails, and GDB 15 aborts when
+    that failure unwinds through its disassembler (`x/i`): the bridge dies
+    with it, and every trap GDB inserted stays in target memory. No list of
+    the commands that read can be complete (pwndbg adds dozens), so while
+    such a target runs only these pass: ``interrupt``, ``help``, ``show``
+    (not ``show convenience``/``values``, which evaluate), and ``info`` (or
+    ``maintenance info``) ``breakpoints``/``watchpoints``/``display``.
+    """
+    words = command.split()
+    if not words:
+        return True
+
+    def spells(word: str, name: str, shortest: int) -> bool:
+        return len(word) >= shortest and name.startswith(word)
+
+    head, rest = words[0], words[1:]
+    if spells(head, "interrupt", 6) or spells(head, "help", 1):
+        return True
+    if spells(head, "show", 3):
+        return not rest or not (spells(rest[0], "convenience", 4) or spells(rest[0], "values", 3))
+    if head == "mt" or spells(head, "maintenance", 2):
+        rest = rest[1:] if rest and spells(rest[0], "info", 1) else []
+    elif not spells(head, "info", 1):
+        return False
+    return bool(rest) and (
+        spells(rest[0], "breakpoints", 1) or spells(rest[0], "watchpoints", 3)
+        or spells(rest[0], "display", 4)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2123,11 +2366,13 @@ class GdbBridge:
         """Capture error context on GDB's thread, after the command unwinds.
 
         A failed op leaves pry's run state as it was: GDB's stop, resume and
-        exit events keep it, and an execution settles its own.
+        exit events keep it, and an execution settles its own. The one
+        exception is a resume GDB aborted (:meth:`_settle_aborted_resume`).
         """
         self._resolve_pending_exit()
         if self._remote_failure:
             return _json_response(ok=False, error=self._remote_failure)
+        self._settle_aborted_resume()
         state = "not-started"
         if self._inferior_is_live():
             state = "running" if self._threads_running() else "stopped"
@@ -2139,6 +2384,28 @@ class GdbBridge:
             with contextlib.suppress(Exception):
                 cause = self._insertion_errors()
         return _json_response(ok=False, error=self._augment_error(exc, state=state, cause=cause))
+
+    def _settle_aborted_resume(self) -> None:
+        """GDB thread, after a failed op: forget a resume that never happened (#77).
+
+        GDB raises its `cont` event before it inserts its breakpoints. When an
+        insert fails it aborts the command (a raw `pry gdb continue`, or one in
+        `py exec`) with no stop event to follow, and ``_running`` would stay
+        True over a stopped target. GDB's own state of the selected thread
+        asks the stub nothing and says whether it really runs; a thread
+        listing would ask an all-stop stub, which refuses while it runs (#68).
+        An execution or trace in flight settles its own state.
+        """
+        if (not self._running or self._execution_lock.locked()
+                or getattr(self, "_active_trace", None) is not None):
+            return
+        with contextlib.suppress(Exception):
+            if gdb.parameter("non-stop"):
+                return  # one stopped thread says nothing about the others
+        with contextlib.suppress(Exception):
+            thread = gdb.selected_thread()
+            if thread is not None and not thread.is_running():
+                self._running = False
 
     @staticmethod
     def _threads_running() -> bool:
@@ -3396,11 +3663,13 @@ class GdbBridge:
             # one uniform slide. Using _text (not the .text section base) lands
             # correctly where _text != _stext (arm), and is identical on x86.
             slide_int = self._parse_addr(base) - ref_vaddr
-        unslid = self._add_symbols_at(path, slide_int)
+        unslid, dropped = self._add_symbols_at(path, slide_int)
         result: dict[str, Any] = {"loaded": path, "slide": hex(slide_int)}
         if unslid:
             # Per-CPU offsets: KASLR does not move them, so neither does pry.
             result["unslid_sections"] = unslid
+        if dropped:
+            result["dropped"] = dropped
         if base is not None:
             result["base"] = hex(self._parse_addr(base))
         if reference is not None:
@@ -3409,12 +3678,13 @@ class GdbBridge:
             result["reference"] = reference
         return self._apply_src_and_scripts(result, params)
 
-    def _add_symbols_at(self, path: str, slide_int: int) -> list[str]:
+    def _add_symbols_at(self, path: str, slide_int: int) -> tuple[list[str], list[str]]:
         """Make *path* the only symbol table for itself, offset by *slide_int*.
 
         Every section moves by the slide except zero-based per-CPU sections
         (see :func:`_elf_zero_based_percpu_sections`), which stay at their link
-        address; their names are returned.
+        address. Returns their names, and the objfiles that are gone and
+        could not be put back (see below).
         """
         # Drop any existing copy so the relocated table is authoritative.
         # remove-symbol-file only removes add-symbol-file'd copies and fails
@@ -3422,27 +3692,49 @@ class GdbBridge:
         # (a `file`/`pry load`/`pry launch <bin>` exec). If the file is STILL
         # loaded after the remove attempt, it's the primary — discard it via
         # `symbol-file` so the relocated table isn't shadowed by the stale
-        # link-time one winning name->address.
+        # link-time one winning name->address. That discards every other
+        # objfile too (#90): the files `load --base/--slide` added are added
+        # again at their slides, and any other one that does not come back
+        # (added by a raw command, a shared library) is returned as dropped.
         # Between the two steps no symbol file defines the breakpoints' names,
         # and GDB disables any breakpoint it fails to re-resolve then; keep the
         # ones the user had enabled enabled.
+        real = os.path.realpath(path)
         enabled = [bp for bp in (gdb.breakpoints() or []) if bp.enabled]
         with contextlib.suppress(gdb.error):
             gdb.execute(f"remove-symbol-file {path}", to_string=True)
+        others: list[str] = []
+        readd: list[dict[str, Any]] = []
         if self._file_is_loaded(path):
+            with contextlib.suppress(Exception):
+                others = [o.filename for o in gdb.objfiles()
+                          if o.filename and os.path.realpath(o.filename) != real]
+            readd = [record for key, record in self._symbol_loads.items()
+                     if key != real and self._file_is_loaded(record["path"])]
             with contextlib.suppress(gdb.error):
                 gdb.execute("symbol-file", to_string=True)  # discard primary symbols
+        try:
+            unslid = self._add_symbol_file(path, slide_int)
+            for record in readd:
+                with contextlib.suppress(gdb.error):
+                    self._add_symbol_file(record["path"], record["slide"])
+        finally:
+            self._reenable_breakpoints(enabled)
+        self._symbol_loads[real] = {"path": path, "slide": slide_int}
+        self._symbol_file = path
+        dropped = [name for name in dict.fromkeys(others) if not self._file_is_loaded(name)]
+        return list(unslid), dropped
+
+    @staticmethod
+    def _add_symbol_file(path: str, slide_int: int) -> dict[str, int]:
+        """`add-symbol-file` *path* with every section offset by *slide_int*
+        but the zero-based per-CPU ones; returns those."""
         offset = f"-0x{-slide_int:x}" if slide_int < 0 else hex(slide_int)
         unslid = _elf_zero_based_percpu_sections(path)
         # `-s SECTION ADDR` pins a section; GDB applies `-o` to the others only.
         pinned = "".join(f" -s {name} {addr:#x}" for name, addr in unslid.items())
-        try:
-            gdb.execute(f"add-symbol-file {path} -o {offset}{pinned}", to_string=True)
-        finally:
-            self._reenable_breakpoints(enabled)
-        self._symbol_loads[os.path.realpath(path)] = {"path": path, "slide": slide_int}
-        self._symbol_file = path
-        return list(unslid)
+        gdb.execute(f"add-symbol-file {path} -o {offset}{pinned}", to_string=True)
+        return unslid
 
     @staticmethod
     def _remove_added_copies(path: str) -> bool:
@@ -4091,9 +4383,12 @@ class GdbBridge:
             return None
         return _elf_file_bytes(real, (addr - slide) & _ADDR_MASK, length)
 
-    def _code_regions(self) -> list[tuple[str, int, bytes]]:
-        """``(path, runtime address, bytes)`` of the code that stays code, in
-        the symbol files pry can map onto target memory (see :meth:`_elf_slide`).
+    def _code_regions(self) -> list[dict[str, Any]]:
+        """The code that stays code in the symbol files pry can map onto
+        target memory (see :meth:`_elf_slide`): one ``{path, start, code,
+        anchors, mode64}`` per section, ``start`` its runtime address,
+        ``code`` its bytes, ``anchors`` the sorted offsets of its code
+        symbols, ``mode64`` whether it is 64-bit code.
 
         Only read-only executable sections, and none the kernel frees after
         boot. A writable section is data the target changes as it runs,
@@ -4107,7 +4402,7 @@ class GdbBridge:
             objfiles = list(gdb.objfiles())
         except Exception:
             return []
-        regions: list[tuple[str, int, bytes]] = []
+        regions: list[dict[str, Any]] = []
         seen: set[str] = set()
         wanted = _ELF_SHF_ALLOC | _ELF_SHF_EXECINSTR
         for objfile in objfiles:
@@ -4124,9 +4419,10 @@ class GdbBridge:
                 continue  # a relocatable object's sections do not move by one slide
             bounds = _elf_symbol_vaddrs(real, ("__init_begin", "__init_end"))
             init_begin, init_end = bounds.get("__init_begin"), bounds.get("__init_end")
+            symbols = _elf_code_symbols(real, parsed)
             try:
                 with open(real, "rb") as f:
-                    for s in parsed[1]:
+                    for index, s in enumerate(parsed[1]):
                         if (s["flags"] & wanted != wanted or s["flags"] & _ELF_SHF_WRITE
                                 or s["type"] == _ELF_SHT_NOBITS or not s["size"]):
                             continue
@@ -4136,7 +4432,16 @@ class GdbBridge:
                         ):
                             continue
                         f.seek(s["offset"])
-                        regions.append((real, (s["addr"] + slide) & _ADDR_MASK, f.read(s["size"])))
+                        regions.append({
+                            "path": real,
+                            "start": (s["addr"] + slide) & _ADDR_MASK,
+                            "code": f.read(s["size"]),
+                            "anchors": [
+                                v - s["addr"] for v in symbols.get(index, ())
+                                if s["addr"] <= v < s["addr"] + s["size"]
+                            ],
+                            "mode64": parsed[0]["is64"],
+                        })
             except OSError:
                 continue
         return regions
@@ -4328,15 +4633,17 @@ class GdbBridge:
             )}
         regions = self._code_regions()
         scan: dict[str, Any] = {
-            "files": sorted({path for path, _, _ in regions}), "bytes": 0, "unreadable": 0,
+            "files": sorted({region["path"] for region in regions}), "bytes": 0, "unreadable": 0,
         }
-        for _, start, elf in regions:
+        for region in regions:
+            start, elf = region["start"], region["code"]
             runs, unreadable = self._read_code(start, len(elf))
             scan["unreadable"] += unreadable
+            starts = insn_start_checker(trap, elf, start, region["anchors"], region["mode64"])
             for offset, guest in runs:
                 scan["bytes"] += len(guest)
                 elf_run = elf[offset:offset + len(guest)]
-                for i in stray_trap_offsets(guest, elf_run, trap, start + offset):
+                for i in stray_trap_offsets(guest, elf_run, trap, lambda i, o=offset: starts(o + i)):
                     addr = (start + offset + i) & _ADDR_MASK
                     if addr in done:
                         continue
@@ -4600,6 +4907,7 @@ class GdbBridge:
                 self._add_symbols_at(record["path"], record["slide"])
                 result["reloaded"].append(record["path"])
 
+        watched = self._reread_watchpoints()
         bps = list(gdb.breakpoints() or [])
         sites = {s["location"]: s for s in self._trap_sites(bps, repair=True, skip=_pending_locations())}
         unreadable = {
@@ -4609,7 +4917,7 @@ class GdbBridge:
             {int(s["address"], 16) for s in sites.values()}, stop_at
         )
         verify = self._verify_insertion(bps, unreadable, keep_inserted=will_resume)
-        result["breakpoints"] = self._resync_entries(bps, sites, verify)
+        result["breakpoints"] = self._resync_entries(bps, sites, verify, watched)
         result["summary"] = _resync_summary(result["breakpoints"], result["stray_traps"])
         if not natural_stop:
             self._last_stop_reason = {"kind": "resynced"}
@@ -4618,7 +4926,38 @@ class GdbBridge:
             result["run_state"] = {"was_running": False, "interrupted": False, "resumed": False}
         return result
 
-    def _resync_entries(self, bps, sites, verify) -> list[dict[str, Any]]:
+    def _reread_watchpoints(self) -> dict[int, dict[str, Any]]:
+        """GDB thread, at resync's stop: have GDB re-read each enabled
+        watchpoint's value from target memory (#98).
+
+        GDB compares the value a trapped write left with the one it read
+        last, and resumes silently when they are equal. It re-reads that
+        value only when something invalidates it (a re-parse on enable, a
+        symbol reload, a write of its own over the watched memory); a
+        snapshot load or a reset changes memory behind its back. A write that
+        puts back the value GDB last saw before the rewind would be
+        swallowed. Re-enabling makes GDB re-parse the expression and re-read
+        it now; pry's own last value (the `old` of `old -> new`) is re-read
+        at the same moment. Returns, by number, ``{"value": ...}`` (None:
+        unreadable now), or ``{"refused": True}`` for one GDB would not
+        enable again, which is disabled now.
+        """
+        watched: dict[int, dict[str, Any]] = {}
+        for bp in list(gdb.breakpoints() or []):
+            if not bp.enabled or not self._is_watchpoint_type(bp.type):
+                continue
+            with contextlib.suppress(gdb.error):
+                bp.enabled = False
+                bp.enabled = True
+            if getattr(bp, "is_valid", lambda: True)():
+                watched[bp.number] = {} if bp.enabled else {"refused": True}
+        self._snapshot_watchpoints()
+        for number, outcome in watched.items():
+            if not outcome:
+                outcome["value"] = self._watchpoint_values.get(number)
+        return watched
+
+    def _resync_entries(self, bps, sites, verify, watched) -> list[dict[str, Any]]:
         """One entry per breakpoint location (or per watch/catchpoint)."""
         pending = verify["pending"]
         entries: list[dict[str, Any]] = []
@@ -4631,11 +4970,23 @@ class GdbBridge:
                 # only verdict besides "disabled" is an observed insert error.
                 if not bp.enabled:
                     entry["status"] = "disabled"
+                    if watched.get(bp.number, {}).get("refused"):
+                        entry["detail"] = (
+                            "GDB would not enable it again to re-read its value at resync's "
+                            f"stop, so it is disabled now: `pry watch enable {bp.number}`"
+                        )
                 elif bp.number in verify["errors"]:
                     entry["status"] = "insert-failed"
                     entry["detail"] = verify["errors"][bp.number]
                 else:
                     entry["status"] = "unverified"
+                if "value" in watched.get(bp.number, {}):
+                    # The value GDB compares the next trapped write with.
+                    entry["value"] = watched[bp.number]["value"]
+                    entry.setdefault("detail", (
+                        "GDB re-read its value from target memory at this stop: "
+                        f"{entry['value'] if entry['value'] is not None else '<unreadable>'}"
+                    ))
                 entry["trap_resident"] = None
                 entries.append(entry)
                 continue
@@ -5461,6 +5812,17 @@ class GdbBridge:
     # Raw GDB command passthrough
     # ------------------------------------------------------------------
 
+    def _remote_target_running(self) -> bool:
+        """GDB thread: an all-stop remote target runs, by pry's or GDB's account."""
+        if not self._needs_stop_for_breakpoints():
+            return False
+        if self._running:
+            return True
+        with contextlib.suppress(Exception):
+            thread = gdb.selected_thread()
+            return thread is not None and thread.is_running()
+        return False
+
     def _gdb_exec(self, params: dict[str, Any]) -> dict[str, Any]:
         command = params["command"]
         words = command.strip().split()
@@ -5477,6 +5839,15 @@ class GdbBridge:
             "target".startswith(head) or "attach".startswith(head)
         )
         self._resolve_pending_exit()
+        if self._remote_target_running() and not _raw_command_leaves_target_alone(command):
+            raise RuntimeError(
+                f"raw `{command.strip()}` is refused while the all-stop remote target "
+                "runs: GDB aborts on some reads of a running stub (taking pry's bridge "
+                "with it and leaving its breakpoints' traps in target memory). While "
+                "it runs, raw commands are limited to interrupt, help, show, and info "
+                "breakpoints/watchpoints/display (the inferior is running — `pry "
+                "interrupt` (or `pry wait`) first)"
+            )
         if self._remote_failure and not (disconnect or load or connect):
             raise RuntimeError(self._remote_failure)
         if not (disconnect or load or connect):
@@ -5628,30 +5999,38 @@ class GdbBridge:
     def _kbase_symbol_file(self, explicit: str | None):
         """``(path, kbase_symbol_info)`` for validation; info is None without one.
 
-        An explicit path must be a kernel image. Otherwise the loaded symbol
-        file is used when it is one (the last `pry load`, else GDB's main file).
+        An explicit path must be a kernel image. Otherwise the loaded objfile
+        that is one, whatever was loaded after it (#91: `pry load mod.ko
+        --base` does not make the module the kernel): the last `pry load`, GDB's
+        main file, then every other objfile, first kernel image wins. Without
+        one, the path is the loaded files checked (None when there is none).
         """
         if explicit:
             return explicit, kbase_symbol_info(explicit)
-        loaded = None
+        loaded: list[str] = []
         if self._symbol_file and self._file_is_loaded(self._symbol_file):
-            loaded = self._symbol_file
-        else:
-            with contextlib.suppress(Exception):
-                loaded = gdb.current_progspace().filename
-        if not loaded:
-            return None, None
-        try:
-            return loaded, kbase_symbol_info(loaded)
-        except ValueError:
-            return loaded, None
+            loaded.append(self._symbol_file)
+        with contextlib.suppress(Exception):
+            loaded.append(gdb.current_progspace().filename)
+        with contextlib.suppress(Exception):
+            loaded.extend(o.filename for o in gdb.objfiles())
+        checked: dict[str, str] = {}
+        for path in loaded:
+            if not path or not os.path.isfile(path) or os.path.realpath(path) in checked:
+                continue
+            checked[os.path.realpath(path)] = path
+            try:
+                return path, kbase_symbol_info(path)
+            except ValueError:
+                continue
+        return ", ".join(checked.values()) or None, None
 
     @staticmethod
     def _kbase_unvalidated_message(
         loaded: str | None, pwndbg: dict[str, Any], probe: dict[str, Any]
     ) -> str:
         why = (
-            f"the loaded symbol file {loaded} is not a Linux kernel image"
+            f"no loaded symbol file ({loaded}) is a Linux kernel image"
             if loaded else "no kernel symbol file is loaded"
         )
         hints = []
