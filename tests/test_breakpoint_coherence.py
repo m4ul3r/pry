@@ -767,8 +767,68 @@ def test_a_target_that_ends_during_a_hold_ends_the_hold(monkeypatch, op, code):
     thread.join(timeout=5)
     assert responses, "the waiter sat out its timeout"
     assert responses[0]["result"]["state"] == "exited"
-    assert bridge.dispatch({"op": "status"})["result"]["state"] == "exited"
+    status = bridge.dispatch({"op": "status"})["result"]
+    assert status["state"] == "exited"
+    # The hold's own interrupt is nobody's result: a background execution's
+    # last result is its exit, as without a hold.
+    if op == "wait":
+        assert status["last_background_result"]["state"] == "exited"
+    else:
+        assert "last_background_result" not in status
     assert bridge.dispatch({"op": "release", "params": {}})["ok"] is False
+    assert bridge.dispatch({"op": "run", "params": {"_background": True}})["ok"] is True
+
+
+@pytest.mark.parametrize("op", ["wait", "continue"])
+@pytest.mark.parametrize("hooked", [True, False])
+def test_a_target_that_ends_while_a_hold_is_taken_is_no_resume(monkeypatch, op, hooked):
+    """#114: the target is killed as the hold's interrupt stops it, before the
+    hold knows its stop: by a stop hook of the user's, which runs before the
+    interrupt reads the stop (*hooked*), or just after. The hold fails, and
+    the waiter gets the exit: not the hold's own SIGINT stop, nor an error
+    blaming a resume nobody made."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    if op == "wait":
+        assert bridge.dispatch({"op": "continue", "params": {"_background": True}})["ok"] is True
+        thread, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    else:
+        thread, responses = _in_flight(bridge, "continue", {"_timeout": 10})
+        for _ in range(500):
+            if bridge._foreground_job is not None:
+                break
+            threading.Event().wait(0.01)
+
+    def kill(*_):
+        fake_gdb.selected_inferior().pid = 0
+        fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+
+    if hooked:
+        def once(event):
+            fake_gdb.events.stop.disconnect(once)
+            kill()
+
+        fake_gdb.events.stop.connect(once)
+    else:
+        execute = fake_gdb.execute
+
+        def killed_at_the_interrupt(cmd, to_string=False):
+            result = execute(cmd, to_string=to_string)
+            if cmd == "interrupt":
+                kill()
+            return result
+
+        fake_gdb.execute = killed_at_the_interrupt
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    held = bridge.dispatch({"op": "hold", "params": {}})
+
+    assert held["ok"] is False
+    thread.join(timeout=5)
+    assert responses, "the waiter sat out its timeout"
+    assert responses[0]["ok"] is True, responses[0]
+    assert responses[0]["result"]["state"] == "exited"
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "exited"
     assert bridge.dispatch({"op": "run", "params": {"_background": True}})["ok"] is True
 
 

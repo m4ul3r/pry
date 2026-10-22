@@ -1916,8 +1916,11 @@ class GdbBridge:
         # None when the target was stopped already}. No execution starts then.
         self._hold: dict[str, Any] | None = None
         # Why the last hold ended without its release (a resume pry did not
-        # make), for the release that comes too late to end it.
+        # make, or its target went away), for the release that comes too late.
         self._hold_ended: str | None = None
+        # One side settles a hold its target left (GDB's exit event, or the
+        # hold still being taken when it came): _settle_hold_gone.
+        self._hold_settle_lock = threading.Lock()
         # Inferior calls in flight (`pry call`): they resume and come back.
         self._inferior_calls = 0
         # Set by _finish just before running `finish` so the stop handler can
@@ -2240,33 +2243,68 @@ class GdbBridge:
         """
         if self._deferred:
             gdb.post_event(self._undefer_all)
-        hold, self._hold = self._hold, None
+        hold = self._hold
         if hold is None:
             return
+        # Marked before it is cleared: a hold still being taken (_dispatch_hold)
+        # must not mistake this end for a resume pry did not make.
+        hold["gone"] = what
+        self._hold = None
         self._hold_ended = (
             f"{what} during a caller's hold (`pry interrupt --hold`), which ended the "
             "hold; nothing is left to resume: `pry status`"
         )
+        self._settle_hold_gone(hold)
+
+    def _settle_hold_gone(self, hold: dict[str, Any]) -> None:
+        """Send whoever waited through *hold*, which ended because its target
+        went away (#114), what a `pry wait` gets without a hold: the exit, or
+        the lost connection; never the hold's own interrupt, which is nobody's
+        answer (not even `pry status`'s last background result). Called by
+        _target_went_away, and by _dispatch_hold when the target went away
+        before its stop was known, so it settles each pause once."""
         pause = hold["pause"]
-        if pause is None or pause["settled"].is_set():
+        if pause is None:
             return
-        if pause["job"] is not None:
-            successor: dict[str, Any] = {
-                "completion": threading.Event(), "response": None, "restored": [],
-            }
-            pause["job"]["superseded_by"] = successor
+        with self._hold_settle_lock:
+            if pause["settled"].is_set():
+                return
+            job = pause["job"]
+            # A stop the target reached on its own (or its exit itself) is the
+            # operator's answer already; only the hold's own interrupt is not.
+            # pause["resume"] judged it from the interrupt's read of the stop,
+            # which comes too late when the target went away at that stop (a
+            # stop hook's `kill`): then the job's own answer tells.
+            if job is not None and (pause["resume"] or self._interrupted_answer(job)):
+                successor: dict[str, Any] = {
+                    "completion": threading.Event(), "response": None, "restored": [],
+                }
+                job["superseded_by"] = successor
+                if self._background_job is job:
+                    self._background_job = successor
 
-            def answer():
-                # Read once GDB has unwound its target stack (_on_exited).
-                try:
-                    response = _json_response(ok=True, result=self._execution_state())
-                except Exception as exc:
-                    response = _json_response(ok=False, error=str(exc))
-                successor["response"] = response
-                successor["completion"].set()
+                def answer():
+                    # Read once GDB has unwound its target stack (_on_exited).
+                    try:
+                        response = _json_response(ok=True, result=self._execution_state())
+                    except Exception as exc:
+                        response = _json_response(ok=False, error=str(exc))
+                    successor["response"] = response
+                    successor["completion"].set()
 
-            gdb.post_event(answer)
-        pause["settled"].set()
+                gdb.post_event(answer)
+            pause["settled"].set()
+
+    @staticmethod
+    def _interrupted_answer(job: dict[str, Any]) -> bool:
+        """Whether *job* ended with the SIGINT stop of pry's own interrupt."""
+        response = job.get("response") or {}
+        result = response.get("result") if response.get("ok") else None
+        reason = (result or {}).get("reason") or {}
+        return (
+            (result or {}).get("state") == "stopped"
+            and reason.get("kind") == "signal" and reason.get("signal") == "SIGINT"
+        )
 
     def _resolve_pending_exit(self):
         """Finish terminal bookkeeping only after GDB returns to its event loop."""
@@ -3109,9 +3147,25 @@ class GdbBridge:
                 )
             except BaseException:
                 self._hold = None
+                if "gone" in hold:
+                    self._hold_ended = None  # this hold was never taken
                 raise
             hold["pause"] = pause
+
+            def went_away() -> RuntimeError:
+                # The target went away while pry took the hold (#114): its
+                # waiters get the exit or the loss, not a resume nobody made.
+                self._settle_hold_gone(hold)
+                self._hold_ended = None
+                return RuntimeError(
+                    f"nothing was held: {hold['gone']} while pry was stopping it for the "
+                    "hold: `pry status`"
+                )
+
             if self._hold is not hold:
+                # _target_went_away marks the hold before it clears it.
+                if "gone" in hold:
+                    raise went_away()
                 # Resumed elsewhere as it was taken: end it so, waiters included.
                 self._hold = hold
                 self._end_hold_resumed_elsewhere()
@@ -3128,12 +3182,18 @@ class GdbBridge:
                 run_state["stop"] = pause["stop"]
 
             def held() -> dict[str, Any]:
-                if run_state["will_resume"]:
+                if run_state["will_resume"] and self._hold is hold:
                     self._last_stop_reason = {"kind": "held"}
                     self._pending_stop_event = None
                 return self._execution_state()
 
-            result = _run_on_gdb_thread(held)
+            try:
+                result = _run_on_gdb_thread(held)
+            except Exception:
+                if "gone" not in hold:
+                    raise
+            if "gone" in hold:
+                raise went_away()
         return _json_response(ok=True, result={**result, "held": True, "run_state": run_state})
 
     def _dispatch_release(self) -> dict[str, Any]:
