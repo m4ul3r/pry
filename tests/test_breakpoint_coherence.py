@@ -667,7 +667,8 @@ def test_a_stop_of_its_own_during_a_hold_goes_to_the_waiter_at_once(monkeypatch)
 
 def test_a_release_gdb_cannot_resume_fails_and_ends_the_hold(monkeypatch):
     """A hold across a reset leaves the guest at the reset vector, where GDB
-    cannot insert a breakpoint at a kernel address, so it cannot resume."""
+    cannot insert a breakpoint at a kernel address: without a resync at the
+    hold to defer it (#98), GDB cannot resume."""
     _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
     _Bp(stub, 1, TRAP_SITE)
     _start_background(bridge, fake_gdb, stub)
@@ -731,6 +732,167 @@ def test_a_foreground_timeout_after_the_release_leaves_no_background_result(monk
 
     assert responses[0]["result"]["timeout_interrupt"] is True
     assert "last_background_result" not in bridge.dispatch({"op": "status"})["result"]
+
+
+def _held_in_flight(bridge, fake_gdb, op):
+    """The operator's `pry wait` (on a background continue) or foreground
+    `continue` in flight, and a caller's hold that stopped it."""
+    if op == "wait":
+        assert bridge.dispatch({"op": "continue", "params": {"_background": True}})["ok"] is True
+        thread, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    else:
+        thread, responses = _in_flight(bridge, "continue", {"_timeout": 10})
+        for _ in range(500):
+            if bridge._foreground_job is not None:
+                break
+            threading.Event().wait(0.01)
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+    held = bridge.dispatch({"op": "hold", "params": {}})
+    assert held["result"]["run_state"]["will_resume"] is True, held
+    return thread, responses
+
+
+@pytest.mark.parametrize("op", ["wait", "continue"])
+@pytest.mark.parametrize("code", [0, None])  # it exits, or `pry gdb kill` kills it
+def test_a_target_that_ends_during_a_hold_ends_the_hold(monkeypatch, op, code):
+    """#114: whoever waits through the hold gets the exit at once, as without
+    a hold, and nothing refuses a new run for a hold on a process that is gone."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    thread, responses = _held_in_flight(bridge, fake_gdb, op)
+
+    fake_gdb.selected_inferior().pid = 0
+    fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(code))
+
+    thread.join(timeout=5)
+    assert responses, "the waiter sat out its timeout"
+    assert responses[0]["result"]["state"] == "exited"
+    status = bridge.dispatch({"op": "status"})["result"]
+    assert status["state"] == "exited"
+    # The hold's own interrupt is nobody's result: a background execution's
+    # last result is its exit, as without a hold.
+    if op == "wait":
+        assert status["last_background_result"]["state"] == "exited"
+    else:
+        assert "last_background_result" not in status
+    assert bridge.dispatch({"op": "release", "params": {}})["ok"] is False
+    assert bridge.dispatch({"op": "run", "params": {"_background": True}})["ok"] is True
+
+
+@pytest.mark.parametrize("op", ["wait", "continue"])
+@pytest.mark.parametrize("hooked", [True, False])
+def test_a_target_that_ends_while_a_hold_is_taken_is_no_resume(monkeypatch, op, hooked):
+    """#114: the target is killed as the hold's interrupt stops it, before the
+    hold knows its stop: by a stop hook of the user's, which runs before the
+    interrupt reads the stop (*hooked*), or just after. The hold fails, and
+    the waiter gets the exit: not the hold's own SIGINT stop, nor an error
+    blaming a resume nobody made."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    bridge = bridge_mod.GdbBridge()
+    if op == "wait":
+        assert bridge.dispatch({"op": "continue", "params": {"_background": True}})["ok"] is True
+        thread, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    else:
+        thread, responses = _in_flight(bridge, "continue", {"_timeout": 10})
+        for _ in range(500):
+            if bridge._foreground_job is not None:
+                break
+            threading.Event().wait(0.01)
+
+    def kill(*_):
+        fake_gdb.selected_inferior().pid = 0
+        fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+
+    if hooked:
+        def once(event):
+            fake_gdb.events.stop.disconnect(once)
+            kill()
+
+        fake_gdb.events.stop.connect(once)
+    else:
+        execute = fake_gdb.execute
+
+        def killed_at_the_interrupt(cmd, to_string=False):
+            result = execute(cmd, to_string=to_string)
+            if cmd == "interrupt":
+                kill()
+            return result
+
+        fake_gdb.execute = killed_at_the_interrupt
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+
+    held = bridge.dispatch({"op": "hold", "params": {}})
+
+    assert held["ok"] is False
+    thread.join(timeout=5)
+    assert responses, "the waiter sat out its timeout"
+    assert responses[0]["ok"] is True, responses[0]
+    assert responses[0]["result"]["state"] == "exited"
+    assert bridge.dispatch({"op": "status"})["result"]["state"] == "exited"
+    assert bridge.dispatch({"op": "run", "params": {"_background": True}})["ok"] is True
+
+
+@pytest.mark.parametrize("op", ["wait", "continue"])
+def test_a_remote_lost_during_a_hold_ends_it_and_waiters_get_the_loss(monkeypatch, op):
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _resume_like_gdb(fake_gdb, stub)
+    thread, responses = _held_in_flight(bridge, fake_gdb, op)
+    inferior = fake_gdb.selected_inferior()
+
+    # The stub dies; GDB finds out at its next packet and tears the target down.
+    inferior.pid = 0
+    inferior.connection = None
+    fake_gdb.events.exited.fire(fake_gdb._FakeExitedEvent(None))
+    fake_gdb.events.connection_removed.fire(types.SimpleNamespace(connection=stub))
+
+    thread.join(timeout=5)
+    assert responses, "the waiter sat out its timeout"
+    assert responses[0]["ok"] is False
+    assert bridge.dispatch({"op": "release", "params": {}})["ok"] is False
+    assert bridge.dispatch({"op": "hold", "params": {}})["ok"] is False  # nothing to hold
+
+
+def test_a_hold_across_a_reset_releases_with_software_breakpoints_deferred(monkeypatch):
+    """#98: at the reset vector no kernel address is mapped, so GDB can insert
+    no software breakpoint there and would not resume at all. resync at the
+    hold defers them; the release resumes the guest, and the first execution
+    that finds their memory readable (the boot mapped its text) re-arms them."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _Bp(stub, 1, TRAP_SITE)
+    _start_background(bridge, fake_gdb, stub)
+    waiter, responses = _in_flight(bridge, "wait", {"_timeout": 10})
+    fake_gdb._pending_stop_event = fake_gdb._FakeSignalEvent("SIGINT")
+    assert bridge.dispatch({"op": "hold", "params": {}})["ok"] is True
+    kernel = dict(stub.mem)
+    stub.mem.clear()  # system_reset: the guest waits at its reset vector
+
+    resync = bridge.dispatch({"op": "resync", "params": {}})["result"]
+
+    [entry] = resync["breakpoints"]
+    assert (entry["status"], entry["deferred"]) == ("unreadable", True)
+    [listed] = bridge.dispatch({"op": "break_list", "params": {}})["result"]
+    assert listed["locations"][0]["deferred"] is True
+
+    released = bridge.dispatch({"op": "release", "params": {}})
+
+    assert released["ok"] is True, released
+    assert released["result"]["run_state"]["resumed"] is True
+    assert released["result"]["run_state"]["deferred"] == ["1.1"]
+    waiter.join(timeout=0.2)
+    assert waiter.is_alive(), "the waiter returned the hold's own stop"
+    # The guest boots, mapping the kernel's text, and stops (`pry interrupt`).
+    stub.mem.update(kernel)
+    fake_gdb.events.stop.fire(fake_gdb._FakeSignalEvent("SIGINT"))
+    waiter.join(timeout=5)
+    assert responses[0]["result"]["reason"] == {"kind": "signal", "signal": "SIGINT"}
+
+    resumed = bridge.dispatch({"op": "continue", "params": {"_background": True}})
+
+    assert resumed["ok"] is True, resumed
+    assert stub.mem[TRAP_SITE] == 0xCC  # inserted as GDB resumed the target
+    [listed] = bridge.dispatch({"op": "break_list", "params": {}})["result"]
+    assert "deferred" not in listed["locations"][0]
 
 
 def test_failed_op_while_running_keeps_the_run_state(monkeypatch):
@@ -892,6 +1054,104 @@ def test_plain_continue_stop_fails_when_gdb_could_not_insert(monkeypatch, refuse
     assert stub.inserted == {}
 
 
+def _five_hardware_breakpoints(fake_gdb, stub):
+    """A software breakpoint and a hardware one GDB has no debug register left for."""
+    _Bp(stub, 1, TRAP_SITE)
+    hw = _Bp(stub, 2, TRAP_SITE + 4, bp_type=fake_gdb.BP_HARDWARE_BREAKPOINT)
+    update = stub.update
+
+    def update_without_free_debug_registers():
+        if stub.always_inserted and hw.enabled:
+            raise fake_gdb.error(
+                "Warning:\nCannot insert hardware breakpoint 2:Remote failure reply: 01.\n"
+            )
+        update()
+
+    stub.update = update_without_free_debug_registers
+
+
+@pytest.mark.parametrize(("op", "params", "finished"), [
+    ("finish", {}, "function-finished"), ("next", {}, "end-stepping-range"),
+    ("step", {}, "end-stepping-range"), ("until", {"location": "6"}, "location-reached"),
+])
+@pytest.mark.parametrize("gave_up", [True, False])
+def test_a_step_op_gdb_gave_up_on_fails_when_it_could_not_insert(monkeypatch, op, params, finished, gave_up):
+    """#78: GDB stepped over the breakpoint at the PC, could not insert its
+    breakpoints to go on, and stopped the op short of its goal; its stop
+    details then name no reason. A step that finished names one, and is a
+    step whatever a trial insertion says."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _five_hardware_breakpoints(fake_gdb, stub)
+    stop = fake_gdb._FakeStopEvent()
+    stop.details = {} if gave_up else {"reason": finished}
+    fake_gdb._pending_stop_event = stop
+
+    response = bridge.dispatch({"op": op, "params": dict(params)})
+
+    if gave_up:
+        assert response["ok"] is False
+        assert f"`{op}`" in response["error"]
+        assert "Cannot insert hardware breakpoint 2" in response["error"]
+        assert bridge.dispatch({"op": "status"})["result"]["state"] == "stopped"
+    else:
+        assert response["result"]["reason"] == {"kind": "step"}
+    assert stub.inserted == {}
+
+
+def test_status_after_a_failed_background_execution_reports_the_state(monkeypatch):
+    """#79: `pry wait` fails with the job it waits for; `pry status` still
+    says where the target is, with exit 0, and carries that failure."""
+    _, fake_gdb, bridge, stub = _remote_target(monkeypatch, _memory(ELF_WINDOW))
+    _five_hardware_breakpoints(fake_gdb, stub)
+    assert bridge.dispatch({"op": "continue", "params": {"_background": True}})["ok"] is True
+    # GDB steps over the breakpoint at the PC, cannot insert the rest, stops.
+    fake_gdb.events.stop.fire(fake_gdb._FakeStopEvent())
+
+    waited = bridge.dispatch({"op": "wait", "params": {}})
+    status = bridge.dispatch({"op": "status"})
+
+    assert waited["ok"] is False
+    assert status["ok"] is True, status
+    assert status["result"]["state"] == "stopped"
+    assert status["result"]["frame"]["address"]
+    assert status["result"]["last_background_error"] == waited["error"]
+    assert bridge.dispatch({"op": "break_disable", "params": {"number": 1}})["ok"] is True
+    assert bridge.dispatch({"op": "status"})["ok"] is True
+
+
+@pytest.mark.parametrize(("si_code", "kind"), [
+    (0, "signal"),       # SI_USER: kill -TRAP
+    (-6, "signal"),      # SI_TKILL: raise(SIGTRAP)
+    (0x80, "trap"),      # SI_KERNEL: an int3 on x86
+    (None, "trap"),      # no siginfo (QEMU's gdbstub)
+])
+def test_a_sigtrap_another_process_sent_is_a_signal(monkeypatch, si_code, kind):
+    """#80: GDB reports every SIGTRAP its breakpoints do not explain as a
+    plain stop; only one the kernel raised is a trap nobody owns."""
+    bridge_mod, fake_gdb = _load_bridge(monkeypatch)
+    parse_and_eval = fake_gdb.parse_and_eval
+
+    def siginfo(expression):
+        if expression != "$_siginfo.si_code":
+            return parse_and_eval(expression)
+        if si_code is None:
+            raise fake_gdb.error("Unable to read siginfo")
+        return si_code
+
+    monkeypatch.setattr(fake_gdb, "parse_and_eval", siginfo)
+    bridge = bridge_mod.GdbBridge()
+    fake_gdb._pending_stop_event = fake_gdb._FakeStopEvent()
+
+    reason = bridge.dispatch({"op": "continue", "params": {}})["result"]["reason"]
+
+    assert reason["kind"] == kind
+    if kind == "signal":
+        assert reason == {"kind": "signal", "signal": "SIGTRAP"}
+    else:
+        assert reason.get("si_code") == si_code
+        assert reason["remote"] is False
+
+
 # --- symbol reload ---------------------------------------------------------------
 
 def test_rebasing_the_primary_symbol_file_keeps_breakpoints_enabled(monkeypatch, tmp_path):
@@ -982,8 +1242,10 @@ def test_resync_reports_unreadable_and_pending_locations_as_not_armed(monkeypatc
     assert status["2.1"]["status"] == "pending"
     assert "address" not in status["2.1"]
     assert result["summary"]["not_armed"] == 2
-    # Held out of the trial insertion, then handed back enabled.
-    assert unreadable.locations[0].enabled is True
+    # Held back until its memory is readable, so a resume does not fail on it (#98).
+    assert status["1.1"]["deferred"] is True
+    assert "deferred" not in status["2.1"]
+    assert result["summary"]["deferred"] == 1
 
 
 def test_resync_drops_a_stale_stub_record_before_arming(monkeypatch):

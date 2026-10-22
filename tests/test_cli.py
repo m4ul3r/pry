@@ -2864,6 +2864,49 @@ def test_render_status_text_shows_exit_code():
     assert "exited (code 3)" in text
 
 
+def test_render_status_text_carries_a_failed_background_execution():
+    """#79: the state stays readable beside the failure."""
+    error = "GDB could not insert its breakpoints, so it stopped the `continue` at 0x401144 in tick"
+    value = {"state": "stopped", "frame": {"function": "tick", "address": "0x401144"},
+             "thread": 1, "last_background_error": error}
+    text = pry.cli._render_status_text(value)
+    assert "state: stopped" in text
+    assert "frame: tick" in text
+    assert error in text
+
+
+@pytest.mark.parametrize("trap_in_memory", [False, True])
+def test_trap_text_names_resync_only_on_a_remote_target(trap_in_memory):
+    """#80: a stub record nobody owns, or a trap left behind in a VM, exists
+    only on a remote target; `pry resync` is no remedy for a native process."""
+    reason = {"kind": "trap", "address": "0x401144", "trap_in_memory": trap_in_memory}
+    native = pry.cli._format_stop_reason({**reason, "remote": False})
+    remote = pry.cli._format_stop_reason({**reason, "remote": True})
+    assert "pry resync" not in native
+    assert "pry resync" in remote
+    assert "0x401144" in native and "0x401144" in remote
+
+
+def test_trap_text_names_the_kernel_si_code():
+    text = pry.cli._format_stop_reason(
+        {"kind": "trap", "address": "0x401144", "trap_in_memory": False, "si_code": 2, "remote": False}
+    )
+    assert "TRAP_TRACE" in text
+
+
+def test_deferred_breakpoints_are_named_wherever_a_resume_reports_them():
+    """#98: a location pry held back does not fire; every result of a resume says which."""
+    release = {"released": True, "state": "running", "status": "running",
+               "run_state": {"was_running": True, "interrupted": True, "resumed": True,
+                             "deferred": ["1.1"]}}
+    stop = {"status": "stopped", "reason": {"kind": "signal", "signal": "SIGINT"}, "deferred": ["1.1"]}
+    listing = [{"number": 1, "kind": "breakpoint", "enabled": True, "location": "f",
+                "locations": [{"address": "0xffffffff81000000", "enabled": False, "deferred": True}]}]
+    assert "#1.1" in pry.cli._render_release_text(release)
+    assert "#1.1" in pry.cli._render_stop_text(stop)
+    assert "deferred" in pry.cli._render_breakpoint_list_text(listing)
+
+
 def test_version_flag(capsys):
     with pytest.raises(SystemExit) as exc:
         pry.cli.main(["--version"])

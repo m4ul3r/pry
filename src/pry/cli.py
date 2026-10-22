@@ -500,6 +500,10 @@ def _render_doctor_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+# Linux `si_code`s of a SIGTRAP the kernel raised (a stop's `si_code`, #80).
+_SI_CODE_NAMES = {1: "TRAP_BRKPT", 2: "TRAP_TRACE", 3: "TRAP_BRANCH", 4: "TRAP_HWBKPT", 0x80: "SI_KERNEL"}
+
+
 def _format_stop_reason(reason: Any) -> str | None:
     """Format a structured stop-reason dict into a human-readable string."""
     if not isinstance(reason, dict):
@@ -527,15 +531,24 @@ def _format_stop_reason(reason: Any) -> str | None:
         return f"exited (code {code})" if code is not None else "exited"
     if kind == "trap":
         where = reason.get("address") or "?"
+        remote = reason.get("remote")
         if reason.get("trap_in_memory"):
             site = reason.get("trap_address") or where
-            return (f"trap at {where}: no pry breakpoint owns the trap instruction at "
-                    f"{site} (the program's own, or one left behind: orphaned, or baked "
-                    "into a restored snapshot; on a remote target `pry resync` restores "
-                    "one left behind)")
-        return (f"trap at {where}: no breakpoint or signal explains this stop (on a remote "
-                "target, a breakpoint the stub still records for nobody stops it like this: "
-                "`pry resync` drops it)")
+            text = f"trap at {where}: no pry breakpoint owns the trap instruction at {site}"
+            if not remote:
+                return f"{text} (the program's own)"
+            return (f"{text} (the program's own, or one left behind: orphaned, or baked into "
+                    "a restored snapshot; `pry resync` restores one left behind)")
+        text = (f"trap at {where}: a SIGTRAP no breakpoint claims, with no trap instruction "
+                "in memory there")
+        code = reason.get("si_code")
+        if code is not None:
+            name = _SI_CODE_NAMES.get(code)
+            text += f" (the kernel raised it: si_code {code}{f', {name}' if name else ''})"
+        if remote:
+            text += ("; a breakpoint the stub still records for nobody stops it like this: "
+                     "`pry resync` drops it")
+        return text
     if kind == "resynced":
         return "resynced (state re-read after the machine changed under the debugger)"
     if kind == "held":
@@ -585,6 +598,15 @@ def _trap_warning(trap: dict) -> str:
             "target traps there with no breakpoint to catch it")
 
 
+def _deferred_warning(locations: list) -> str:
+    """A `warning:` line for breakpoint locations pry held back (#98)."""
+    names = ", ".join(f"#{loc}" for loc in locations)
+    return (f"warning: breakpoint location(s) {names} were not inserted: their memory cannot "
+            "be read (not mapped yet, as at a guest's reset vector; or moved by a KASLR "
+            "re-slide), so they do not fire until pry re-arms each, before the first pry "
+            "execution that finds its memory readable")
+
+
 def _breakpoint_op_notes(value: dict) -> list[str]:
     """Trailing lines of a breakpoint op: restored traps, and a paused target."""
     lines = [_trap_warning(t) for t in value.get("baked_traps") or [] if isinstance(t, dict)]
@@ -596,6 +618,8 @@ def _breakpoint_op_notes(value: dict) -> list[str]:
             lines.append("warning: GDB could not insert location(s) "
                          f"{', '.join('#' + str(g) for g in gave_up)} when it resumed the "
                          "target: they are pending and will not fire")
+        if run_state.get("deferred"):
+            lines.append(_deferred_warning(run_state["deferred"]))
     return lines
 
 
@@ -642,6 +666,8 @@ def _render_stop_text(value: Any) -> str:
     for trap in value.get("baked_traps") or []:
         if isinstance(trap, dict):
             parts.append(_trap_warning(trap))
+    if value.get("deferred"):
+        parts.append(_deferred_warning(value["deferred"]))
     return "\n".join(parts)
 
 
@@ -682,6 +708,9 @@ def _render_status_text(value: Any) -> str:
             for d in displays:
                 if isinstance(d, dict):
                     parts.append(f"  display #{d.get('number')}: {d.get('expr')} = {d.get('value')}")
+    if value.get("last_background_error"):
+        # Its `pry wait` fails with it; the state above is still the truth.
+        parts.append(f"last background execution failed: {value['last_background_error']}")
     return "\n".join(parts)
 
 
@@ -783,6 +812,8 @@ def _render_release_text(value: Any) -> str:
         lines.append("warning: GDB could not insert location(s) "
                      f"{', '.join('#' + str(g) for g in gave_up)} when it resumed the "
                      "target: they are pending and will not fire")
+    if run_state.get("deferred"):
+        lines.append(_deferred_warning(run_state["deferred"]))
     return "\n".join(lines)
 
 
@@ -913,6 +944,8 @@ def _render_breakpoint_list_text(value: Any) -> str:
             line += " (pending)"
         if bp.get("temporary"):
             line += " (temporary)"
+        if loc_count <= 1 and any(loc.get("deferred") for loc in _bp_location_entries(bp)):
+            line += " (deferred: not inserted until its memory is readable)"
         thread = bp.get("thread")
         if thread is not None:
             line += f" thread {thread}"
@@ -932,7 +965,8 @@ def _render_breakpoint_list_text(value: Any) -> str:
             for loc in _bp_location_entries(bp):
                 detail = _format_bp_location_detail(loc)
                 if detail:
-                    lines.append(f"  {detail}")
+                    deferred = " (deferred: not inserted until its memory is readable)"
+                    lines.append(f"  {detail}{deferred if loc.get('deferred') else ''}")
     return "\n".join(lines)
 
 
@@ -2616,6 +2650,8 @@ def _format_resync_entry(entry: dict) -> str:
         tags.append("no trap byte in memory")
     if entry.get("reseated"):
         tags.append("re-inserted over a stale stub record")
+    if entry.get("deferred"):
+        tags.append("deferred")
     if entry.get("stub_record"):
         tags.append("dropped a stub record nobody owned")
     if entry.get("baked_trap"):
@@ -2662,6 +2698,8 @@ def _render_resync_text(value: Any) -> str:
         lines.append(f"symbols: re-read {path} so GDB re-resolves breakpoints it had given up on")
     summary = value.get("summary") or {}
     head = f"breakpoints: {summary.get('armed', 0)} armed, {summary.get('not_armed', 0)} not armed"
+    if summary.get("deferred"):
+        head += f" ({summary['deferred']} deferred until their memory is readable)"
     if summary.get("baked_traps"):
         head += f", {summary.get('repaired', 0)} of {summary['baked_traps']} baked trap(s) restored"
     lines.append(head)
