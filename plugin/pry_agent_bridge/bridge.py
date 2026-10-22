@@ -1638,13 +1638,17 @@ def _pending_locations() -> set[tuple[int, int]]:
     return {(int(m.group(1)), int(m.group(2))) for m in _PENDING_LOCATION_RE.finditer(out or "")}
 
 
-def _breakpoint_to_dict(bp, pending_locations: set[tuple[int, int]] | None = None) -> dict[str, Any]:
+def _breakpoint_to_dict(
+    bp, pending_locations: set[tuple[int, int]] | None = None,
+    deferred_locations: set[tuple[int, int]] | None = None,
+) -> dict[str, Any]:
     """Convert a gdb.Breakpoint to a JSON-friendly dict.
 
     ``pending_locations`` (from :func:`_pending_locations`) marks locations GDB
     shows as <PENDING>: they carry ``pending: true`` and no address, because GDB
     will not insert them, and a breakpoint whose every location is pending is
-    itself ``pending``.
+    itself ``pending``. ``deferred_locations`` marks those pry holds back
+    until their memory is readable (``deferred: true``, #98).
     """
     result: dict[str, Any] = {
         "number": bp.number,
@@ -1688,6 +1692,8 @@ def _breakpoint_to_dict(bp, pending_locations: set[tuple[int, int]] | None = Non
                         for key in ("address", "file", "line"):
                             entry.pop(key, None)
                         entry["pending"] = True
+                    if deferred_locations and (bp.number, index) in deferred_locations:
+                        entry["deferred"] = True
                     serialized.append(entry)
                 # Drop empties (defensive against odd location objects).
                 serialized = [s for s in serialized if s]
@@ -1760,6 +1766,7 @@ def _resync_summary(entries: list[dict[str, Any]], strays: list[dict[str, Any]])
         "breakpoints": len(entries),
         "armed": sum(e["status"] == "armed" for e in entries),
         "not_armed": sum(e["status"] in _NOT_ARMED for e in entries),
+        "deferred": sum(bool(e.get("deferred")) for e in entries),
         "baked_traps": sum(bool(e.get("baked_trap")) for e in entries),
         "repaired": sum(bool(e.get("repaired")) for e in entries),
         "elf_mismatch": sum(e.get("elf_match") is False for e in entries),
@@ -1932,6 +1939,16 @@ class GdbBridge:
         # Execution op driving the inferior, so a stop nothing explains is not
         # mistaken for a completed step.
         self._exec_op: str | None = None
+        # The stop reason of a step op (`step`, `next`, `finish`, `until`) GDB
+        # stopped before the op finished (#78): its stop details carry no
+        # `reason`, as after a breakpoint GDB could not insert.
+        self._unfinished_stop: dict[str, Any] | None = None
+        # Software breakpoint locations pry holds out of GDB's insertion
+        # because their memory could not be read at resync's stop (#98, a
+        # guest at its reset vector): number -> 1-based location indices.
+        # GDB would refuse to resume the target with them. Each is re-armed
+        # before the first resume at which its memory is readable.
+        self._deferred: dict[int, set[int]] = {}
         # True while GDB holds its code breakpoints in target memory at a
         # stop: resync arms them there for the resume that follows. Any other
         # stop has them out (GDB removes them), unless always-inserted is on.
@@ -2077,6 +2094,7 @@ class GdbBridge:
         self._stop_thread = None
         with contextlib.suppress(Exception):
             self._stop_thread = gdb.selected_thread().num
+        self._unfinished_stop = None
         reason = {"kind": "step"}
         if hasattr(gdb, "BreakpointEvent") and isinstance(event, gdb.BreakpointEvent):
             if event.breakpoints:
@@ -2089,6 +2107,13 @@ class GdbBridge:
             # stop: a trap nobody owns (an orphaned or snapshot-baked int3),
             # not a completed step.
             reason = {"kind": "trap"}
+        elif self._exec_op in ("step", "next", "finish", "until") and self._stopped_unfinished(event):
+            # GDB's stop details name why a step op stopped (`end-stepping-
+            # range`, `function-finished`, `location-reached`) only once the
+            # op finished. Without one GDB gave up on it (#78): most often it
+            # stepped over the breakpoint at the PC, then could not insert its
+            # breakpoints to go on.
+            self._unfinished_stop = reason
         self._last_stop_reason = reason
         self._pending_stop_event = reason if reason["kind"] in ("watchpoint-hit", "trap") else None
 
@@ -2101,14 +2126,36 @@ class GdbBridge:
             else:
                 self._enrich_watchpoint_reason(reason)
 
+    @staticmethod
+    def _stopped_unfinished(event) -> bool:
+        """Whether GDB's MI details of a plain stop carry no `reason` (GDB 14+)."""
+        details = getattr(event, "details", None)
+        return isinstance(details, dict) and "reason" not in details
+
     def _enrich_trap_reason(self, reason):
-        """Add the stop address and whether a trap instruction sits there."""
+        """Add the stop address and whether a trap instruction sits there.
+
+        GDB reports every SIGTRAP its breakpoints do not explain as a plain
+        stop, also one another process sent (`kill -TRAP`, `raise`). Linux's
+        `si_code` tells them apart (#80): <= 0 (SI_USER, SI_TKILL, ...) for a
+        sent signal, which is reported as `signal SIGTRAP`; > 0 for a trap the
+        kernel raised (an int3, a single-step or debug-register trap).
+        """
         try:
             pc = int(gdb.selected_frame().pc())
         except Exception:
             _raise_if_remote_lost(self)
             return
+        code = self._siginfo_code()
+        if code is not None and code <= 0:
+            reason.clear()
+            reason.update(kind="signal", signal="SIGTRAP")
+            return
         reason["address"] = hex(pc)
+        if code is not None:
+            reason["si_code"] = code
+        # A stub record nobody owns (`pry resync` drops it) exists only there.
+        reason["remote"] = bool(self._remember_remote_connection())
         trap = self._trap_bytes()
         if trap is None:
             return
@@ -2120,6 +2167,15 @@ class GdbBridge:
                 reason["trap_in_memory"] = True
                 return
         reason["trap_in_memory"] = False
+
+    def _siginfo_code(self) -> int | None:
+        """`$_siginfo.si_code` of the stop, or None where the target has no
+        siginfo (QEMU's gdbstub, non-Linux targets)."""
+        try:
+            return int(gdb.parse_and_eval("$_siginfo.si_code"))
+        except Exception:
+            _raise_if_remote_lost(self)
+            return None
 
     def _on_inferior_call(self, event):
         """Count inferior calls in flight: one resumes the target and comes
@@ -2158,17 +2214,59 @@ class GdbBridge:
         self._pending_stop_event = None
         if self._disconnecting:
             self._reset_execution_history("disconnected")
+            self._target_went_away("pry disconnected from the target")
             return
         self._has_run = True
         self._has_exited = True
         self._last_exit_code = code
         self._last_exit_signal = None
-        self._pending_exit = {
-            "remote": self._remote_connection is not None or self._remote_failure is not None,
-        }
+        remote = self._remote_connection is not None or self._remote_failure is not None
+        self._pending_exit = {"remote": remote}
         if code is not None:
             self._remote_failure = None
         gdb.post_event(self._resolve_pending_exit)
+        self._target_went_away(
+            f"the target exited (code {code})" if code is not None
+            else "the remote target went away (killed, or its connection closed)" if remote
+            else "the target was killed (or a signal ended it)"
+        )
+
+    def _target_went_away(self, what: str) -> None:
+        """GDB thread, as the target goes away (#114): it exited, was killed,
+        or its remote connection closed. That ends a caller's hold, as a
+        resume pry did not make does, and whoever waited through the hold gets
+        what a `pry wait` gets without one: the exit, or the lost connection.
+        Locations deferred for this target's memory go back to GDB as they were.
+        """
+        if self._deferred:
+            gdb.post_event(self._undefer_all)
+        hold, self._hold = self._hold, None
+        if hold is None:
+            return
+        self._hold_ended = (
+            f"{what} during a caller's hold (`pry interrupt --hold`), which ended the "
+            "hold; nothing is left to resume: `pry status`"
+        )
+        pause = hold["pause"]
+        if pause is None or pause["settled"].is_set():
+            return
+        if pause["job"] is not None:
+            successor: dict[str, Any] = {
+                "completion": threading.Event(), "response": None, "restored": [],
+            }
+            pause["job"]["superseded_by"] = successor
+
+            def answer():
+                # Read once GDB has unwound its target stack (_on_exited).
+                try:
+                    response = _json_response(ok=True, result=self._execution_state())
+                except Exception as exc:
+                    response = _json_response(ok=False, error=str(exc))
+                successor["response"] = response
+                successor["completion"].set()
+
+            gdb.post_event(answer)
+        pause["settled"].set()
 
     def _resolve_pending_exit(self):
         """Finish terminal bookkeeping only after GDB returns to its event loop."""
@@ -2221,6 +2319,7 @@ class GdbBridge:
                 "reconnect before inspecting or resuming the target"
             )
             self._running = False
+        self._target_went_away("the remote target's connection closed")
 
     def _remember_remote_connection(self):
         """Record GDB's transport identity, never probe target memory for life."""
@@ -2571,11 +2670,14 @@ class GdbBridge:
                 # once GDB has inserted its breakpoints and resumed the target,
                 # or failed to (then the job has completed with the error).
                 _run_on_gdb_thread(lambda: None)
+            deferred: list[str] = []
             if job is not None:
                 # Restored as it resumed, under breakpoints the op did not
-                # touch: this op reports them, not the resumed execution.
+                # touch: this op reports them, not the resumed execution. So
+                # are the locations GDB did not insert (#98).
                 job["restored_reported"] = True
                 pause["baked_traps"] = list(job["restored"])
+                deferred = list(job["deferred"])
             if job is not None and job["completion"].is_set():
                 response = job["response"]
             if job is not None and pause["job"] is not None:
@@ -2596,6 +2698,8 @@ class GdbBridge:
                 _run_on_gdb_thread(self._remove_inserted_breakpoints)
                 return run_state
             run_state["resumed"] = True
+            if deferred:
+                run_state["deferred"] = deferred
             result = response["result"] or {}
             if result.get("state") != "running":
                 run_state["stop"] = result  # resumed, and stopped again at once
@@ -2635,20 +2739,30 @@ class GdbBridge:
         PC, an internal shared-library event stop), GDB prints the cause to
         its console and stops: the same plain stop as a trap no breakpoint
         owns. No trap in memory at the stop and a trial insertion that fails
-        tell the two apart.
+        tell the two apart. A step op (`step`, `next`, `finish`, `until`) GDB
+        stops the same way looks like a completed step, but GDB's stop details
+        name no reason for it, since the op never finished (#78).
         """
         reason = self._last_stop_reason
-        if not reason or reason.get("kind") != "trap":
+        if not reason:
             return None
-        self._resolve_pending_stop()
-        if reason.get("trap_in_memory"):
+        if reason.get("kind") == "trap":
+            self._resolve_pending_stop()
+            # A SIGTRAP another process sent is a signal now (#80).
+            if reason.get("kind") != "trap" or reason.get("trap_in_memory"):
+                return None
+        elif reason is not self._unfinished_stop:
             return None
         cause = self._insertion_errors()
         if cause is None:
             return None
         # The stop reports GDB's failure, not a trap: nothing replays it.
         self._last_stop_reason = None
-        where = reason.get("address") or "the current PC"
+        where = reason.get("address")
+        if where is None:
+            with contextlib.suppress(Exception):
+                where = hex(int(gdb.selected_frame().pc()) & _ADDR_MASK)
+        where = where or "the current PC"
         with contextlib.suppress(Exception):
             name = gdb.selected_frame().name()
             if name:
@@ -2937,6 +3051,12 @@ class GdbBridge:
             }
         pause["settled"].set()
 
+    def _target_gone(self) -> bool:
+        """GDB thread: whether no live target is left (it exited, was killed,
+        or its remote connection is lost)."""
+        self._resolve_pending_exit()
+        return bool(self._remote_failure) or self._has_exited or not self._inferior_is_live()
+
     def _dispatch_hold(self) -> dict[str, Any]:
         """`pry interrupt --hold`: stop the target for a caller and keep it
         stopped until `pry continue --release` (#99).
@@ -3055,6 +3175,13 @@ class GdbBridge:
             run_state = self._finish_pause(pause)
             if not run_state["resumed"]:
                 # Resuming is what a release is for: like `continue`, fail.
+                if _run_on_gdb_thread(self._target_gone):
+                    # A stub that died during the hold, found only by this
+                    # resume (#114): nothing is stopped, nothing is left.
+                    raise RuntimeError(
+                        "the hold is released, but the target went away during it, so "
+                        f"nothing is left to resume: {run_state.get('error')}"
+                    )
                 raise RuntimeError(
                     "the hold is released, but pry could not resume the target, so it "
                     f"is stopped: {run_state.get('error')}"
@@ -3181,9 +3308,12 @@ class GdbBridge:
         # A paused job's answer is pry's own stop, not a result to report.
         if job is not None and job["completion"].is_set() and not self._paused(job):
             response = job["response"]
-            if not response["ok"]:
-                return response
-            result["last_background_result"] = response["result"]
+            # `pry wait` fails with a failed job; `status` still says where the
+            # target is, and carries the failure beside it (#79).
+            if response["ok"]:
+                result["last_background_result"] = response["result"]
+            else:
+                result["last_background_error"] = response["error"]
         return _json_response(ok=True, result=result)
 
     def _dispatch_wait(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -3270,8 +3400,11 @@ class GdbBridge:
         # `restored`: traps nobody owned under breakpoint sites, restored just
         # before the resume. The execution's answer reports them, unless the
         # breakpoint op that resumed the target already did (`restored_reported`).
+        # So it does `deferred`: locations GDB did not insert (#98).
         restored: list[dict[str, Any]] = []
-        job: dict[str, Any] = {"completion": completion, "response": None, "restored": restored}
+        job: dict[str, Any] = {
+            "completion": completion, "response": None, "restored": restored, "deferred": [],
+        }
         terminal_event = [False]
         error_box: list[Exception] = []
         command_returned = [False]
@@ -3324,6 +3457,8 @@ class GdbBridge:
                     response["error"] = f"{response['error']} ({_restored_note(restored)})"
                 elif not job.get("restored_reported"):
                     response["result"]["baked_traps"] = restored
+            if job["deferred"] and response["ok"] and not job.get("restored_reported"):
+                response["result"]["deferred"] = job["deferred"]
             _cleanup()
             self._restarting = False
             self._exec_op = None
@@ -3367,6 +3502,8 @@ class GdbBridge:
                 if hasattr(gdb.events, "connection_removed"):
                     gdb.events.connection_removed.connect(_on_exec_connection_removed)
                 self._snapshot_watchpoints()
+                if self._deferred:
+                    job["deferred"] = self._rearm_deferred()
                 restored.extend(self._restore_traps_before_resume())
                 self._exec_op = op
                 self._dispatch_op(op, params)
@@ -4882,7 +5019,8 @@ class GdbBridge:
     def _break_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         bps = gdb.breakpoints() or []
         pending = _pending_locations() if bps else set()
-        result = [_breakpoint_to_dict(bp, pending) for bp in bps]
+        deferred = {(number, index) for number, index, _ in self._deferred_locations()}
+        result = [_breakpoint_to_dict(bp, pending, deferred) for bp in bps]
         # The Python API exposes no detail for catchpoints (location/expression
         # are None), so a `catch syscall write` is indistinguishable from any
         # other catchpoint. Recover the "what" column from `info breakpoints`.
@@ -5283,6 +5421,65 @@ class GdbBridge:
         sites = self._trap_sites(bps, repair=True, skip=_pending_locations(), resuming=True)
         return self._baked_traps(sites)
 
+    def _defer_locations(self, keys: set[tuple[int, int]]) -> None:
+        """GDB thread, at a stop: hold the software breakpoint locations
+        *keys* (``(number, index)``, their memory unreadable) out of GDB's
+        insertion (#98).
+
+        GDB inserts every enabled location as it resumes the target, and does
+        not resume at all when one cannot be written (`Cannot insert
+        breakpoint N. Cannot access memory`): a guest held across a reset
+        waits at its reset vector, where no kernel address is mapped. GDB
+        does not insert a disabled location; :meth:`_rearm_deferred` enables
+        it again once its memory is readable.
+        """
+        for bp in gdb.breakpoints() or []:
+            for index, loc in enumerate(getattr(bp, "locations", None) or [], 1):
+                if (bp.number, index) in keys and loc.enabled:
+                    loc.enabled = False
+                    self._deferred.setdefault(bp.number, set()).add(index)
+
+    def _deferred_locations(self) -> list[tuple[int, int, Any]]:
+        """GDB thread: ``(number, index, location)`` of each location pry
+        still holds back. One deleted, or enabled again behind pry's back
+        (a raw `enable N.M`), is no longer pry's to hold."""
+        held = []
+        bps = {bp.number: bp for bp in gdb.breakpoints() or []}
+        for number, indices in self._deferred.items():
+            locs = list(getattr(bps.get(number), "locations", None) or [])
+            for index in sorted(indices):
+                if index <= len(locs) and not locs[index - 1].enabled:
+                    held.append((number, index, locs[index - 1]))
+        self._deferred = {}
+        for number, index, _ in held:
+            self._deferred.setdefault(number, set()).add(index)
+        return held
+
+    def _rearm_deferred(self) -> list[str]:
+        """GDB thread, at the stop an execution is about to leave: enable each
+        deferred location whose memory is readable now, so that GDB inserts
+        it as it resumes. Returns the locations still held back."""
+        trap = self._trap_bytes()
+        width = len(trap) if trap else 1
+        held = []
+        for number, index, loc in self._deferred_locations():
+            address = getattr(loc, "address", None)
+            if address is not None and self._raw_read(address, width) is not None:
+                loc.enabled = True
+                self._deferred[number].discard(index)
+                if not self._deferred[number]:
+                    del self._deferred[number]
+            else:
+                held.append(f"{number}.{index}")
+        return held
+
+    def _undefer_all(self) -> None:
+        """GDB thread: give every location pry holds back to GDB, enabled."""
+        for _, _, loc in self._deferred_locations():
+            with contextlib.suppress(Exception):
+                loc.enabled = True
+        self._deferred = {}
+
     def _stray_traps(
         self, exclude: set[int], stop_at: int | None
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -5587,6 +5784,8 @@ class GdbBridge:
         for command in ("maintenance flush register-cache", "maintenance flush dcache"):
             with contextlib.suppress(gdb.error):
                 gdb.execute(command, to_string=True)
+        # Every location is judged again at this stop, those held back included.
+        self._undefer_all()
 
         result: dict[str, Any] = {"resynced": True}
         if base is not None:
@@ -5637,6 +5836,7 @@ class GdbBridge:
         self._progress(_RESYNC_ARM)
         verify = self._verify_insertion(bps, unreadable, keep_inserted=will_resume)
         result["breakpoints"] = self._resync_entries(bps, sites, verify, watched)
+        self._defer_unreadable(result["breakpoints"])
         result["summary"] = _resync_summary(result["breakpoints"], result["stray_traps"])
         if not natural_stop:
             self._last_stop_reason = {"kind": "resynced"}
@@ -5675,6 +5875,26 @@ class GdbBridge:
             if not outcome:
                 outcome["value"] = self._watchpoint_values.get(number)
         return watched
+
+    def _defer_unreadable(self, entries: list[dict[str, Any]]) -> None:
+        """GDB thread, at resync's stop: hold back every enabled software
+        breakpoint location whose memory cannot be read (#98), so that GDB
+        can still resume the target, and say so in its entry."""
+        keys = set()
+        for entry in entries:
+            if entry.get("status") != "unreadable" or not entry.get("location"):
+                continue
+            number, index = (int(part) for part in entry["location"].split("."))
+            keys.add((number, index))
+            entry["deferred"] = True
+            entry["detail"] = (
+                f"{entry.get('detail')}. pry holds it back, so GDB does not insert it and "
+                "can still resume the target (from a reset vector, say); it does not fire "
+                "until pry re-arms it, before the first pry execution (`continue`, "
+                "`--release`, ...) that finds its memory readable"
+            )
+        if keys:
+            self._defer_locations(keys)
 
     def _resync_entries(self, bps, sites, verify, watched) -> list[dict[str, Any]]:
         """One entry per breakpoint location (or per watch/catchpoint)."""
